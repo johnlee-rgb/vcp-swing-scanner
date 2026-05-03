@@ -1477,6 +1477,65 @@ def style_scan_table(row: pd.Series) -> List[str]:
     return [colors.get(row["Action Label"], "")] * len(row)
 
 
+def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
+    """Round displayed prices, levels, scores, and percentages without changing calculations."""
+    rounded = frame.copy()
+    two_decimal_columns = [
+        "close",
+        "Pivot",
+        "Distance to Pivot %",
+        "Entry Trigger",
+        "Stop Loss",
+        "Risk %",
+        "Target 2R",
+        "Target 3R",
+        "RR Ratio",
+        "Final Score",
+        "RS Score",
+        "Sector Spread %",
+        "MA10 Distance %",
+        "MA20 Distance %",
+    ]
+    for column in two_decimal_columns:
+        if column in rounded.columns:
+            converted = pd.to_numeric(rounded[column], errors="coerce")
+            if converted.notna().any():
+                rounded[column] = converted.round(2).where(converted.notna(), rounded[column])
+    return rounded
+
+
+def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame:
+    """Build a compact top-five focus table for the daily summary."""
+    if frame.empty:
+        return pd.DataFrame()
+
+    summary = frame.head(5).copy()
+    summary["Reason"] = summary[reason_column]
+    columns = [
+        "ticker",
+        "Action Label",
+        "Final Score",
+        "Pivot",
+        "Distance to Pivot %",
+        "Entry Trigger",
+        "Stop Loss",
+        "Risk %",
+        "RR Score",
+        "Reason",
+    ]
+    return round_display_values(summary[columns])
+
+
+def show_focus_group(title: str, frame: pd.DataFrame, reason_column: str) -> None:
+    """Render one daily focus group as a small top-five table."""
+    st.markdown(f"**{title}**")
+    focus = focus_summary_frame(frame, reason_column)
+    if focus.empty:
+        st.caption("No current matches.")
+    else:
+        st.dataframe(focus, width="stretch", hide_index=True, height=220)
+
+
 def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
     """Create selected ticker chart with levels and VCP labels."""
     chart_data = data.tail(140)
@@ -1747,7 +1806,7 @@ def main() -> None:
     visible["trade sort"] = np.where(visible["Trade"] == "YES", 0, 1)
     visible["watchlist sort"] = np.where(visible["WATCHLIST FLAG"] == "YES", 0, 1)
     visible = visible.sort_values(
-        ["trade sort", "watchlist sort", "Tightness Score", "Trend Score"],
+        ["trade sort", "watchlist sort", "Final Score", "Tightness Score"],
         ascending=[True, True, False, False],
     )
 
@@ -1787,12 +1846,48 @@ def main() -> None:
         "Notes",
     ]
 
+    focus_source = results.copy()
+    focus_source["trade sort"] = np.where(focus_source["Trade"] == "YES", 0, 1)
+    focus_source["watchlist sort"] = np.where(focus_source["WATCHLIST FLAG"] == "YES", 0, 1)
+
+    trade_focus = focus_source[focus_source["Trade"] == "YES"].sort_values(
+        ["Final Score", "Tightness Score"],
+        ascending=[False, False],
+    )
+    watchlist_focus = focus_source[
+        (focus_source["WATCHLIST FLAG"] == "YES") & (focus_source["Trade"] != "YES")
+    ].sort_values(
+        ["Final Score", "Tightness Score"],
+        ascending=[False, False],
+    )
+    pullback_focus = focus_source[focus_source["Action Label"] == "PULLBACK ENTRY"].copy()
+    if not pullback_focus.empty:
+        pullback_focus["Pullback Reason"] = pullback_focus["Trade Reason"]
+        pullback_focus.loc[pullback_focus["WATCHLIST FLAG"] == "YES", "Pullback Reason"] = pullback_focus[
+            "Watchlist Reason"
+        ]
+        pullback_focus.loc[pullback_focus["Trade"] == "YES", "Pullback Reason"] = pullback_focus["Trade Reason"]
+        pullback_focus = pullback_focus.sort_values(
+            ["trade sort", "watchlist sort", "Final Score", "Tightness Score"],
+            ascending=[True, True, False, False],
+        )
+
+    st.subheader("Daily Focus Summary")
+    focus_cols = st.columns(3)
+    with focus_cols[0]:
+        show_focus_group("Trade YES", trade_focus, "Trade Reason")
+    with focus_cols[1]:
+        show_focus_group("Watchlist Setups", watchlist_focus, "Watchlist Reason")
+    with focus_cols[2]:
+        show_focus_group("Best Pullback Candidates", pullback_focus, "Pullback Reason")
+
     st.subheader("Best Setups")
     if visible.empty:
         st.info("No rows match the current display filters.")
     else:
+        table_display = round_display_values(visible[display_columns])
         st.dataframe(
-            visible[display_columns].style.apply(style_scan_table, axis=1),
+            table_display.style.apply(style_scan_table, axis=1),
             width="stretch",
             hide_index=True,
         )
