@@ -1,5 +1,10 @@
 streamlit>=1.35
-yfinance>=0.2.40
 pandas>=2.0
 numpy>=1.24
+yfinance>=0.2.40
 plotly>=5.20
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+html5lib>=1.1
+feedparser>=6.0

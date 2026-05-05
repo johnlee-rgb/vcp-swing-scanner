@@ -9,11 +9,16 @@ trend and timing separately, then produce a next-day trade plan.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.message import EmailMessage
+from io import StringIO
+import re
+import smtplib
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -512,6 +517,49 @@ for ticker_list in PRESET_UNIVERSES.values():
 
 PRESET_UNIVERSES["Market Leaders 300"] = MARKET_LEADERS_BASE[:300]
 
+US_PRO_EXTRA = [
+    "UNH", "JNJ", "ABBV", "MRK", "PFE", "ABT", "AMGN", "GILD", "BIIB", "ILMN", "HCA", "CI", "ELV",
+    "TMO", "DHR", "ZTS", "A", "EW", "RMD", "PODD", "MCK", "CAH", "COR", "HUM", "CNC", "CVS",
+    "PG", "KO", "PEP", "COKE", "MDLZ", "MNST", "CL", "KMB", "CAG", "KHC", "GIS", "HSY", "MCD",
+    "YUM", "DPZ", "WING", "TXRH", "DRI", "CMG", "CAVA", "SBUX", "TGT", "LOW", "TJX", "ROST",
+    "F", "GM", "RIVN", "LCID", "NIO", "LI", "XPEV", "TM", "HMC", "RACE", "AZO", "ORLY", "GPC",
+    "DIS", "CMCSA", "WBD", "PARA", "TTWO", "EA", "RBLX", "PINS", "SNAP", "RDDT", "MTCH", "BMBL",
+    "T", "VZ", "TMUS", "CHTR", "LUMN", "AMT", "CCI", "EQIX", "DLR", "PLD", "O", "SPG", "WELL",
+    "PSA", "EXR", "AVB", "EQR", "VICI", "GLPI", "CPT", "ARE", "CBRE", "JLL", "AON", "MMC",
+    "TRV", "PGR", "ALL", "AIG", "MET", "PRU", "AFL", "TFC", "USB", "PNC", "COF", "DFS", "SYF",
+    "FIS", "FI", "GPN", "ADP", "PAYX", "BR", "FICO", "SPGI", "MCO", "NDAQ", "MKTX", "CBOE",
+    "LIN", "APD", "SHW", "ECL", "DD", "DOW", "FCX", "NEM", "GOLD", "AA", "CLF", "STLD", "NUE",
+    "X", "RS", "CMC", "MOS", "CF", "ALB", "SQM", "LAC", "LTHM", "ENPH", "SEDG", "FSLR", "RUN",
+    "NEE", "DUK", "SO", "D", "AEP", "SRE", "EXC", "PEG", "ED", "EIX", "PCG", "FE", "AES",
+    "DAL", "UAL", "AAL", "LUV", "ALK", "JBLU", "FDX", "UPS", "XPO", "CHRW", "ODFL", "SAIA",
+    "NSC", "CSX", "UNP", "CP", "CNI", "KSU", "WAB", "LII", "CARR", "TT", "JCI", "MAS", "BLDR",
+    "LEN", "DHI", "PHM", "TOL", "NVR", "KBH", "MTH", "TREX", "OC", "HD", "LOW", "POOL",
+    "LULU", "ONON", "BIRK", "SKX", "CROX", "RL", "TPR", "CPRI", "LEVI", "GAP", "ANF", "AEO",
+    "W", "CHWY", "ETSY", "EBAY", "BABA", "JD", "PDD", "BIDU", "TME", "VIPS", "GRAB", "CPNG",
+    "ROKU", "TTD", "MGNI", "PUBM", "APPS", "U", "RBLX", "Unity", "AI", "SOUN", "BBAI", "SERV",
+]
+
+US_PRO_UNIVERSE = list(dict.fromkeys(MARKET_LEADERS_BASE + US_PRO_EXTRA))[:500]
+
+HK_PRO_UNIVERSE = [
+    "0700.HK", "9988.HK", "3690.HK", "1810.HK", "0388.HK", "0005.HK", "0939.HK", "1398.HK",
+    "3988.HK", "2318.HK", "1299.HK", "0941.HK", "0883.HK", "0857.HK", "0386.HK", "0688.HK",
+    "2628.HK", "2319.HK", "2388.HK", "0011.HK", "0002.HK", "0003.HK", "0006.HK", "0012.HK",
+    "0016.HK", "0027.HK", "0066.HK", "0101.HK", "0175.HK", "0201.HK", "0267.HK", "0288.HK",
+    "0291.HK", "0316.HK", "0322.HK", "0358.HK", "0384.HK", "0390.HK", "0669.HK", "0683.HK",
+    "0708.HK", "0762.HK", "0823.HK", "0836.HK", "0868.HK", "0881.HK", "0960.HK", "0968.HK",
+    "0981.HK", "0986.HK", "1024.HK", "1044.HK", "1088.HK", "1093.HK", "1109.HK", "1113.HK",
+    "1177.HK", "1209.HK", "1211.HK", "1336.HK", "1378.HK", "1368.HK", "1448.HK", "1548.HK",
+    "1658.HK", "1688.HK", "1766.HK", "1772.HK", "1800.HK", "1876.HK", "1918.HK", "1928.HK",
+    "1929.HK", "1997.HK", "2007.HK", "2015.HK", "2020.HK", "2269.HK", "2313.HK", "2331.HK",
+    "2333.HK", "2359.HK", "2382.HK", "2386.HK", "2600.HK", "2601.HK", "2618.HK", "2688.HK",
+    "2899.HK", "3323.HK", "3328.HK", "3333.HK", "3618.HK", "3669.HK", "3759.HK", "3800.HK",
+    "6030.HK", "6060.HK", "6618.HK", "6690.HK", "6862.HK", "9618.HK", "9633.HK", "9868.HK",
+    "9888.HK", "9901.HK", "9992.HK", "9999.HK", "1024.HK", "2018.HK", "9995.HK", "9698.HK",
+]
+HK_PRO_UNIVERSE = list(dict.fromkeys(HK_PRO_UNIVERSE))
+COMBINED_PRO_UNIVERSE = list(dict.fromkeys(US_PRO_UNIVERSE + HK_PRO_UNIVERSE))[:800]
+
 SCAN_MODES = [
     "AI / Semiconductor",
     "AI Infrastructure / Power",
@@ -528,6 +576,9 @@ SCAN_MODES = [
     "Industrials / Infrastructure",
     "Crypto / Blockchain Stocks",
     "Market Leaders 300",
+    "US Pro Market Scan",
+    "HK Pro Market Scan",
+    "Combined US + HK Scan",
     "Custom Input",
 ]
 
@@ -548,6 +599,9 @@ SECTOR_ETFS_BY_MODE = {
     "Crypto / Blockchain Stocks": ["QQQ", "XLF"],
     "Growth Leaders": ["QQQ", "XLK"],
     "Market Leaders 300": ["QQQ", "SPY"],
+    "US Pro Market Scan": ["QQQ", "SPY"],
+    "HK Pro Market Scan": ["2800.HK", "^HSI"],
+    "Combined US + HK Scan": ["QQQ", "2800.HK"],
     "Custom Input": ["SPY"],
 }
 
@@ -573,6 +627,8 @@ MARKET_TICKERS = [
     "ITA",
     "^VIX",
 ]
+HK_MARKET_TICKERS = ["^HSI", "2800.HK", "3033.HK", "3067.HK"]
+ALL_CONTEXT_TICKERS = list(dict.fromkeys(MARKET_TICKERS + HK_MARKET_TICKERS))
 ACTION_ORDER = {"READY": 0, "PULLBACK ENTRY": 1, "WATCH": 2, "EXTENDED": 3, "FAILED": 4}
 
 
@@ -689,6 +745,64 @@ def download_next_earnings_dates(tickers: Tuple[str, ...]) -> Dict[str, str | No
     return earnings_dates
 
 
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def download_earnings_data(tickers: Tuple[str, ...]) -> Dict[str, dict]:
+    """Fetch best-effort earnings metadata without assuming yfinance fields exist."""
+    today = pd.Timestamp.today().normalize()
+    output: Dict[str, dict] = {}
+    for ticker in tickers:
+        item = {
+            "next_date": None,
+            "days_to_earnings": None,
+            "last_date": None,
+            "eps_estimate": "N/A",
+            "revenue_estimate": "N/A",
+            "last_eps_surprise_pct": "N/A",
+            "last_revenue_surprise_pct": "N/A",
+        }
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            calendar = None
+            try:
+                calendar = yf_ticker.get_calendar()
+            except Exception:
+                calendar = getattr(yf_ticker, "calendar", None)
+            if isinstance(calendar, dict):
+                raw_date = calendar.get("Earnings Date") or calendar.get("EarningsDate")
+                if isinstance(raw_date, (list, tuple)) and raw_date:
+                    raw_date = raw_date[0]
+                if raw_date is not None:
+                    parsed = pd.to_datetime(raw_date, errors="coerce")
+                    if pd.notna(parsed):
+                        item["next_date"] = parsed.normalize().strftime("%Y-%m-%d")
+                item["eps_estimate"] = calendar.get("Earnings Average", "N/A")
+                item["revenue_estimate"] = calendar.get("Revenue Average", "N/A")
+
+            earnings = yf_ticker.get_earnings_dates(limit=8)
+            if earnings is not None and not earnings.empty:
+                dates = pd.to_datetime(earnings.index).tz_localize(None).normalize()
+                future_dates = [date for date in dates if date >= today]
+                past_dates = [date for date in dates if date < today]
+                if future_dates and item["next_date"] is None:
+                    item["next_date"] = min(future_dates).strftime("%Y-%m-%d")
+                if past_dates:
+                    item["last_date"] = max(past_dates).strftime("%Y-%m-%d")
+                latest_past_rows = earnings.loc[dates < today]
+                if latest_past_rows is not None and not latest_past_rows.empty:
+                    last_row = latest_past_rows.iloc[0]
+                    surprise = last_row.get("Surprise(%)", last_row.get("Surprise (%)", np.nan))
+                    if pd.notna(surprise):
+                        item["last_eps_surprise_pct"] = round(float(surprise), 2)
+        except Exception:
+            pass
+
+        if item["next_date"]:
+            days = (pd.Timestamp(item["next_date"]) - today).days
+            item["days_to_earnings"] = max(days, 0)
+        output[ticker] = item
+    return output
+
+
 def add_indicators(frame: pd.DataFrame, spy_frame: pd.DataFrame | None = None) -> pd.DataFrame:
     """Add moving averages, RSI, ATR, volume, ranges, and relative strength."""
     data = frame.copy()
@@ -792,6 +906,28 @@ def calculate_market_score(market_data: Dict[str, pd.DataFrame]) -> Tuple[int, s
     else:
         status = "RISKY"
 
+    return score, status, details
+
+
+def calculate_hk_market_score(market_data: Dict[str, pd.DataFrame]) -> Tuple[int, str, List[str]]:
+    """Score HK market context from HSI and liquid HK ETFs."""
+    score = 0
+    details: List[str] = []
+    for ticker in ("^HSI", "2800.HK", "3033.HK", "3067.HK"):
+        data = market_data.get(ticker)
+        if data is None or data.empty:
+            details.append(f"{ticker}: no data")
+            continue
+        latest = data.iloc[-1]
+        passes = bool(latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"])
+        score += int(passes)
+        details.append(f"{ticker} {'above' if passes else 'not above'} MA20/MA50")
+    if score >= 3:
+        status = "BULLISH"
+    elif score == 2:
+        status = "NEUTRAL"
+    else:
+        status = "RISKY"
     return score, status, details
 
 
@@ -1196,6 +1332,18 @@ def detect_earnings_risk(next_earnings_date: str | None) -> Tuple[str, bool]:
     return ("EARNINGS RISK" if trading_days <= 7 else next_earnings_date), trading_days <= 7
 
 
+def classify_earnings_risk(earnings_info: dict) -> Tuple[str, bool]:
+    """Classify next earnings risk using calendar days."""
+    days = earnings_info.get("days_to_earnings")
+    if days is None:
+        return "N/A", False
+    if days <= 7:
+        return "HIGH RISK", True
+    if days <= 14:
+        return "MEDIUM RISK", False
+    return "LOW RISK", False
+
+
 def calculate_volume_confirmation(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple[str, str]:
     """Confirm volume for breakout setups and pullback setups."""
     latest = data.iloc[-1]
@@ -1212,6 +1360,113 @@ def calculate_volume_confirmation(data: pd.DataFrame, action: str, pivot: PivotI
     if action == "PULLBACK ENTRY":
         return ("YES", "Pullback volume contracting") if pullback_volume_contracts else ("NO", "Pullback volume not contracting")
     return ("YES", "Volume contracting") if pullback_volume_contracts else ("NO", "No volume confirmation")
+
+
+def detect_breakout_alert(data: pd.DataFrame, pivot: PivotInfo, volume_confirmation: str) -> str:
+    """Classify the current relationship to the pivot for alerts and ranking."""
+    close = latest_value(data, "Close")
+    if pd.isna(close) or pd.isna(pivot.pivot):
+        return "NO BREAKOUT"
+    if close > pivot.pivot and volume_confirmation == "YES":
+        return "CONFIRMED BREAKOUT"
+    if 0 <= pivot.distance_pct <= 3:
+        return "NEAR BREAKOUT"
+    if close > pivot.pivot:
+        return "BREAKOUT IN PROGRESS"
+    return "NO BREAKOUT"
+
+
+def calculate_earnings_setup(
+    data: pd.DataFrame,
+    trend_score: int,
+    rs_score: float,
+    sector_score: int,
+    earnings_info: dict,
+) -> Tuple[int, str, str]:
+    """Score pre/post-earnings momentum and assign an earnings strategy."""
+    latest = data.iloc[-1]
+    score = 0
+    if trend_score >= 5:
+        score += 2
+    if rs_score >= 6:
+        score += 2
+    if len(data) >= 15 and data["Volume"].tail(5).mean() > data["Volume"].iloc[-15:-5].mean():
+        score += 2
+    if latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"]:
+        score += 2
+    if sector_score >= 2:
+        score += 1
+    surprise = earnings_info.get("last_eps_surprise_pct")
+    if isinstance(surprise, (int, float)) and surprise > 0:
+        score += 1
+
+    if score >= 8:
+        label = "Strong earnings momentum"
+    elif score >= 6:
+        label = "Positive setup"
+    elif score >= 4:
+        label = "Neutral"
+    else:
+        label = "Weak / risky"
+
+    days = earnings_info.get("days_to_earnings")
+    if days is not None and days <= 7:
+        strategy = "WATCH AFTER EARNINGS" if score >= 7 else "AVOID BEFORE EARNINGS"
+    elif score >= 8:
+        strategy = "PRE-EARNINGS MOMENTUM TRADE"
+    else:
+        strategy = "WATCH AFTER EARNINGS"
+    return min(score, 10), label, strategy
+
+
+def detect_post_earnings_label(data: pd.DataFrame, earnings_info: dict) -> str:
+    """Detect basic post-earnings gap behavior when earnings occurred recently."""
+    last_date = earnings_info.get("last_date")
+    if not last_date:
+        return "NO RECENT EARNINGS"
+    date = pd.Timestamp(last_date)
+    recent_index = data.index[data.index >= date]
+    if len(recent_index) == 0 or len(recent_index) > 10:
+        return "NO RECENT EARNINGS"
+
+    pos = data.index.get_loc(recent_index[0])
+    if pos == 0:
+        return "NO RECENT EARNINGS"
+    earnings_day = data.iloc[pos]
+    previous_close = data.iloc[pos - 1]["Close"]
+    latest = data.iloc[-1]
+    gap_pct = (earnings_day["Open"] - previous_close) / previous_close * 100 if previous_close else 0
+    high_hold = latest["Close"] >= earnings_day["High"]
+    ma_hold = latest["Close"] >= latest["MA10"] or latest["Close"] >= latest["MA20"]
+    strong_volume = earnings_day["Volume"] > 1.5 * earnings_day.get("AvgVol20", np.nan)
+
+    if gap_pct >= 2:
+        return "EARNINGS GAP UP HOLDING" if high_hold and ma_hold and strong_volume else "EARNINGS GAP UP FAILING"
+    if gap_pct <= -2:
+        return "EARNINGS GAP DOWN RECOVERING" if ma_hold else "EARNINGS GAP DOWN WEAK"
+    return "NO RECENT EARNINGS"
+
+
+def ai_trade_label(row: pd.Series) -> str:
+    """Summarize why an AI top-pick card is interesting or risky."""
+    if row.get("Earnings Risk") == "HIGH RISK":
+        return "EARNINGS RISK"
+    if row.get("Action Label") == "EXTENDED":
+        return "TOO EXTENDED"
+    if row.get("Trade") == "YES":
+        return "BEST BUY SETUP"
+    if row.get("Action Label") == "PULLBACK ENTRY":
+        return "PULLBACK SETUP"
+    return "WATCH FOR BREAKOUT"
+
+
+def build_ai_trading_notes(row: dict) -> str:
+    """Create compact rule-based notes for table, cards, and alerts."""
+    return (
+        f"{row['ticker']} {row['Action Label']} | {row['VCP Status']} | "
+        f"Final {row['Final Score']}/100 | {row['Breakout Alert']} | "
+        f"Risk {row['Risk %']}% | Earnings {row['Earnings Risk']}"
+    )
 
 
 def calculate_final_score(
@@ -1279,6 +1534,7 @@ def decide_watchlist_flag(
     volume_confirmation: str,
     market_score: int,
     sector_score: int,
+    earnings_risk_label: str = "N/A",
 ) -> Tuple[str, str]:
     """Flag high-potential setups that need a better entry or confirmation."""
     if trade == "YES":
@@ -1308,9 +1564,15 @@ def decide_watchlist_flag(
         return "NO", "Weak sector score"
 
     if risk_pct > 10:
+        if earnings_risk_label == "HIGH RISK":
+            return "YES", "Watch only - earnings soon"
         return "YES", "Strong trend, tightening, risk too high now"
     if volume_confirmation != "YES":
+        if earnings_risk_label == "HIGH RISK":
+            return "YES", "Watch only - earnings soon"
         return "YES", "Near pivot, waiting for volume confirmation"
+    if earnings_risk_label == "HIGH RISK":
+        return "YES", "Watch only - earnings soon"
     return "YES", "Early VCP, good structure, waiting for better entry"
 
 
@@ -1342,7 +1604,7 @@ def build_scan_row(
     ticker: str,
     data: pd.DataFrame,
     market_cap: float | None,
-    next_earnings_date: str | None,
+    earnings_info: dict,
     market_score: int,
     sector_score: int,
     benchmark_data: Dict[str, pd.DataFrame],
@@ -1361,8 +1623,13 @@ def build_scan_row(
     tightness_score, tightness_label = calculate_tightness(data, vcp)
     rs_score = calculate_rs_score(data, benchmark_data.get("SPY"), benchmark_data.get("QQQ"))
     sector_leadership, sector_spread = calculate_sector_leadership(data, benchmark_data.get(sector_etf))
-    earnings_label, earnings_risk = detect_earnings_risk(next_earnings_date)
+    earnings_label, earnings_risk = classify_earnings_risk(earnings_info)
     volume_confirmation, volume_note = calculate_volume_confirmation(data, action, pivot)
+    breakout_alert = detect_breakout_alert(data, pivot, volume_confirmation)
+    earnings_setup_score, earnings_setup_label, earnings_strategy = calculate_earnings_setup(
+        data, trend_score, rs_score, sector_score, earnings_info
+    )
+    post_earnings_label = detect_post_earnings_label(data, earnings_info)
     final_score = calculate_final_score(
         trend_score=trend_score,
         technical_score=technical_score,
@@ -1396,6 +1663,7 @@ def build_scan_row(
         volume_confirmation=volume_confirmation,
         market_score=market_score,
         sector_score=sector_score,
+        earnings_risk_label=earnings_label,
     )
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
 
@@ -1412,7 +1680,7 @@ def build_scan_row(
         ]
     )
 
-    return {
+    row = {
         "ticker": ticker,
         "close": round(float(latest["Close"]), 2),
         "market cap": format_large_number(market_cap),
@@ -1442,7 +1710,18 @@ def build_scan_row(
         "RR Ratio": rr_ratio if rr_ratio is not None else "Invalid",
         "RR Score": rr_score,
         "Volume Confirmation": volume_confirmation,
+        "Breakout Alert": breakout_alert,
+        "Earnings Date": earnings_info.get("next_date") or "N/A",
+        "Days to Earnings": earnings_info.get("days_to_earnings") if earnings_info.get("days_to_earnings") is not None else "N/A",
         "Earnings Risk": earnings_label,
+        "EPS Estimate": earnings_info.get("eps_estimate", "N/A"),
+        "Revenue Estimate": earnings_info.get("revenue_estimate", "N/A"),
+        "Last EPS Surprise %": earnings_info.get("last_eps_surprise_pct", "N/A"),
+        "Last Revenue Surprise %": earnings_info.get("last_revenue_surprise_pct", "N/A"),
+        "Earnings Trend": earnings_setup_label,
+        "Earnings Setup Score": earnings_setup_score,
+        "Earnings Strategy": earnings_strategy,
+        "Post-Earnings Label": post_earnings_label,
         "Trade": trade,
         "Trade Reason": trade_reason,
         "WATCHLIST FLAG": watchlist_flag,
@@ -1455,9 +1734,12 @@ def build_scan_row(
         "MA10 Distance %": ma10_distance,
         "MA20 Distance %": ma20_distance,
         "Notes": notes,
+        "Company Name": "N/A",
         "_pivot": pivot,
         "_vcp": vcp,
     }
+    row["AI Trading Notes"] = build_ai_trading_notes(row)
+    return row
 
 
 def style_scan_table(row: pd.Series) -> List[str]:
@@ -1534,6 +1816,91 @@ def show_focus_group(title: str, frame: pd.DataFrame, reason_column: str) -> Non
         st.caption("No current matches.")
     else:
         st.dataframe(focus, width="stretch", hide_index=True, height=220)
+
+
+def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
+    """Rule-based Top 5 ranking for alerts and top-pick cards."""
+    if results.empty:
+        return pd.DataFrame()
+    ranked = results.copy()
+    breakout_priority = {
+        "CONFIRMED BREAKOUT": 0,
+        "NEAR BREAKOUT": 1,
+        "BREAKOUT IN PROGRESS": 2,
+        "NO BREAKOUT": 3,
+    }
+    ranked["trade sort"] = np.where(ranked["Trade"] == "YES", 0, 1)
+    ranked["watchlist sort"] = np.where(ranked["WATCHLIST FLAG"] == "YES", 0, 1)
+    ranked["breakout sort"] = ranked["Breakout Alert"].map(breakout_priority).fillna(9)
+    ranked["earnings sort"] = np.where(ranked["Earnings Risk"] == "HIGH RISK", 1, 0)
+    ranked = ranked.sort_values(
+        ["trade sort", "watchlist sort", "breakout sort", "Final Score", "RS Score", "Tightness Score", "Risk %", "earnings sort"],
+        ascending=[True, True, True, False, False, False, True, True],
+    )
+    return ranked.head(5)
+
+
+def alert_message(row: pd.Series) -> str:
+    """Build the requested alert message format."""
+    return (
+        f"Ticker: {row.get('ticker', 'N/A')}\n"
+        f"Action: {row.get('Action Label', 'N/A')}\n"
+        f"Final Score: {row.get('Final Score', 'N/A')}\n"
+        f"Pivot: {row.get('Pivot', 'N/A')}\n"
+        f"Entry Trigger: {row.get('Entry Trigger', 'N/A')}\n"
+        f"Stop Loss: {row.get('Stop Loss', 'N/A')}\n"
+        f"Risk %: {row.get('Risk %', 'N/A')}\n"
+        f"Target 2R: {row.get('Target 2R', 'N/A')}\n"
+        f"Target 3R: {row.get('Target 3R', 'N/A')}\n"
+        f"Breakout Alert: {row.get('Breakout Alert', 'N/A')}\n"
+        f"Earnings Date: {row.get('Earnings Date', 'N/A')}\n"
+        f"Earnings Risk: {row.get('Earnings Risk', 'N/A')}\n"
+        f"AI Trading Notes: {row.get('AI Trading Notes', 'N/A')}"
+    )
+
+
+def send_telegram_message(token: str, chat_id: str, message: str) -> Tuple[bool, str]:
+    """Send Telegram alert if credentials are present."""
+    if not token or not chat_id:
+        return False, "Telegram credentials missing."
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": message},
+            timeout=10,
+        )
+        return response.ok, "Telegram alert sent." if response.ok else response.text
+    except Exception as exc:
+        return False, f"Telegram error: {exc}"
+
+
+def send_email_message(sender: str, password: str, recipient: str, message: str) -> Tuple[bool, str]:
+    """Send email alert with common SMTP defaults."""
+    if not sender or not password or not recipient:
+        return False, "Email credentials missing."
+    smtp_host = "smtp.gmail.com"
+    smtp_port = 587
+    try:
+        email = EmailMessage()
+        email["Subject"] = "VCP Swing Scanner Alert"
+        email["From"] = sender
+        email["To"] = recipient
+        email.set_content(message)
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(email)
+        return True, "Email alert sent."
+    except Exception as exc:
+        return False, f"Email error: {exc}"
+
+
+def get_secret(name: str, default: str = "") -> str:
+    """Read a Streamlit secret if available."""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
 
 def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
@@ -1620,17 +1987,25 @@ def scan_universe(
     min_dollar_volume: float,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], dict]:
     """Download, filter, score, and return scanner results."""
-    tickers = tickers[:300]
-    all_tickers = tuple(sorted(set(tickers + MARKET_TICKERS)))
+    tickers = tickers[:500]
+    is_hk_scan = any(ticker.endswith(".HK") for ticker in tickers) or "HK" in mode
+    context_tickers = ALL_CONTEXT_TICKERS if is_hk_scan else MARKET_TICKERS
+    all_tickers = tuple(sorted(set(tickers + context_tickers)))
     raw_data = download_daily_data(all_tickers, period="18mo")
 
-    spy_raw = raw_data.get("SPY")
+    spy_raw = raw_data.get("^HSI") if is_hk_scan and raw_data.get("^HSI") is not None else raw_data.get("SPY")
     indicator_data = {ticker: add_indicators(frame, spy_raw) for ticker, frame in raw_data.items()}
-    market_data = {ticker: indicator_data[ticker] for ticker in MARKET_TICKERS if ticker in indicator_data}
-    market_score, market_status, market_details = calculate_market_score(market_data)
+    market_data = {ticker: indicator_data[ticker] for ticker in context_tickers if ticker in indicator_data}
+    if is_hk_scan:
+        market_data["SPY"] = market_data.get("^HSI", pd.DataFrame())
+        market_data["QQQ"] = market_data.get("2800.HK", pd.DataFrame())
+    if is_hk_scan and mode == "HK Pro Market Scan":
+        market_score, market_status, market_details = calculate_hk_market_score(market_data)
+    else:
+        market_score, market_status, market_details = calculate_market_score(market_data)
     sector_score, sector_details = calculate_sector_score(mode, market_data)
     market_caps = download_market_caps(tuple(tickers))
-    earnings_dates = download_next_earnings_dates(tuple(tickers))
+    earnings_data = download_earnings_data(tuple(tickers))
 
     rows: List[dict] = []
     rejected: List[str] = []
@@ -1657,7 +2032,7 @@ def scan_universe(
                     ticker=ticker,
                     data=data,
                     market_cap=market_cap,
-                    next_earnings_date=earnings_dates.get(ticker),
+                    earnings_info=earnings_data.get(ticker, {}),
                     market_score=market_score,
                     sector_score=sector_score,
                     benchmark_data=market_data,
@@ -1681,36 +2056,1205 @@ def scan_universe(
     return results, indicator_data, summary
 
 
-def main() -> None:
-    """Render the Streamlit app."""
-    st.set_page_config(page_title="VCP Swing Scanner", page_icon="VCP", layout="wide")
-    st.title("VCP Swing Scanner")
+POSITIVE_IPO_KEYWORDS = (
+    "oversubscribed", "hot ipo", "strong demand", "cornerstone", "ai", "semiconductor", "profitable",
+    "tencent", "blackrock", "gic", "temasek", "hillhouse", "strong debut", "growth",
+)
+NEGATIVE_IPO_KEYWORDS = (
+    "weak demand", "loss-making", "loss making", "cut valuation", "delayed listing", "regulatory risk",
+    "low subscription", "poor grey market", "high valuation", "down round", "lawsuit", "cash burn",
+)
+
+
+def keyword_sentiment_score(text: str) -> int:
+    """Lightweight IPO news sentiment from positive and negative keywords."""
+    lowered = text.lower()
+    positive_hits = sum(keyword in lowered for keyword in POSITIVE_IPO_KEYWORDS)
+    negative_hits = sum(keyword in lowered for keyword in NEGATIVE_IPO_KEYWORDS)
+    if positive_hits > negative_hits:
+        return 1
+    if negative_hits > positive_hits:
+        return -1
+    return 0
+
+
+def ipo_score_label(score: float) -> str:
+    """Translate a 0-10 IPO score into a subscription recommendation."""
+    if score >= 8:
+        return "STRONG SUBSCRIBE"
+    if score >= 6:
+        return "SMALL BET"
+    return "AVOID"
+
+
+def ipo_strategy_label(grey_market_premium_pct: float) -> str:
+    """Choose IPO posture from grey-market premium bands."""
+    if grey_market_premium_pct > 20:
+        return "SCALP"
+    if grey_market_premium_pct >= 10:
+        return "FAST SWING"
+    return "RISKY"
+
+
+def grey_market_assessment(grey_price, ipo_price):
+    """Calculate grey-market premium and classify first-day IPO risk posture."""
+    grey_value = parse_price_midpoint(grey_price)
+    ipo_value = parse_price_midpoint(ipo_price)
+    if grey_value is None or ipo_value is None or ipo_value <= 0:
+        return None, "Grey market unavailable"
+
+    premium = (grey_value - ipo_value) / ipo_value * 100
+    if premium >= 20:
+        label = "HOT (SCALP)"
+    elif premium >= 10:
+        label = "STRONG"
+    elif premium > 0:
+        label = "WEAK POSITIVE"
+    else:
+        label = "NEGATIVE RISK"
+    return round(premium, 2), label
+
+
+def open_decision(open_price, ipo_price, vol_ratio, first_5m_high):
+    """Classify IPO open behavior from opening gap and early volume confirmation."""
+    open_value = parse_price_midpoint(open_price)
+    ipo_value = parse_price_midpoint(ipo_price)
+    volume_ratio = parse_first_number(vol_ratio) or 0
+    _ = first_5m_high
+    if open_value is None or ipo_value is None or ipo_value <= 0:
+        return "Await open data"
+
+    gap = (open_value - ipo_value) / ipo_value * 100
+    if gap >= 15 and volume_ratio >= 1.5:
+        return "OPEN STRONG -> HOLD / SCALE OUT"
+    if gap >= 10:
+        return "TAKE PROFIT PARTIAL"
+    if gap > 0:
+        return "SCALP ONLY"
+    return "AVOID / CUT FAST"
+
+
+def ipo_win_probability(grey_premium, oversub, sector_score, inst_score, sentiment_score):
+    """Estimate IPO win probability from grey premium, demand, theme, institutions, and sentiment."""
+    grey_premium = parse_first_number(grey_premium) or 0
+    oversub = parse_first_number(oversub) or 0
+    sector_score = parse_first_number(sector_score) or 0
+    inst_score = parse_first_number(inst_score) or 0
+    sentiment_score = parse_first_number(sentiment_score) or 0
+
+    score = 0
+    if grey_premium >= 20:
+        score += 3
+    elif grey_premium >= 10:
+        score += 2
+    elif grey_premium > 0:
+        score += 1
+
+    if oversub >= 50:
+        score += 3
+    elif oversub >= 20:
+        score += 2
+    elif oversub > 5:
+        score += 1
+
+    score += min(sector_score, 2)
+    score += min(inst_score, 1)
+    score += min(sentiment_score, 1)
+
+    win_rate = 0.3 + (score / 10) * 0.5
+    return round(win_rate * 100, 1)
+
+
+def parse_first_number(value: object) -> float | None:
+    """Extract the first numeric value from messy IPO source text."""
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(match.group()) if match else None
+
+
+def parse_price_midpoint(value: object) -> float | None:
+    """Parse offer price or price range into a midpoint."""
+    if value is None or pd.isna(value):
+        return None
+    numbers = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", str(value).replace(",", ""))]
+    if not numbers:
+        return None
+    return sum(numbers[:2]) / min(len(numbers), 2)
+
+
+def format_price(value: float | None) -> str:
+    """Format optional IPO price values."""
+    return "N/A" if value is None or pd.isna(value) else f"{value:.2f}"
+
+
+def ipo_theme_score(theme_text: str) -> int:
+    """Score IPO theme heat out of 20."""
+    text = theme_text.lower()
+    hot = ("ai", "semiconductor", "robotics", "biotech", "platform", "cloud", "cyber", "ev", "battery")
+    medium = ("health", "software", "consumer", "fintech", "energy", "industrial")
+    if any(word in text for word in hot):
+        return 20
+    if any(word in text for word in medium):
+        return 12
+    return 6
+
+
+def ipo_oversubscription_score(value: object) -> int:
+    """Score IPO demand from oversubscription multiple out of 15."""
+    multiple = parse_first_number(value)
+    if multiple is None:
+        return 6
+    if multiple > 100:
+        return 15
+    if multiple >= 30:
+        return 12
+    if multiple >= 10:
+        return 8
+    return 3
+
+
+def ipo_institutional_score(text: str) -> int:
+    """Score cornerstone quality out of 15."""
+    lowered = text.lower()
+    top_names = ("blackrock", "hillhouse", "tencent", "alibaba", "gic", "temasek", "fidelity", "sovereign")
+    if any(name in lowered for name in top_names):
+        return 15
+    if lowered and lowered != "n/a":
+        return 8
+    return 4
+
+
+def ipo_underwriter_score(text: str) -> int:
+    """Score sponsor or underwriter quality out of 10."""
+    lowered = text.lower()
+    top_names = ("goldman", "morgan stanley", "jpmorgan", "ubs", "cicc", "citic", "huatai", "bofa", "merrill")
+    if any(name in lowered for name in top_names):
+        return 10
+    if lowered and lowered != "n/a":
+        return 5
+    return 3
+
+
+def ipo_financial_score(text: str) -> int:
+    """Simple financial-quality proxy out of 10."""
+    lowered = text.lower()
+    if "profitable" in lowered or "profit" in lowered and "loss" not in lowered:
+        return 10
+    if "growth" in lowered or "revenue" in lowered:
+        return 7
+    if "loss" in lowered:
+        return 3
+    return 5
+
+
+def ipo_supply_score(shares_or_cap_text: str) -> int:
+    """Simple supply-pressure proxy out of 10."""
+    number = parse_first_number(shares_or_cap_text)
+    if number is None:
+        return 6
+    if number < 50:
+        return 10
+    if number < 200:
+        return 7
+    return 4
+
+
+def ipo_grey_score(premium_pct: float | None) -> int:
+    """Score grey-market performance out of 5."""
+    if premium_pct is None or pd.isna(premium_pct):
+        return 2
+    if premium_pct > 15:
+        return 5
+    if premium_pct >= 0:
+        return 3
+    return 0
+
+
+def ipo_action_from_score(score: int) -> str:
+    """Map 0-100 IPO score to application action."""
+    if score >= 80:
+        return "APPLY"
+    if score >= 65:
+        return "SMALL APPLY"
+    if score >= 50:
+        return "WATCH GREY MARKET"
+    return "SKIP"
+
+
+def ipo_first_day_plan(offer_price: float | None, grey_price: float | None, premium_pct: float | None) -> dict:
+    """Generate first-day entry, stop, targets, and open strategy."""
+    entry = grey_price or offer_price or 0
+    if entry <= 0:
+        return {"entry": "N/A", "stop loss": "N/A", "TP1": "N/A", "TP2": "N/A", "TP3": "N/A", "first day strategy": "Data unavailable"}
+
+    stop_candidates = [entry * 0.93]
+    if offer_price:
+        stop_candidates.append(offer_price * 0.99)
+    stop_loss = min(stop_candidates)
+    tp1 = entry * 1.12
+    tp2 = entry * 1.28
+    tp3 = entry * 1.50
+
+    if premium_pct is not None and premium_pct > 20:
+        strategy = "Take profit quickly on open spike"
+    elif premium_pct is not None and premium_pct >= 10:
+        strategy = "Scalp / quick trade only"
+    elif premium_pct is not None and premium_pct < 0:
+        strategy = "Do not chase"
+    else:
+        strategy = "Wait for open strength and VWAP hold"
+
+    return {
+        "entry": round(entry, 2),
+        "stop loss": round(stop_loss, 2),
+        "TP1": round(tp1, 2),
+        "TP2": round(tp2, 2),
+        "TP3": round(tp3, 2),
+        "first day strategy": strategy,
+    }
+
+
+def live_news_summary(*parts: str) -> Tuple[str, int]:
+    """Summarize available source text and score keyword sentiment."""
+    text = " ".join(part for part in parts if part and part != "N/A")
+    score = keyword_sentiment_score(text)
+    if not text.strip():
+        return "News unavailable", score
+    return text[:220], score
+
+
+def score_live_ipo(record: dict) -> dict:
+    """Normalize, score, and enrich one live IPO record."""
+    offer_price = parse_price_midpoint(record.get("offer price"))
+    grey_price = parse_price_midpoint(record.get("grey market price"))
+    assessed_premium, grey_label = grey_market_assessment(record.get("grey market price"), record.get("offer price"))
+    premium = record.get("grey market premium %")
+    if premium is None:
+        premium = assessed_premium
+    premium = round(float(premium), 2) if premium is not None and not pd.isna(premium) else None
+    open_proxy = record.get("expected open price") or record.get("grey market price")
+    open_behavior = (
+        open_decision(
+            open_proxy,
+            record.get("offer price"),
+            record.get("opening volume ratio", 0),
+            record.get("first 5m high", "N/A"),
+        )
+        if parse_price_midpoint(open_proxy) is not None
+        else "Await open data"
+    )
+
+    news_summary, sentiment = live_news_summary(
+        record.get("latest news summary", ""),
+        record.get("theme", ""),
+        record.get("cornerstone investors", ""),
+        record.get("sponsor / underwriter", ""),
+    )
+    theme_points = ipo_theme_score(record.get("theme", "") + " " + record.get("company", ""))
+    sector_probability_score = 2 if theme_points >= 20 else 1 if theme_points >= 12 else 0
+    institutional_probability_score = 1 if (
+        ipo_institutional_score(record.get("cornerstone investors", "")) >= 8
+        or ipo_underwriter_score(record.get("sponsor / underwriter", "")) >= 5
+    ) else 0
+    win_probability = ipo_win_probability(
+        premium or 0,
+        record.get("oversubscription"),
+        sector_probability_score,
+        institutional_probability_score,
+        sentiment,
+    )
+    score = (
+        theme_points
+        + 8
+        + ipo_oversubscription_score(record.get("oversubscription"))
+        + ipo_institutional_score(record.get("cornerstone investors", ""))
+        + ipo_underwriter_score(record.get("sponsor / underwriter", ""))
+        + ipo_financial_score(news_summary)
+        + ipo_supply_score(record.get("shares offered", "") or record.get("minimum subscription amount", ""))
+        + ipo_grey_score(premium)
+    )
+    score = int(max(0, min(score + sentiment * 3, 100)))
+    plan = ipo_first_day_plan(offer_price, grey_price, premium)
+
+    enriched = {
+        "ticker": record.get("ticker", "N/A"),
+        "company": record.get("company", "N/A"),
+        "market": record.get("market", "N/A"),
+        "status": record.get("status", "Data unavailable"),
+        "offer price": record.get("offer price", "N/A"),
+        "lot size": record.get("lot size", "N/A"),
+        "minimum subscription amount": record.get("minimum subscription amount", "N/A"),
+        "application deadline": record.get("application deadline", "N/A"),
+        "listing date": record.get("listing date", record.get("expected IPO date", "N/A")),
+        "sponsor / underwriter": record.get("sponsor / underwriter", "N/A"),
+        "theme": record.get("theme", "N/A"),
+        "cornerstone investors": record.get("cornerstone investors", "N/A"),
+        "oversubscription": record.get("oversubscription", "N/A"),
+        "cornerstone quality": "Strong" if ipo_institutional_score(record.get("cornerstone investors", "")) >= 12 else "Average",
+        "grey market price": format_price(grey_price),
+        "grey market premium %": "Grey market unavailable" if premium is None else round(premium, 2),
+        "grey market label": grey_label,
+        "grey market source": record.get("grey market source", "N/A"),
+        "last updated": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "IPO score": score,
+        "Win Probability %": win_probability,
+        "action": ipo_action_from_score(score),
+        "open decision": open_behavior,
+        "latest news headline": record.get("latest news headline", news_summary),
+        "latest news summary": news_summary,
+        **plan,
+    }
+    return enriched
+
+
+def unavailable_ipo_row(market: str, reason: str) -> dict:
+    """Return a safe placeholder row when live IPO sources fail."""
+    return score_live_ipo(
+        {
+            "ticker": "N/A",
+            "company": f"{market} IPO data unavailable",
+            "market": market,
+            "status": reason,
+            "offer price": "N/A",
+            "theme": "N/A",
+            "latest news summary": reason,
+        }
+    )
+
+
+def manual_fallback_ipo_rows(market: str, reason: str) -> pd.DataFrame:
+    """Return editable-looking fallback rows with all common IPO fields."""
+    templates = [
+        ("Manual IPO 1", "applying / upcoming"),
+        ("Manual IPO 2", "grey market / upcoming"),
+        ("Manual IPO 3", "watchlist"),
+    ]
+    rows = []
+    for index, (company, status) in enumerate(templates, start=1):
+        rows.append(
+            score_live_ipo(
+                {
+                    "ticker": f"MANUAL{index}",
+                    "company": company,
+                    "market": market,
+                    "status": f"{status} - live data unavailable",
+                    "offer price": "N/A",
+                    "lot size": "N/A",
+                    "minimum subscription amount": "N/A",
+                    "application deadline": "N/A",
+                    "listing date": "N/A",
+                    "sponsor / underwriter": "N/A",
+                    "cornerstone investors": "N/A",
+                    "oversubscription": "N/A",
+                    "theme": "Manual fallback",
+                    "latest news summary": reason,
+                    "grey market price": "N/A",
+                    "grey market source": "Grey market unavailable",
+                }
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def source_debug(name: str, ok: bool, count: int = 0, error: str = "") -> dict:
+    """Build a source debug entry."""
+    return {"source": name, "ok": ok, "count": count, "error": error}
+
+
+def safe_read_html_tables(html: str) -> List[pd.DataFrame]:
+    """Read HTML tables with multiple parsers so lxml failure is not fatal."""
+    tables: List[pd.DataFrame] = []
+    for flavor in ("lxml", "html5lib", "bs4"):
+        try:
+            tables = pd.read_html(StringIO(html), flavor=flavor)
+            if tables:
+                return tables
+        except Exception:
+            continue
+    return tables
+
+
+def clean_hk_ticker(text: str) -> str:
+    """Extract a Hong Kong ticker from source text."""
+    match = re.search(r"\b(\d{4,5})\.?\s*(?:HK|HKG)[A-Za-z]*\b", text, flags=re.IGNORECASE)
+    return f"{match.group(1)[-4:]}.HK" if match else "N/A"
+
+
+def clean_ipo_text(value: object, default: str = "N/A") -> str:
+    """Return a compact text value while preserving clear missing fields."""
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "n/a", "-"}:
+        return default
+    return re.sub(r"\s+", " ", text)
+
+
+def clean_hk_company_name(text: str, ticker: str) -> str:
+    """Remove ticker and quote-page noise from a Hong Kong IPO company field."""
+    company = clean_ipo_text(text)
+    if company == "N/A":
+        return company
+    company = re.sub(r"\bGrey Market Today\b|\bMarket Today\b|\bDetail Quote\b", "", company, flags=re.IGNORECASE)
+    company = re.sub(r"\b\d{4,5}\.?(?:HK|HKG)?[A-Za-z]*\b", "", company, flags=re.IGNORECASE)
+    if ticker != "N/A":
+        company = company.replace(ticker.replace(".HK", ""), "")
+    return clean_ipo_text(company)
+
+
+def value_by_keywords(row: pd.Series, keywords: Tuple[str, ...], default: str = "N/A") -> str:
+    """Find a row value whose column name matches one of the keywords."""
+    for column, value in row.items():
+        column_text = str(column).lower()
+        cleaned = clean_ipo_text(value)
+        if any(keyword in column_text for keyword in keywords) and cleaned != "N/A":
+            return cleaned
+    return default
+
+
+def looks_like_hk_ipo_table(table: pd.DataFrame) -> bool:
+    """Detect source tables that contain actual IPO rows, not page navigation."""
+    if table.empty or table.shape[1] < 2:
+        return False
+
+    columns_text = " ".join(str(column).lower() for column in table.columns)
+    sample_text = " ".join(str(value).lower() for value in table.head(6).to_numpy().flatten())
+    haystack = f"{columns_text} {sample_text}"
+
+    chrome_keywords = (
+        "real-time futures",
+        "local indices",
+        "world indices",
+        "top 20",
+        "interactive chart",
+        "company announcement",
+        "short selling",
+        "sitemap",
+        "disclaimer",
+    )
+    strong_ipo_keywords = (
+        "offer price",
+        "listing price",
+        "lot size",
+        "entry fee",
+        "closing date",
+        "grey market date",
+        "listing date",
+        "over-sub",
+        "sponsor",
+        "ipo listing",
+    )
+    if any(keyword in haystack for keyword in chrome_keywords) and not any(keyword in haystack for keyword in strong_ipo_keywords):
+        return False
+
+    signal_count = sum(keyword in haystack for keyword in strong_ipo_keywords)
+    has_company_signal = any(keyword in columns_text for keyword in ("name", "company", "stock"))
+    has_hk_code = bool(re.search(r"\b\d{4,5}\.?\s*(?:hk|hkg)\b", haystack))
+    has_code_column = "code" in columns_text
+    has_summary_price = "offer price" in columns_text or "listing price" in columns_text or "ipo price" in columns_text
+    has_summary_dates = "listing date" in columns_text or "ipo listing" in columns_text
+    return signal_count >= 2 and has_company_signal and (has_code_column or has_hk_code) and (has_summary_price or has_summary_dates)
+
+
+def looks_like_ipo_row(joined: str, ticker: str, company: str) -> bool:
+    """Keep only rows with enough IPO-specific information to be actionable."""
+    text = joined.lower()
+    if company == "N/A" and ticker == "N/A":
+        return False
+    if any(keyword in text for keyword in ("last update:", "sitemap", "disclaimer", "no related information")):
+        return False
+    row_signals = sum(
+        keyword in text
+        for keyword in (
+            "grey market",
+            "listing",
+            "offer",
+            "health care",
+            "biotechnology",
+            "hardware",
+            "software",
+            "sponsor",
+            "lot",
+            "entry fee",
+        )
+    )
+    has_date = bool(re.search(r"20\d{2}[/-]\d{1,2}[/-]\d{1,2}", text))
+    has_price = bool(re.search(r"\b\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\b", text))
+    return row_signals >= 1 and (ticker != "N/A" or has_date or has_price)
+
+
+def normalize_hk_ipo_table(table: pd.DataFrame, source_name: str, source_url: str) -> List[dict]:
+    """Convert a messy HK IPO HTML table into scored IPO records."""
+    table = table.fillna("N/A")
+    if isinstance(table.columns, pd.MultiIndex):
+        table.columns = [" ".join(str(part) for part in column if str(part) != "nan") for column in table.columns]
+    if not looks_like_hk_ipo_table(table):
+        return []
+
+    records: List[dict] = []
+    for _, row in table.head(40).iterrows():
+        values = [clean_ipo_text(value) for value in row.tolist()]
+        joined = " | ".join(values)
+        if len(joined) < 10:
+            continue
+        ticker = clean_hk_ticker(joined)
+        company = value_by_keywords(row, ("company", "name", "stock"), values[0] if values else "N/A")
+        company = clean_hk_company_name(company, ticker)
+        if not looks_like_ipo_row(joined, ticker, company):
+            continue
+        offer_price = value_by_keywords(row, ("offer price", "listing price", "ipo price", "price range"), "N/A")
+        lot_size = value_by_keywords(row, ("lot size", "board lot"), "N/A")
+        minimum = value_by_keywords(row, ("entry fee", "minimum subscription", "subscription amount"), "N/A")
+        deadline = value_by_keywords(row, ("closing date", "application deadline", "deadline"), "N/A")
+        listing = value_by_keywords(row, ("listing date", "debut date", "ipo listing"), "N/A")
+        sponsor = value_by_keywords(row, ("sponsor", "underwriter", "bookrunner"), "N/A")
+        industry = value_by_keywords(row, ("industry", "sector", "business"), joined)
+        oversub = value_by_keywords(row, ("over-sub", "oversub", "oversubscription"), "N/A")
+        grey = value_by_keywords(row, ("phillip grey market", "futu (hk) grey market", "grey market price", "gray market price", "暗盤價"), "N/A")
+        records.append(
+            score_live_ipo(
+                {
+                    "ticker": ticker,
+                    "company": company,
+                    "market": "HK",
+                    "status": "applying / upcoming",
+                    "offer price": offer_price,
+                    "lot size": lot_size,
+                    "minimum subscription amount": minimum,
+                    "application deadline": deadline,
+                    "listing date": listing,
+                    "sponsor / underwriter": sponsor,
+                    "cornerstone investors": value_by_keywords(row, ("cornerstone", "investor"), "N/A"),
+                    "oversubscription": oversub,
+                    "theme": industry,
+                    "latest news summary": f"{source_name}: {joined[:180]}",
+                    "grey market price": grey,
+                    "grey market source": "Grey market unavailable" if grey == "N/A" else source_name,
+                }
+            )
+        )
+    return records
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def fetch_us_live_ipos() -> pd.DataFrame:
+    """Best-effort US IPO calendar fetch from Nasdaq public calendar endpoint."""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/market-activity/ipos",
+    }
+    date_key = pd.Timestamp.today().strftime("%Y-%m")
+    try:
+        response = requests.get(
+            f"https://api.nasdaq.com/api/ipo/calendar?date={date_key}",
+            headers=headers,
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data", {}).get("priced", {}).get("rows", [])
+        rows += payload.get("data", {}).get("upcoming", {}).get("rows", [])
+        records = []
+        for row in rows:
+            company = row.get("companyName") or row.get("name") or "N/A"
+            ticker = row.get("proposedTickerSymbol") or row.get("symbol") or "N/A"
+            price_range = row.get("proposedSharePrice") or row.get("price") or "N/A"
+            records.append(
+                score_live_ipo(
+                    {
+                        "ticker": ticker,
+                        "company": company,
+                        "market": "US",
+                        "status": "upcoming",
+                        "offer price": price_range,
+                        "listing date": row.get("expectedPriceDate") or row.get("pricedDate") or "N/A",
+                        "application deadline": "N/A",
+                        "shares offered": row.get("sharesOffered", "N/A"),
+                        "sponsor / underwriter": row.get("underwriters", "N/A"),
+                        "theme": row.get("sector") or row.get("industry") or "N/A",
+                        "latest news summary": f"{company} IPO calendar entry from Nasdaq.",
+                    }
+                )
+            )
+        return pd.DataFrame(records) if records else pd.DataFrame([unavailable_ipo_row("US", "Data unavailable")])
+    except Exception as exc:
+        return pd.DataFrame([unavailable_ipo_row("US", f"Data unavailable: {exc}")])
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def fetch_hk_live_ipos() -> Tuple[pd.DataFrame, dict]:
+    """Best-effort HK IPO scrape with ordered fallbacks and visible debug metadata."""
+    sources = [
+        ("HKEX new listings", "https://www.hkexnews.hk/app/appindex.html"),
+        ("AAStocks IPO Center", "https://www.aastocks.com/en/stocks/market/ipo/upcomingipo/company-summary"),
+        ("ETNet IPO Center", "https://www.etnet.com.hk/www/eng/stocks/ipo/ipo.php"),
+        ("Investing.com IPO Calendar", "https://www.investing.com/ipo-calendar/"),
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36"}
+    failed: List[dict] = []
+    last_updated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for source_name, url in sources:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            tables = safe_read_html_tables(response.text)
+            records: List[dict] = []
+            for table in tables:
+                records.extend(normalize_hk_ipo_table(table, source_name, url))
+            deduped = list({(record["ticker"], record["company"]): record for record in records}.values())
+            if deduped:
+                debug = {
+                    "source_used": source_name,
+                    "last_updated": last_updated,
+                    "count": len(deduped),
+                    "failed_sources": failed,
+                }
+                return pd.DataFrame(deduped), debug
+            failed.append(source_debug(source_name, False, 0, "No usable IPO rows found"))
+        except Exception as exc:
+            failed.append(source_debug(source_name, False, 0, str(exc)))
+
+    try:
+        import feedparser
+
+        feed = feedparser.parse("https://finance.yahoo.com/rss/ipo")
+        records = []
+        for entry in feed.entries[:10]:
+            title = entry.get("title", "N/A")
+            records.append(
+                score_live_ipo(
+                    {
+                        "ticker": "N/A",
+                        "company": title[:80],
+                        "market": "HK",
+                        "status": "news watch",
+                        "offer price": "N/A",
+                        "theme": title,
+                        "latest news summary": title,
+                        "grey market price": "N/A",
+                        "grey market source": "Grey market unavailable",
+                    }
+                )
+            )
+        if records:
+            debug = {
+                "source_used": "Yahoo Finance / RSS news search",
+                "last_updated": last_updated,
+                "count": len(records),
+                "failed_sources": failed,
+            }
+            return pd.DataFrame(records), debug
+        failed.append(source_debug("Yahoo Finance / RSS news search", False, 0, "No feed entries"))
+    except Exception as exc:
+        failed.append(source_debug("Yahoo Finance / RSS news search", False, 0, str(exc)))
+
+    reason = "All live sources failed; using manual fallback table."
+    debug = {
+        "source_used": "Manual fallback table",
+        "last_updated": last_updated,
+        "count": 3,
+        "failed_sources": failed,
+    }
+    return manual_fallback_ipo_rows("HK", reason), debug
+
+
+def render_status_card(title: str, value: str, tone: str, detail: str = "") -> None:
+    """Render a dark IPO summary card with green, yellow, or red accent color."""
+    colors = {"green": "#22c55e", "yellow": "#eab308", "red": "#ef4444"}
+    color = colors.get(tone, "#94a3b8")
+    st.markdown(
+        f"""
+        <div style="background:#111827;border:1px solid #243244;border-left:5px solid {color};
+                    border-radius:10px;padding:14px 16px;margin-bottom:10px;">
+            <div style="color:#94a3b8;font-size:13px;">{title}</div>
+            <div style="color:{color};font-size:24px;font-weight:800;">{value}</div>
+            <div style="color:#cbd5e1;font-size:13px;">{detail}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_ipo_manual_calculator() -> None:
+    """Render the manual IPO scoring and trading-plan calculator."""
+    st.markdown(
+        """
+        <style>
+        .ipo-panel {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 18px;
+            color: #e5e7eb;
+        }
+        .ipo-panel h3 { color: #f8fafc; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption("Manual IPO planning module with grey-market pricing, scoring, risk, and strategy labels.")
+
+    input_col, score_col = st.columns([1, 1])
+    with input_col:
+        st.subheader("IPO Input")
+        ipo_name = st.text_input("IPO name", value="Example AI Robotics IPO")
+        ipo_ticker = st.text_input("Ticker", value="IPOX").upper()
+        price_low, price_high = st.columns(2)
+        listing_low = price_low.number_input("Listing price lower", min_value=0.0, value=10.0, step=0.1)
+        listing_high = price_high.number_input("Listing price upper", min_value=0.0, value=12.0, step=0.1)
+        lot_size = st.number_input("Lot size", min_value=1, value=100, step=10)
+        min_subscription = st.number_input("Minimum subscription amount", min_value=0.0, value=1200.0, step=100.0)
+        lots = st.number_input("Number of lots", min_value=1, value=1, step=1)
+
+        st.subheader("Grey Market")
+        grey_low, grey_high = st.columns(2)
+        grey_market_lower = grey_low.number_input("Grey market price lower", min_value=0.0, value=13.0, step=0.1)
+        grey_market_upper = grey_high.number_input("Grey market price upper", min_value=0.0, value=15.0, step=0.1)
+        expected_open = st.number_input("Expected open price", min_value=0.0, value=14.0, step=0.1)
+        st.subheader("Opening Behavior")
+        opening_volume_ratio = st.number_input("Opening volume ratio vs normal", min_value=0.0, value=1.5, step=0.1)
+        first_5m_high = st.number_input("First 5-minute high", min_value=0.0, value=14.5, step=0.1)
+
+    with score_col:
+        st.subheader("IPO Scoring Inputs")
+        revenue_growth = st.slider("Revenue growth %", min_value=-50, max_value=300, value=40, step=5)
+        profitability = st.selectbox("Profitability", ["Profitable", "Near breakeven", "Loss making"])
+        industry = st.selectbox("Industry", ["AI", "Biotech", "Cybersecurity", "Cloud", "Consumer", "Industrial", "Other"])
+        oversubscription = st.number_input("Oversubscription multiplier", min_value=0.0, value=10.0, step=1.0)
+        news_text = st.text_area(
+            "News / sentiment keywords",
+            value="strong demand, AI, oversubscribed",
+            help="Positive: oversubscribed, hot IPO, AI, strong demand. Negative: loss making, weak demand, cut valuation.",
+            height=100,
+        )
+        social_buzz = st.slider("Social buzz score", min_value=1, max_value=3, value=2)
+        cornerstone = st.selectbox("Cornerstone investors", ["Strong", "Some", "None"])
+        underwriter = st.selectbox("Underwriter strength", ["Goldman / Morgan Stanley / JPM", "Major bank", "Regional / unknown"])
+        similar_performance = st.selectbox("Similar IPO past performance", ["Strong", "Mixed", "Weak"])
+
+    listing_reference = (listing_low + listing_high) / 2 if listing_high > 0 else listing_low
+    grey_entry = (grey_market_lower + grey_market_upper) / 2 if grey_market_upper > 0 else grey_market_lower
+    grey_entry = grey_entry if grey_entry > 0 else expected_open
+    expected_return_pct = ((expected_open - listing_reference) / listing_reference * 100) if listing_reference > 0 else 0
+    assessed_grey_premium, grey_market_label = grey_market_assessment(grey_entry, listing_reference)
+    grey_market_premium_pct = assessed_grey_premium if assessed_grey_premium is not None else 0
+    risk_low_pct = ((grey_market_lower - listing_reference) / listing_reference * 100) if listing_reference > 0 else 0
+    risk_high_pct = ((grey_market_upper - listing_reference) / listing_reference * 100) if listing_reference > 0 else 0
+
+    fundamentals_score = 0.0
+    fundamentals_score += 1 if revenue_growth >= 50 else 0.5 if revenue_growth >= 20 else 0
+    fundamentals_score += 1 if profitability == "Profitable" else 0.5 if profitability == "Near breakeven" else 0
+    fundamentals_score += 1 if industry in {"AI", "Biotech", "Cybersecurity", "Cloud"} else 0.5 if industry == "Industrial" else 0
+
+    news_score = keyword_sentiment_score(news_text)
+    sentiment_score = 0.0
+    sentiment_score += 2 if oversubscription > 50 else 1 if oversubscription >= 10 else 0
+    sentiment_score += 1 if news_score > 0 else 0.5 if news_score == 0 else 0
+    sentiment_score += social_buzz / 3
+
+    institutional_score = 0.0
+    institutional_score += 1 if cornerstone == "Strong" else 0.5 if cornerstone == "Some" else 0
+    institutional_score += 1 if underwriter == "Goldman / Morgan Stanley / JPM" else 0.5 if underwriter == "Major bank" else 0
+
+    technical_ipo_score = {"Strong": 2.0, "Mixed": 1.0, "Weak": 0.0}[similar_performance]
+    ipo_score = round(min(fundamentals_score + sentiment_score + institutional_score + technical_ipo_score, 10), 1)
+    recommendation = ipo_score_label(ipo_score)
+
+    entry_price = grey_entry
+    breakout_level = expected_open * 1.03
+    stop_loss = min(entry_price * 0.93, listing_reference * 0.99) if listing_reference > 0 else entry_price * 0.93
+    risk_pct = ((entry_price - stop_loss) / entry_price * 100) if entry_price > 0 else 0
+    tp1 = entry_price * 1.15
+    tp2 = entry_price * 1.30
+    tp3 = entry_price * 1.50
+    shares = lots * lot_size
+    total_capital = max(min_subscription * lots, shares * entry_price)
+    max_risk = max(entry_price - stop_loss, 0) * shares
+    reward_tp1 = max(tp1 - entry_price, 0) * shares
+    reward_tp2 = max(tp2 - entry_price, 0) * shares
+    reward_tp3 = max(tp3 - entry_price, 0) * shares
+    strategy_label = ipo_strategy_label(grey_market_premium_pct)
+    open_behavior = open_decision(expected_open, listing_reference, opening_volume_ratio, first_5m_high)
+    sector_probability_score = 2 if industry in {"AI", "Biotech", "Cybersecurity", "Cloud"} else 1 if industry in {"Industrial", "Consumer"} else 0
+    institutional_probability_score = 1 if cornerstone != "None" or underwriter != "Regional / unknown" else 0
+    win_probability = ipo_win_probability(
+        grey_market_premium_pct,
+        oversubscription,
+        sector_probability_score,
+        institutional_probability_score,
+        news_score,
+    )
+
+    tone = "green" if recommendation == "STRONG SUBSCRIBE" else "yellow" if recommendation == "SMALL BET" else "red"
+    win_tone = "green" if win_probability >= 65 else "yellow" if win_probability >= 50 else "red"
+    strategy_detail = "Flip Strategy: sell into open spike. Hold Strategy: only if price holds breakout level with strong volume."
+    if strategy_label == "FAST SWING":
+        strategy_detail = "Fast Swing: hold only while price stays above breakout or grey-market support."
+    elif strategy_label == "RISKY":
+        strategy_detail = "Risky: weak grey-market premium. Reduce size or avoid until price confirms."
+
+    st.subheader("IPO Output Panel")
+    summary_cols = st.columns(6)
+    with summary_cols[0]:
+        render_status_card("IPO Score", f"{ipo_score}/10", tone, recommendation)
+    with summary_cols[1]:
+        render_status_card("Win Probability", f"{win_probability:.1f}%", win_tone, "Grey premium + demand model")
+    with summary_cols[2]:
+        render_status_card("Grey Market", grey_market_label, "green" if grey_market_premium_pct >= 10 else "yellow" if grey_market_premium_pct > 0 else "red", f"{grey_market_premium_pct:.2f}% premium")
+    with summary_cols[3]:
+        render_status_card("Risk", f"{risk_pct:.2f}%", "red" if risk_pct > 8 else "yellow")
+    with summary_cols[4]:
+        render_status_card("Strategy Label", strategy_label, tone, strategy_detail)
+    with summary_cols[5]:
+        open_tone = "green" if open_behavior == "OPEN STRONG -> HOLD / SCALE OUT" else "yellow" if open_behavior in {"TAKE PROFIT PARTIAL", "SCALP ONLY"} else "red"
+        render_status_card("Open Decision", open_behavior, open_tone, "Gap + opening volume rule")
+
+    plan_col, risk_col = st.columns([1.2, 1])
+    with plan_col:
+        st.markdown("### Trading Plan")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Plan Item": "IPO", "Value": f"{ipo_name} ({ipo_ticker})"},
+                    {"Plan Item": "Grey market entry price", "Value": f"{entry_price:.2f}"},
+                    {"Plan Item": "IPO open breakout level", "Value": f"{breakout_level:.2f}"},
+                    {"Plan Item": "Stop loss", "Value": f"{stop_loss:.2f}"},
+                    {"Plan Item": "TP1", "Value": f"{tp1:.2f} (+15%)"},
+                    {"Plan Item": "TP2", "Value": f"{tp2:.2f} (+30%)"},
+                    {"Plan Item": "TP3", "Value": f"{tp3:.2f} (+50%, strong momentum only)"},
+                    {"Plan Item": "Open Decision", "Value": open_behavior},
+                    {"Plan Item": "Flip Strategy", "Value": "Sell into open spike or failed breakout."},
+                    {"Plan Item": "Hold Strategy", "Value": "Only if strong trend holds above breakout level."},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    with risk_col:
+        st.markdown("### Risk Calculation")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Metric": "Lots", "Value": f"{lots}"},
+                    {"Metric": "Shares", "Value": f"{shares}"},
+                    {"Metric": "Total capital used", "Value": f"{total_capital:.2f}"},
+                    {"Metric": "Max risk", "Value": f"{max_risk:.2f}"},
+                    {"Metric": "Reward at TP1", "Value": f"{reward_tp1:.2f}"},
+                    {"Metric": "Reward at TP2", "Value": f"{reward_tp2:.2f}"},
+                    {"Metric": "Reward at TP3", "Value": f"{reward_tp3:.2f}"},
+                    {"Metric": "Grey market premium", "Value": f"{grey_market_premium_pct:.2f}%"},
+                    {"Metric": "Grey market assessment", "Value": grey_market_label},
+                    {"Metric": "Expected open return", "Value": f"{expected_return_pct:.2f}%"},
+                    {"Metric": "Opening volume ratio", "Value": f"{opening_volume_ratio:.2f}x"},
+                    {"Metric": "First 5-minute high", "Value": f"{first_5m_high:.2f}"},
+                    {"Metric": "IPO win probability", "Value": f"{win_probability:.1f}%"},
+                    {"Metric": "Grey market risk range", "Value": f"{risk_low_pct:.2f}% to {risk_high_pct:.2f}%"},
+                    {"Metric": "Keyword sentiment", "Value": f"{news_score}"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.caption("IPO module is for planning only. Confirm allotment, live prices, fees, liquidity, and exchange rules before trading.")
+
+
+LIVE_IPO_COLUMNS = [
+    "ticker",
+    "company",
+    "market",
+    "status",
+    "offer price",
+    "lot size",
+    "minimum subscription amount",
+    "application deadline",
+    "listing date",
+    "sponsor / underwriter",
+    "theme",
+    "cornerstone investors",
+    "oversubscription",
+    "cornerstone quality",
+    "grey market price",
+    "grey market premium %",
+    "grey market label",
+    "grey market source",
+    "IPO score",
+    "Win Probability %",
+    "action",
+    "open decision",
+    "entry",
+    "stop loss",
+    "TP1",
+    "TP2",
+    "first day strategy",
+    "latest news headline",
+    "latest news summary",
+    "last updated",
+]
+
+
+def live_ipo_summary_cards(data: pd.DataFrame, market: str) -> None:
+    """Show top IPO cards for the live IPO watchlist."""
+    if data.empty:
+        st.info("Data unavailable")
+        return
+    valid = data[data["ticker"] != "N/A"].copy()
+    source = valid if not valid.empty else data
+    best = source.sort_values("IPO score", ascending=False).iloc[0]
+    grey_numeric = pd.to_numeric(source["grey market premium %"], errors="coerce")
+    grey_winner = source.loc[grey_numeric.idxmax()] if grey_numeric.notna().any() else None
+    high_risk = source.sort_values("IPO score", ascending=True).iloc[0]
+
+    cards = st.columns(5)
+    with cards[0]:
+        render_status_card("Best IPO to apply", best["ticker"], "green" if best["IPO score"] >= 80 else "yellow", best["action"])
+    with cards[1]:
+        render_status_card(f"Hottest {market} IPO", best["company"][:24], "green", f"Score {best['IPO score']}")
+    with cards[2]:
+        if market == "HK" and grey_winner is not None:
+            render_status_card("Grey market winner", grey_winner["ticker"], "green", f"{grey_winner['grey market premium %']}%")
+        else:
+            render_status_card("Grey market winner", "N/A", "yellow", "Grey market unavailable")
+    with cards[3]:
+        render_status_card("High risk IPO", high_risk["ticker"], "red", high_risk["action"])
+    with cards[4]:
+        render_status_card("Live source", "Best effort", "yellow", "Confirm with broker/prospectus")
+
+
+def render_ipo_debug(debug: dict | None) -> None:
+    """Show visible live IPO source diagnostics."""
+    if not debug:
+        return
+    with st.expander("Live IPO source debug", expanded=True):
+        st.write(f"Source used: {debug.get('source_used', 'N/A')}")
+        st.write(f"Last updated: {debug.get('last_updated', 'N/A')}")
+        st.write(f"Number of IPOs found: {debug.get('count', 0)}")
+        failed = debug.get("failed_sources", [])
+        if failed:
+            st.write("Failed sources:")
+            st.dataframe(pd.DataFrame(failed), width="stretch", hide_index=True)
+        else:
+            st.caption("No failed sources before the selected source.")
+
+
+def render_live_ipo_table(market: str, data: pd.DataFrame, debug: dict | None = None) -> None:
+    """Render filters, grey-market override, and the live IPO table."""
+    st.subheader(f"{market} IPO Live Watchlist")
+    if data.empty:
+        st.warning("Data unavailable")
+        return
+
+    render_ipo_debug(debug)
+    live_ipo_summary_cards(data, market)
+
+    filter_cols = st.columns(5)
+    only_applying = filter_cols[0].checkbox("Show only applying IPOs", value=False, key=f"{market}_ipo_applying")
+    only_hk = filter_cols[1].checkbox("Show only HK IPOs", value=(market == "HK"), key=f"{market}_ipo_hk")
+    only_us = filter_cols[2].checkbox("Show only US IPOs", value=(market == "US"), key=f"{market}_ipo_us")
+    only_apply = filter_cols[3].checkbox("Show only APPLY / SMALL APPLY", value=False, key=f"{market}_ipo_apply")
+    only_grey = filter_cols[4].checkbox("Show only grey market available", value=False, key=f"{market}_ipo_grey")
+
+    display = data.copy()
+    if only_applying:
+        display = display[display["status"].str.contains("applying", case=False, na=False)]
+    if only_hk:
+        display = display[display["market"] == "HK"]
+    if only_us:
+        display = display[display["market"] == "US"]
+    if only_apply:
+        display = display[display["action"].isin(["APPLY", "SMALL APPLY"])]
+    if only_grey:
+        display = display[pd.to_numeric(display["grey market premium %"], errors="coerce").notna()]
+
+    if market == "HK" and not data.empty:
+        with st.expander("Manual grey market override"):
+            tickers = data["ticker"].tolist()
+            selected = st.selectbox("IPO ticker", tickers, key=f"{market}_grey_ticker")
+            override_price = st.number_input("Grey market price override", min_value=0.0, value=0.0, step=0.01, key=f"{market}_grey_price")
+            override_source = st.text_input("Grey market source", value="Manual override", key=f"{market}_grey_source")
+            if st.button("Apply grey market override", key=f"{market}_grey_apply") and override_price > 0:
+                mask = display["ticker"] == selected
+                offer = parse_price_midpoint(display.loc[mask, "offer price"].iloc[0]) if mask.any() else None
+                premium = ((override_price - offer) / offer * 100) if offer else None
+                display.loc[mask, "grey market price"] = f"{override_price:.2f}"
+                display.loc[mask, "grey market premium %"] = round(premium, 2) if premium is not None else "N/A"
+                display.loc[mask, "grey market source"] = override_source
+
+    if display.empty:
+        st.info("No IPOs match the current filters.")
+    else:
+        st.dataframe(display.reindex(columns=LIVE_IPO_COLUMNS, fill_value="N/A"), width="stretch", hide_index=True)
+
+    st.caption(
+        "IPO data, grey market price, news and sentiment may be delayed or inaccurate. "
+        "Always confirm with broker or official prospectus before applying or trading."
+    )
+
+
+def render_ipo_scanner() -> None:
+    """Render live IPO discovery plus the existing manual calculator."""
+    st.caption("Automatic IPO discovery is best-effort. Manual override remains available when live data is unavailable.")
+    hk_tab, us_tab, manual_tab = st.tabs(["HK IPO Live", "US IPO Live", "IPO Manual Calculator"])
+
+    with hk_tab:
+        hk_data, hk_debug = fetch_hk_live_ipos()
+        render_live_ipo_table("HK", hk_data, hk_debug)
+
+    with us_tab:
+        us_data = fetch_us_live_ipos()
+        render_live_ipo_table("US", us_data)
+
+    with manual_tab:
+        render_ipo_manual_calculator()
+
+
+def combined_session_results() -> pd.DataFrame:
+    """Combine latest scan outputs from any scanner tab."""
+    frames = []
+    for key in ("us_results", "hk_results", "swing_results"):
+        frame = st.session_state.get(key)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["ticker"], keep="first")
+
+
+def render_top_5_trades() -> None:
+    """Render AI selected top five trades as rule-based cards."""
+    st.subheader("AI Selected Top 5 Trades")
+    results = combined_session_results()
+    if results.empty:
+        st.info("Run a US or HK scan first, then return here for Top 5 picks.")
+        return
+
+    picks = select_ai_top_5(results)
+    cols = st.columns(5)
+    for index, (_, row) in enumerate(picks.iterrows()):
+        with cols[index % 5]:
+            label = ai_trade_label(row)
+            tone = "red" if label in {"TOO EXTENDED", "EARNINGS RISK"} else "green" if label == "BEST BUY SETUP" else "yellow"
+            render_status_card(row["ticker"], label, tone, f"Final {row['Final Score']} | {row['Action Label']}")
+            st.write(f"Company: {row.get('Company Name', 'N/A')}")
+            st.write(f"Theme: {row.get('Sector ETF', 'N/A')}")
+            st.write(f"Close: {row.get('close', 'N/A')}")
+            st.write(f"VCP: {row.get('VCP Status', 'N/A')}")
+            st.write(f"Pivot: {row.get('Pivot', 'N/A')}")
+            st.write(f"Entry: {row.get('Entry Trigger', 'N/A')}")
+            st.write(f"Stop: {row.get('Stop Loss', 'N/A')}")
+            st.write(f"Risk: {row.get('Risk %', 'N/A')}%")
+            st.write(f"2R / 3R: {row.get('Target 2R', 'N/A')} / {row.get('Target 3R', 'N/A')}")
+            st.write(f"Earnings: {row.get('Earnings Date', 'N/A')} ({row.get('Earnings Risk', 'N/A')})")
+            st.caption(row.get("AI Trading Notes", ""))
+
+
+def render_alerts() -> None:
+    """Render Telegram and email alert settings plus send buttons."""
+    st.subheader("Breakout Alert System")
+    results = combined_session_results()
+    with st.sidebar:
+        st.header("Alert Settings")
+        enable_telegram = st.toggle("Enable Telegram alert", value=False, key="alert_telegram_on")
+        telegram_token = st.text_input("Telegram bot token", value=get_secret("telegram_bot_token"), type="password", key="telegram_token")
+        telegram_chat_id = st.text_input("Telegram chat ID", value=get_secret("telegram_chat_id"), key="telegram_chat_id")
+        enable_email = st.toggle("Enable Email alert", value=False, key="alert_email_on")
+        smtp_email = st.text_input("SMTP email", value=get_secret("smtp_email"), key="smtp_email")
+        smtp_password = st.text_input("SMTP password", value=get_secret("smtp_password"), type="password", key="smtp_password")
+        recipient_email = st.text_input("Recipient email", value=get_secret("recipient_email"), key="recipient_email")
+
+    if results.empty:
+        st.info("Run a scan first. Alerts use the latest US/HK scanner results.")
+        return
+
+    picks = select_ai_top_5(results)
+    st.write("Today alert candidates:")
+    st.dataframe(round_display_values(picks[["ticker", "Action Label", "Final Score", "Breakout Alert", "Earnings Date", "Earnings Risk", "AI Trading Notes"]]), width="stretch", hide_index=True)
+
+    def send_message(message: str) -> None:
+        sent_any = False
+        if enable_telegram:
+            ok, status = send_telegram_message(telegram_token, telegram_chat_id, message)
+            st.success(status) if ok else st.warning(status)
+            sent_any = sent_any or ok
+        if enable_email:
+            ok, status = send_email_message(smtp_email, smtp_password, recipient_email, message)
+            st.success(status) if ok else st.warning(status)
+            sent_any = sent_any or ok
+        if not sent_any and not (enable_telegram or enable_email):
+            st.info("Enable Telegram or Email alert first. Missing credentials are ignored safely.")
+
+    if st.button("Send Test Alert", type="secondary"):
+        sample = picks.iloc[0] if not picks.empty else results.iloc[0]
+        send_message("TEST ALERT\n\n" + alert_message(sample))
+
+    if st.button("Send Today's Top 5 Alert", type="primary"):
+        message = "\n\n---\n\n".join(alert_message(row) for _, row in picks.iterrows())
+        send_message(message)
+
+
+def render_settings() -> None:
+    """Render app settings and operational notes."""
+    st.subheader("Settings")
+    st.write("Alert credentials can be typed in the Alerts sidebar or provided via Streamlit secrets:")
+    st.code(
+        "telegram_bot_token = '...'\ntelegram_chat_id = '...'\nsmtp_email = '...'\nsmtp_password = '...'\nrecipient_email = '...'",
+        language="toml",
+    )
+    st.write("The app skips failed tickers and missing yfinance earnings data instead of crashing.")
+
+
+def render_swing_scanner(
+    title: str = "Swing Scanner",
+    mode_options: List[str] | None = None,
+    default_mode: str = "Market Leaders 300",
+    key_prefix: str = "swing",
+) -> None:
+    """Render the Streamlit swing scanner tab."""
+    st.subheader(title)
     st.caption("Daily end-of-day scanner for VCP / J Law / Minervini-style swing-trading preparation.")
+    mode_options = mode_options or SCAN_MODES
+    default_index = mode_options.index(default_mode) if default_mode in mode_options else 0
 
     with st.sidebar:
-        st.header("Scanner")
-        scan_mode = st.selectbox("Scan Mode", SCAN_MODES)
+        st.header(f"{title} Controls")
+        scan_mode = st.selectbox("Scan Mode", mode_options, index=default_index, key=f"{key_prefix}_scan_mode")
         custom_tickers = st.text_area(
             "Custom tickers",
             value="AAPL, MSFT, NVDA, AMD, META, TSLA",
             height=120,
             disabled=scan_mode != "Custom Input",
+            key=f"{key_prefix}_custom_tickers",
         )
 
         preset_tickers = PRESET_UNIVERSES.get(scan_mode, [])
+        if scan_mode == "US Pro Market Scan":
+            preset_tickers = US_PRO_UNIVERSE
+        elif scan_mode == "HK Pro Market Scan":
+            preset_tickers = HK_PRO_UNIVERSE
+        elif scan_mode == "Combined US + HK Scan":
+            preset_tickers = COMBINED_PRO_UNIVERSE
         tickers = normalize_tickers(custom_tickers) if scan_mode == "Custom Input" else preset_tickers
 
-        st.caption(f"{len(tickers)} tickers selected. Preset scans are capped at 300 symbols.")
-        min_price = st.number_input("Minimum price", min_value=0.0, value=10.0, step=1.0)
-        min_market_cap_b = st.number_input("Minimum market cap ($B)", min_value=0.0, value=5.0, step=0.5)
-        min_dollar_volume_m = st.number_input("Minimum avg dollar volume ($M)", min_value=0.0, value=20.0, step=5.0)
+        st.caption(f"{len(tickers)} tickers selected. Preset scans are capped at 500 symbols.")
+        is_hk_mode = "HK" in scan_mode
+        min_price_default = 1.0 if is_hk_mode else 10.0
+        min_price = st.number_input("Minimum price", min_value=0.0, value=min_price_default, step=1.0, key=f"{key_prefix}_min_price")
+        min_market_cap_b = st.number_input("Minimum market cap ($B)", min_value=0.0, value=5.0, step=0.5, key=f"{key_prefix}_min_cap")
+        min_dollar_volume_m = st.number_input("Minimum avg turnover / dollar volume ($M)", min_value=0.0, value=20.0, step=5.0, key=f"{key_prefix}_min_dv")
+        include_small_caps = st.checkbox("Include small caps", value=False, key=f"{key_prefix}_small_caps") if is_hk_mode else False
 
         st.divider()
-        show_all = st.checkbox("Show all", value=False)
-        only_ready_pullback = st.checkbox("Show only READY / PULLBACK", value=False)
-        only_trade_watchlist = st.checkbox("Show only Trade + Watchlist", value=False)
-        hide_extended = st.checkbox("Hide EXTENDED", value=False)
-        run_scan = st.button("Run Scan", type="primary", width="stretch")
+        show_all = st.checkbox("Show all", value=False, key=f"{key_prefix}_show_all")
+        show_full_diagnostics = st.checkbox("Show full diagnostics", value=False, key=f"{key_prefix}_diagnostics")
+        only_ready_pullback = st.checkbox("Show only READY / PULLBACK", value=False, key=f"{key_prefix}_ready")
+        only_trade_watchlist = st.checkbox("Show only Trade + Watchlist", value=False, key=f"{key_prefix}_trade_watch")
+        hide_extended = st.checkbox("Hide EXTENDED", value=False, key=f"{key_prefix}_hide_extended")
+        run_scan = st.button("Run Scan", type="primary", width="stretch", key=f"{key_prefix}_run")
 
     if run_scan:
         if not tickers:
@@ -1722,15 +3266,15 @@ def main() -> None:
                 tickers=tickers,
                 mode=scan_mode,
                 min_price=min_price,
-                min_market_cap=min_market_cap_b * 1_000_000_000,
+                min_market_cap=(0 if include_small_caps else min_market_cap_b * 1_000_000_000),
                 min_dollar_volume=min_dollar_volume_m * 1_000_000,
             )
-            st.session_state["results"] = results
-            st.session_state["indicator_data"] = indicator_data
-            st.session_state["summary"] = summary
-            st.session_state["scan_mode"] = scan_mode
+            st.session_state[f"{key_prefix}_results"] = results
+            st.session_state[f"{key_prefix}_indicator_data"] = indicator_data
+            st.session_state[f"{key_prefix}_summary"] = summary
+            st.session_state[f"{key_prefix}_last_scan_mode"] = scan_mode
 
-    if "results" not in st.session_state:
+    if f"{key_prefix}_results" not in st.session_state:
         st.info("Choose a scan mode, adjust the filters, then run the scan for your daily watchlist.")
         st.caption(
             "For education and trade planning only. Not financial advice. Data may be delayed or inaccurate. "
@@ -1738,9 +3282,9 @@ def main() -> None:
         )
         return
 
-    results = st.session_state.get("results", pd.DataFrame())
-    indicator_data = st.session_state.get("indicator_data", {})
-    summary = st.session_state.get("summary", {})
+    results = st.session_state.get(f"{key_prefix}_results", pd.DataFrame())
+    indicator_data = st.session_state.get(f"{key_prefix}_indicator_data", {})
+    summary = st.session_state.get(f"{key_prefix}_summary", {})
     required_result_columns = {
         "Trade",
         "Trade Reason",
@@ -1755,10 +3299,15 @@ def main() -> None:
         "Final Score",
         "WATCHLIST FLAG",
         "Watchlist Reason",
+        "Breakout Alert",
+        "Earnings Date",
+        "Days to Earnings",
+        "Earnings Setup Score",
+        "AI Trading Notes",
     }
 
     if not results.empty and not required_result_columns.issubset(results.columns):
-        st.session_state.pop("results", None)
+        st.session_state.pop(f"{key_prefix}_results", None)
         st.info("The scanner was upgraded with new decision fields. Run a fresh scan to rebuild the table.")
         return
 
@@ -1771,7 +3320,19 @@ def main() -> None:
     metric_cols[1].metric("Market Score", f"{market_score}/4")
     metric_cols[2].metric("Sector Score", f"{sector_score}/3")
     metric_cols[3].metric("Stocks Passed", len(results))
-    metric_cols[4].metric("Mode", st.session_state.get("scan_mode", scan_mode))
+    metric_cols[4].metric("Mode", st.session_state.get(f"{key_prefix}_last_scan_mode", scan_mode))
+
+    dashboard_cols = st.columns(6)
+    dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
+    dashboard_cols[1].metric("Watchlist", int((results["WATCHLIST FLAG"] == "YES").sum()))
+    dashboard_cols[2].metric("Near Breakouts", int((results["Breakout Alert"] == "NEAR BREAKOUT").sum()))
+    dashboard_cols[3].metric("Confirmed Breakouts", int((results["Breakout Alert"] == "CONFIRMED BREAKOUT").sum()))
+    dashboard_cols[4].metric("Earnings Risk", int((results["Earnings Risk"] == "HIGH RISK").sum()))
+    best_sector = results.groupby("Sector ETF")["Final Score"].mean().sort_values(ascending=False).index[0] if not results.empty else "N/A"
+    dashboard_cols[5].metric("Best Sector", best_sector)
+    high_earnings_count = int((results["Earnings Risk"] == "HIGH RISK").sum())
+    if high_earnings_count:
+        st.warning(f"Earnings risk active: {high_earnings_count} stocks report within 7 days.")
 
     with st.expander("Market and filter details", expanded=True):
         st.write("Market:", " | ".join(summary.get("market_details", [])) or "No market data yet.")
@@ -1810,41 +3371,57 @@ def main() -> None:
         ascending=[True, True, False, False],
     )
 
-    display_columns = [
+    compact_columns = [
         "ticker",
         "close",
-        "market cap",
-        "avg dollar volume",
-        "RSI",
-        "RS Score",
-        "Trend Score",
-        "Technical Score",
-        "Sector Score",
-        "Sector Leadership",
-        "Market Score",
         "Final Score",
-        "VCP Status",
-        "Contractions",
-        "Pivot",
-        "Distance to Pivot %",
-        "Action Label",
-        "Tightness Score",
-        "Tightness Label",
-        "RR Ratio",
-        "RR Score",
-        "Volume Confirmation",
-        "Earnings Risk",
         "Trade",
         "WATCHLIST FLAG",
-        "Trade Reason",
-        "Watchlist Reason",
+        "Action Label",
+        "Breakout Alert",
+        "Earnings Date",
+        "Earnings Risk",
+        "Earnings Setup Score",
+        "Trend Score",
+        "Technical Score",
+        "RS Score",
+        "Tightness Score",
+        "RR Score",
+        "Pivot",
         "Entry Trigger",
         "Stop Loss",
         "Risk %",
         "Target 2R",
         "Target 3R",
+        "AI Trading Notes",
+    ]
+    diagnostic_columns = compact_columns + [
+        "market cap",
+        "avg dollar volume",
+        "RSI",
+        "Sector Score",
+        "Sector ETF",
+        "Sector Leadership",
+        "Market Score",
+        "VCP Status",
+        "Contractions",
+        "Distance to Pivot %",
+        "Tightness Label",
+        "RR Ratio",
+        "Volume Confirmation",
+        "Trade Reason",
+        "Watchlist Reason",
+        "Days to Earnings",
+        "EPS Estimate",
+        "Revenue Estimate",
+        "Last EPS Surprise %",
+        "Last Revenue Surprise %",
+        "Earnings Trend",
+        "Earnings Strategy",
+        "Post-Earnings Label",
         "Notes",
     ]
+    display_columns = diagnostic_columns if show_full_diagnostics else compact_columns
 
     focus_source = results.copy()
     focus_source["trade sort"] = np.where(focus_source["Trade"] == "YES", 0, 1)
@@ -1893,7 +3470,7 @@ def main() -> None:
         )
 
     selectable = visible if not visible.empty else results
-    selected_ticker = st.selectbox("Review ticker", selectable["ticker"].tolist())
+    selected_ticker = st.selectbox("Review ticker", selectable["ticker"].tolist(), key=f"{key_prefix}_review")
     selected_row = results[results["ticker"] == selected_ticker].iloc[0]
     selected_data = indicator_data.get(selected_ticker)
 
@@ -1926,6 +3503,71 @@ def main() -> None:
         "For education and trade planning only. Not financial advice. Data may be delayed or inaccurate. "
         "Confirm live price and volume in your broker before trading."
     )
+
+
+def main() -> None:
+    """Render the IPO + Swing Pro Scanner app."""
+    st.set_page_config(page_title="IPO + Swing Pro Scanner", page_icon="IPO", layout="wide")
+    st.markdown(
+        """
+        <style>
+        .stApp { background: #020617; color: #e5e7eb; }
+        [data-testid="stSidebar"] { background: #0f172a; }
+        [data-testid="stMetric"] {
+            background: #111827;
+            border: 1px solid #1e293b;
+            border-radius: 10px;
+            padding: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.title("IPO + Swing Pro Scanner")
+    st.caption("Daily swing-trading scanner plus IPO grey-market scoring and trade planning.")
+
+    us_tab, hk_tab, ipo_tab, top5_tab, alerts_tab, settings_tab = st.tabs(
+        ["US Scanner", "HK Scanner", "IPO Scanner", "Top 5 Trades", "Alerts", "Settings"]
+    )
+    with us_tab:
+        render_swing_scanner(
+            title="US Scanner",
+            mode_options=[
+                "US Pro Market Scan",
+                "Combined US + HK Scan",
+                "AI / Semiconductor",
+                "AI Infrastructure / Power",
+                "Cloud / Software",
+                "Cybersecurity",
+                "Data Center / Networking",
+                "Energy / Oil & Gas",
+                "Defense / Aerospace",
+                "Financials / Fintech",
+                "Consumer Growth",
+                "Biotech / Healthcare Growth",
+                "Industrials / Infrastructure",
+                "Crypto / Blockchain Stocks",
+                "Market Leaders 300",
+                "Custom Input",
+            ],
+            default_mode="US Pro Market Scan",
+            key_prefix="us",
+        )
+    with hk_tab:
+        render_swing_scanner(
+            title="HK Scanner",
+            mode_options=["HK Pro Market Scan", "Combined US + HK Scan", "Custom Input"],
+            default_mode="HK Pro Market Scan",
+            key_prefix="hk",
+        )
+    with ipo_tab:
+        render_ipo_scanner()
+    with top5_tab:
+        render_top_5_trades()
+    with alerts_tab:
+        render_alerts()
+    with settings_tab:
+        render_settings()
 
 
 if __name__ == "__main__":
