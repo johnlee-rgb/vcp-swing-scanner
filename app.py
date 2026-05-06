@@ -615,6 +615,33 @@ for universe_name, universe_tickers in PRESET_UNIVERSES.items():
     for symbol in universe_tickers:
         SECTOR_ETF_BY_TICKER.setdefault(symbol, primary_etf)
 
+UNIVERSE_SECTOR_FALLBACKS = {
+    "AI / Semiconductor": ("Technology", "Semiconductors"),
+    "AI Infrastructure / Power": ("Utilities", "AI infrastructure / power"),
+    "Cloud / Software": ("Technology", "Software - Application"),
+    "Cybersecurity": ("Technology", "Cybersecurity"),
+    "Data Center / Networking": ("Technology", "Data center / networking"),
+    "Robotics / Automation": ("Industrials", "Robotics / automation"),
+    "Nuclear / Uranium": ("Energy", "Nuclear / uranium"),
+    "Energy / Oil & Gas": ("Energy", "Oil & gas"),
+    "Defense / Aerospace": ("Industrials", "Aerospace & defense"),
+    "Financials / Fintech": ("Financial Services", "Financials / fintech"),
+    "Biotech / Healthcare Growth": ("Healthcare", "Biotechnology / healthcare growth"),
+    "Consumer Growth": ("Consumer Cyclical", "Consumer growth"),
+    "Industrials / Infrastructure": ("Industrials", "Infrastructure"),
+    "Crypto / Blockchain Stocks": ("Financial Services", "Crypto / digital assets"),
+    "Growth Leaders": ("Technology", "Growth leaders"),
+}
+
+MANUAL_SECTOR_MAP: Dict[str, Tuple[str, str]] = {}
+for universe_name, universe_tickers in PRESET_UNIVERSES.items():
+    fallback_sector = UNIVERSE_SECTOR_FALLBACKS.get(universe_name)
+    if fallback_sector:
+        for symbol in universe_tickers:
+            MANUAL_SECTOR_MAP.setdefault(symbol, fallback_sector)
+for symbol in MARKET_LEADERS_BASE:
+    MANUAL_SECTOR_MAP.setdefault(symbol, ("Technology", "Market leader"))
+
 MARKET_TICKERS = [
     "SPY",
     "QQQ",
@@ -915,6 +942,9 @@ def classify_theme_group(ticker: str, sector: str, industry: str) -> str:
 @st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
 def fetch_sector_industry_one(ticker: str) -> dict:
     """Fetch one ticker's sector/industry metadata and cache it for seven days."""
+    fallback_sector, fallback_industry = MANUAL_SECTOR_MAP.get(ticker.upper(), ("N/A", "N/A"))
+    if ticker.endswith(".HK") and fallback_sector == "N/A":
+        fallback_sector, fallback_industry = "Hong Kong", "HK liquid leader"
     sector = "N/A"
     industry = "N/A"
     try:
@@ -923,6 +953,10 @@ def fetch_sector_industry_one(ticker: str) -> dict:
         industry = info.get("industry") or "N/A"
     except Exception:
         pass
+    if sector == "N/A":
+        sector = fallback_sector
+    if industry == "N/A":
+        industry = fallback_industry
 
     if sector == "N/A" and industry == "N/A":
         display = "N/A"
@@ -946,6 +980,28 @@ def fetch_sector_industry_one(ticker: str) -> dict:
 def download_sector_industry(tickers: Tuple[str, ...]) -> Dict[str, dict]:
     """Fetch sector/industry metadata from yfinance and cache it for seven days."""
     return {ticker: fetch_sector_industry_one(ticker) for ticker in tickers}
+
+
+def fallback_sector_industry_one(ticker: str) -> dict:
+    """Return instant manual sector metadata without touching yfinance."""
+    sector, industry = MANUAL_SECTOR_MAP.get(ticker.upper(), ("N/A", "N/A"))
+    if ticker.endswith(".HK") and sector == "N/A":
+        sector, industry = "Hong Kong", "HK liquid leader"
+    if sector == "N/A" and industry == "N/A":
+        display = "N/A"
+    elif sector == "N/A":
+        display = industry
+    elif industry == "N/A":
+        display = sector
+    else:
+        display = f"{sector} / {industry}"
+    return {
+        "sector": sector,
+        "industry": industry,
+        "sector_industry": display,
+        "sector_group": classify_sector_group(ticker, sector, industry),
+        "theme_group": classify_theme_group(ticker, sector, industry),
+    }
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
@@ -1587,7 +1643,7 @@ def detect_extension(data: pd.DataFrame) -> Tuple[bool, float, float, str]:
     latest = data.iloc[-1]
     ma10_distance = (latest["Close"] - latest["MA10"]) / latest["MA10"] * 100
     ma20_distance = (latest["Close"] - latest["MA20"]) / latest["MA20"] * 100
-    extended = bool(ma10_distance > 10 or ma20_distance > 15 or latest["RSI14"] > 85)
+    extended = bool(ma10_distance > 12 or (latest["RSI14"] > 85 and ma10_distance > 8))
 
     if extended:
         warning = f"Extended: {ma10_distance:.1f}% above MA10, {ma20_distance:.1f}% above MA20"
@@ -1993,6 +2049,7 @@ def determine_signal_state(
     market_environment: str,
     live_breakout_status: str,
     stage_label: str,
+    live_mode: bool = False,
 ) -> Tuple[str, str, str, str, str]:
     """Map scanner evidence into J Law / Minervini-style signal states."""
     price_above_key_mas = bool(latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"])
@@ -2000,7 +2057,7 @@ def determine_signal_state(
     exceptional_volume = pd.notna(avg_vol20) and avg_vol20 > 0 and latest["Volume"] >= 1.3 * avg_vol20
     volume_confirmed = volume_confirmation == "YES" or exceptional_volume
     risk_ok = pd.notna(risk_pct) and risk_pct <= 10
-    risk_too_high = pd.isna(risk_pct) or risk_pct > 10
+    risk_too_high = pd.isna(risk_pct) or risk_pct > 12
     rs_buy_ok = score_at_least(rs_score, 7)
     rs_momentum_ok = score_at_least(rs_score, 8)
     setup_a = setup_grade in {"A+", "A"}
@@ -2009,7 +2066,7 @@ def determine_signal_state(
     near_resistance = pd.notna(resistance_distance_pct) and -1 <= resistance_distance_pct <= 5
     structure_valid = action not in {"FAILED"} and latest["Close"] >= latest["MA50"]
 
-    market_correction = market_environment == "CORRECTION"
+    market_correction = live_mode and market_environment == "CORRECTION"
     rvol_confirmed = pd.notna(rvol) and rvol > 2
 
     if pd.notna(ma10_distance) and ma10_distance > 12:
@@ -2041,7 +2098,7 @@ def determine_signal_state(
         final_score >= 90
         and rs_momentum_ok
         and explosive_score >= 8
-        and breakout_quality_score >= 7
+        and (not live_mode or breakout_quality_score >= 7)
         and trend_score >= 7
         and technical_score >= 7
         and price_above_key_mas
@@ -2054,7 +2111,7 @@ def determine_signal_state(
         and stage_label not in {"STAGE 3 RISK", "STAGE 4"}
     )
     if momentum_base:
-        if (volume_confirmed or momentum_breakout_candidate or live_breakout_status == "LIVE BREAKOUT") and not market_correction:
+        if (volume_confirmed or momentum_breakout_candidate or (live_mode and live_breakout_status == "LIVE BREAKOUT")) and not market_correction:
             return (
                 "BUY NOW",
                 "YES",
@@ -2075,12 +2132,12 @@ def determine_signal_state(
         and final_score >= 85
         and rs_buy_ok
         and explosive_score >= 7
-        and breakout_quality_score >= 7
+        and (not live_mode or breakout_quality_score >= 7)
         and risk_ok
         and price_above_key_mas
         and ma10_rising
         and breakout_state
-        and (volume_confirmed or rvol_confirmed or live_breakout_status == "LIVE BREAKOUT")
+        and (volume_confirmed or (live_mode and (rvol_confirmed or live_breakout_status == "LIVE BREAKOUT")))
         and earnings_risk_label != "HIGH RISK"
         and not market_correction
         and stage_label not in {"STAGE 3 RISK", "STAGE 4"}
@@ -2107,10 +2164,10 @@ def determine_signal_state(
         and final_score >= 85
         and rs_buy_ok
         and explosive_score >= 7
-        and breakout_quality_score >= 6
+        and (not live_mode or breakout_quality_score >= 6)
         and risk_ok
         and (near_pivot or near_resistance or resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH")
-        and not (volume_confirmed or rvol_confirmed)
+        and not (volume_confirmed or (live_mode and rvol_confirmed))
         and structure_valid
         and stage_label not in {"STAGE 4"}
     )
@@ -2537,6 +2594,7 @@ def is_momentum_breakout_candidate(
     ma10_rising: bool,
     breakout_quality_score: int = 0,
     rvol: float = np.nan,
+    live_mode: bool = False,
 ) -> bool:
     """Allow exceptional high-momentum breakouts even when they are not pure VCPs."""
     price_above_key_mas = latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"]
@@ -2553,7 +2611,7 @@ def is_momentum_breakout_candidate(
         and price_above_key_mas
         and ma10_rising
         and volume_ok
-        and breakout_quality_score >= 7
+        and (not live_mode or breakout_quality_score >= 7)
         and pd.notna(risk_pct)
         and risk_pct <= 10
         and pd.notna(ma10_distance)
@@ -2886,6 +2944,7 @@ def build_scan_row(
     benchmark_data: Dict[str, pd.DataFrame],
     sector_etf: str,
     market_environment: str = "UPTREND UNDER PRESSURE",
+    live_mode: bool = False,
     aggressive_mode: bool = False,
 ) -> dict:
     """Build the output row and stash chart-specific detail fields."""
@@ -2923,9 +2982,12 @@ def build_scan_row(
         market_score=market_score,
         tightness_score=tightness_score,
     )
-    rvol, intraday_volume_ratio, rvol_label = calculate_intraday_volume_metrics(
-        latest, quote_info, scan_timestamps.get("session_status", "MARKET CLOSED")
-    )
+    if live_mode:
+        rvol, intraday_volume_ratio, rvol_label = calculate_intraday_volume_metrics(
+            latest, quote_info, scan_timestamps.get("session_status", "MARKET CLOSED")
+        )
+    else:
+        rvol, intraday_volume_ratio, rvol_label = np.nan, np.nan, "EOD only"
     stage_label = detect_stage_analysis(data)
     institutional_action = detect_institutional_action(data)
     breakout_quality_score = calculate_breakout_quality_score(
@@ -2976,6 +3038,7 @@ def build_scan_row(
         ma10_rising=ma10_rising,
         breakout_quality_score=breakout_quality_score,
         rvol=rvol,
+        live_mode=live_mode,
     )
     if momentum_breakout_candidate:
         action = "MOMENTUM BREAKOUT"
@@ -3014,15 +3077,19 @@ def build_scan_row(
     if (not momentum_breakout_candidate) and quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
-    live_breakout_status = detect_live_breakout_status(
-        latest=latest,
-        pivot=pivot,
-        rvol=rvol,
-        intraday_volume_ratio=intraday_volume_ratio,
-        rs_score=rs_score,
-        setup_grade=quality_grade,
+    live_breakout_status = (
+        detect_live_breakout_status(
+            latest=latest,
+            pivot=pivot,
+            rvol=rvol,
+            intraday_volume_ratio=intraday_volume_ratio,
+            rs_score=rs_score,
+            setup_grade=quality_grade,
+        )
+        if live_mode
+        else "EOD ONLY"
     )
-    if live_breakout_status == "LIVE BREAKOUT" and quality_grade in {"A+", "A"}:
+    if live_mode and live_breakout_status == "LIVE BREAKOUT" and quality_grade in {"A+", "A"}:
         volume_confirmation = "YES"
         breakout_alert = "CONFIRMED BREAKOUT"
         current_setup_status = "ACTIVE BREAKOUT"
@@ -3154,6 +3221,7 @@ def build_scan_row(
         market_environment=market_environment,
         live_breakout_status=live_breakout_status,
         stage_label=stage_label,
+        live_mode=live_mode,
     )
     trade = signal_trade
     watchlist_flag = signal_watchlist
@@ -3815,17 +3883,22 @@ def scan_universe(
     min_price: float,
     min_market_cap: float,
     min_dollar_volume: float,
+    live_mode: bool = False,
+    include_earnings: bool = False,
+    fetch_market_caps: bool = False,
+    use_live_sector_metadata: bool = False,
+    max_tickers: int = 50,
     aggressive_mode: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], dict]:
     """Download, filter, score, and return scanner results."""
-    tickers = tickers[:500]
+    tickers = tickers[:max_tickers]
     session_status, market_timestamp, local_timestamp = market_session_status()
     force_token = datetime.now(ZoneInfo("America/New_York")).isoformat()
     is_hk_scan = any(ticker.endswith(".HK") for ticker in tickers) or "HK" in mode
     context_tickers = ALL_CONTEXT_TICKERS if is_hk_scan else MARKET_TICKERS
     all_tickers = tuple(sorted(set(tickers + context_tickers)))
     raw_data = download_daily_data(all_tickers, period="1y", force_token=force_token)
-    quote_data = download_live_quotes(all_tickers)
+    quote_data = download_live_quotes(all_tickers) if live_mode else {}
     quote_applied: Dict[str, bool] = {}
     synchronized_raw: Dict[str, pd.DataFrame] = {}
     for symbol, frame in raw_data.items():
@@ -3847,8 +3920,8 @@ def scan_universe(
         market_score, market_status, market_details = calculate_market_score(market_data)
     market_environment = calculate_market_environment(market_data, is_hk_scan=is_hk_scan and mode == "HK Pro Market Scan")
     sector_score, sector_details = calculate_sector_score(mode, market_data)
-    market_caps = download_market_caps(tuple(tickers))
-    earnings_data = download_earnings_data(tuple(tickers))
+    market_caps = download_market_caps(tuple(tickers)) if fetch_market_caps else {ticker: None for ticker in tickers}
+    earnings_data = download_earnings_data(tuple(tickers)) if include_earnings else {ticker: {} for ticker in tickers}
     scan_timestamps = {
         "market_timestamp": market_timestamp,
         "local_timestamp": local_timestamp,
@@ -3875,7 +3948,7 @@ def scan_universe(
 
         try:
             sector_etf = SECTOR_ETF_BY_TICKER.get(ticker, SECTOR_ETFS_BY_MODE.get(mode, ["SPY"])[0])
-            sector_info = fetch_sector_industry_one(ticker)
+            sector_info = fetch_sector_industry_one(ticker) if use_live_sector_metadata else fallback_sector_industry_one(ticker)
             rows.append(
                 build_scan_row(
                     ticker=ticker,
@@ -3891,6 +3964,7 @@ def scan_universe(
                     benchmark_data=market_data,
                     sector_etf=sector_etf,
                     market_environment=market_environment.get("status", "UPTREND UNDER PRESSURE"),
+                    live_mode=live_mode,
                     aggressive_mode=aggressive_mode,
                 )
             )
@@ -3906,6 +3980,8 @@ def scan_universe(
         "market_environment_details": market_environment.get("details", ""),
         "distribution_days": market_environment.get("distribution_days", 0),
         "follow_through_day": market_environment.get("follow_through_day", False),
+        "live_mode": live_mode,
+        "scan_limit": max_tickers,
         "market_details": market_details,
         "market_timestamp": market_timestamp,
         "local_timestamp": local_timestamp,
@@ -5334,12 +5410,24 @@ def render_ipo_scanner() -> None:
     hk_tab, us_tab, manual_tab = st.tabs(["HK IPO Live", "US IPO Live", "IPO Manual Calculator"])
 
     with hk_tab:
-        hk_data, hk_debug = fetch_hk_ipo_live()
-        render_live_ipo_table("HK", hk_data, hk_debug)
+        if st.button("Load HK IPO Live Data", key="load_hk_ipo_live"):
+            hk_data, hk_debug = fetch_hk_ipo_live()
+            st.session_state["hk_ipo_live_data"] = hk_data
+            st.session_state["hk_ipo_live_debug"] = hk_debug
+        if "hk_ipo_live_data" in st.session_state:
+            render_live_ipo_table("HK", st.session_state["hk_ipo_live_data"], st.session_state.get("hk_ipo_live_debug"))
+        else:
+            st.info("Live IPO scraping is optional. Click Load HK IPO Live Data when you want it.")
 
     with us_tab:
-        us_data, us_debug = fetch_us_ipo_live()
-        render_live_ipo_table("US", us_data, us_debug)
+        if st.button("Load US IPO Live Data", key="load_us_ipo_live"):
+            us_data, us_debug = fetch_us_ipo_live()
+            st.session_state["us_ipo_live_data"] = us_data
+            st.session_state["us_ipo_live_debug"] = us_debug
+        if "us_ipo_live_data" in st.session_state:
+            render_live_ipo_table("US", st.session_state["us_ipo_live_data"], st.session_state.get("us_ipo_live_debug"))
+        else:
+            st.info("Live IPO scraping is optional. Click Load US IPO Live Data when you want it.")
 
     with manual_tab:
         render_ipo_manual_calculator()
@@ -5681,6 +5769,19 @@ def render_swing_scanner(
 
     with st.sidebar:
         st.header(f"{title} Controls")
+        scanner_mode_kind = st.selectbox(
+            "Scanner Mode",
+            ["EOD Swing Scanner", "Live Breakout Scanner"],
+            index=0,
+            key=f"{key_prefix}_scanner_mode_kind",
+            help="EOD is the fast default for nightly planning. Live Breakout adds quote/RVOL checks only when explicitly run.",
+        )
+        scan_depth = st.selectbox(
+            "Scan Depth",
+            ["Quick Scan (50)", "Normal Scan (150)", "Full Scan (500)"],
+            index=0,
+            key=f"{key_prefix}_scan_depth",
+        )
         scan_mode = st.selectbox("Scan Mode", mode_options, index=default_index, key=f"{key_prefix}_scan_mode")
         custom_tickers = st.text_area(
             "Custom tickers",
@@ -5699,7 +5800,9 @@ def render_swing_scanner(
             preset_tickers = COMBINED_PRO_UNIVERSE
         tickers = normalize_tickers(custom_tickers) if scan_mode == "Custom Input" else preset_tickers
 
-        st.caption(f"{len(tickers)} tickers selected. Preset scans are capped at 500 symbols.")
+        max_tickers = 50 if scan_depth.startswith("Quick") else 150 if scan_depth.startswith("Normal") else 500
+        live_mode = scanner_mode_kind == "Live Breakout Scanner"
+        st.caption(f"{len(tickers)} tickers selected. This run will scan up to {max_tickers} symbols.")
         is_hk_mode = "HK" in scan_mode
         min_price_default = 1.0 if is_hk_mode else 10.0
         min_price = st.number_input("Minimum price", min_value=0.0, value=min_price_default, step=1.0, key=f"{key_prefix}_min_price")
@@ -5747,15 +5850,18 @@ def render_swing_scanner(
         hide_reject = st.checkbox("Hide Reject", value=False, key=f"{key_prefix}_hide_reject")
         only_strong_pullbacks = st.checkbox("Show only pullback entries with RS >= 6", value=False, key=f"{key_prefix}_strong_pullbacks")
         auto_refresh = st.checkbox("Auto refresh every 60 sec", value=False, key=f"{key_prefix}_auto_refresh")
-        run_scan = st.button("Run Scan", type="primary", width="stretch", key=f"{key_prefix}_run")
+        show_position_management = st.checkbox("Show Position Management", value=False, key=f"{key_prefix}_show_pm")
+        run_scan = st.button("Run EOD Scan", type="primary", width="stretch", key=f"{key_prefix}_run")
+        run_live_scan = st.button("Run Live Scan", width="stretch", key=f"{key_prefix}_run_live", disabled=not live_mode)
         force_refresh = st.button("Force Refresh Market Data", width="stretch", key=f"{key_prefix}_force_refresh")
 
     if auto_refresh:
         st.components.v1.html("<script>setTimeout(() => window.parent.location.reload(), 60000);</script>", height=0)
 
-    should_run_scan = run_scan or force_refresh or (
+    should_run_scan = run_scan or run_live_scan or force_refresh or (
         auto_refresh and f"{key_prefix}_results" in st.session_state and st.session_state.get(f"{key_prefix}_last_scan_mode") == scan_mode
     )
+    active_live_mode = bool(live_mode and run_live_scan)
 
     if should_run_scan:
         if not tickers:
@@ -5770,12 +5876,18 @@ def render_swing_scanner(
                 min_price=min_price,
                 min_market_cap=(0 if include_small_caps else min_market_cap_b * 1_000_000_000),
                 min_dollar_volume=min_dollar_volume_m * 1_000_000,
+                live_mode=active_live_mode,
+                include_earnings=scan_depth.startswith("Full"),
+                fetch_market_caps=not scan_depth.startswith("Quick"),
+                use_live_sector_metadata=scan_depth.startswith("Full"),
+                max_tickers=max_tickers,
                 aggressive_mode=aggressive_mode,
             )
             st.session_state[f"{key_prefix}_results"] = results
             st.session_state[f"{key_prefix}_indicator_data"] = indicator_data
             st.session_state[f"{key_prefix}_summary"] = summary
             st.session_state[f"{key_prefix}_last_scan_mode"] = scan_mode
+            st.session_state[f"{key_prefix}_last_scanner_mode_kind"] = "Live Breakout Scanner" if active_live_mode else "EOD Swing Scanner"
 
     if f"{key_prefix}_results" not in st.session_state:
         st.info("Choose a scan mode, adjust the filters, then run the scan for your daily watchlist.")
@@ -5899,7 +6011,7 @@ def render_swing_scanner(
     metric_cols[2].metric("Distribution Days", summary.get("distribution_days", 0))
     metric_cols[3].metric("Follow Through Day", "YES" if summary.get("follow_through_day", False) else "NO")
     metric_cols[4].metric("Stocks Passed", len(results))
-    metric_cols[5].metric("Mode", st.session_state.get(f"{key_prefix}_last_scan_mode", scan_mode))
+    metric_cols[5].metric("Mode", st.session_state.get(f"{key_prefix}_last_scanner_mode_kind", "EOD Swing Scanner"))
 
     dashboard_cols = st.columns(7)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
@@ -6087,6 +6199,8 @@ def render_swing_scanner(
         "Entry Trigger",
         "Stop Loss",
     ]
+    if not summary.get("live_mode", False):
+        compact_columns = [column for column in compact_columns if column not in {"RVOL", "Live Breakout Status"}]
     diagnostic_columns = compact_columns + [
         "% Change",
         "Sector Group",
@@ -6248,13 +6362,7 @@ def render_swing_scanner(
         show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
     with focus_cols[3]:
         show_focus_group("Top Momentum Breakout Exceptions", momentum_focus, "Decision Reason")
-    lower_focus_cols = st.columns(3)
-    with lower_focus_cols[0]:
-        show_focus_group("Top Pullback Setups", pullback_focus, "Decision Reason")
-    with lower_focus_cols[1]:
-        show_focus_group("Extended / Do Not Chase", extended_focus, "Decision Reason")
-    with lower_focus_cols[2]:
-        show_focus_group("Rejected / Avoid", rejected_focus, "Decision Reason")
+    show_focus_group("Top Pullback Setups", pullback_focus, "Decision Reason")
 
     st.subheader("Best Setups")
     if visible.empty:
@@ -6363,7 +6471,8 @@ def render_swing_scanner(
         st.write(f"MA distance: MA10 {selected_row['MA10 Distance %']:.2f}%, MA20 {selected_row['MA20 Distance %']:.2f}%")
         st.write(selected_row["Notes"])
 
-    render_position_management(selected_ticker, selected_row, selected_data, key_prefix)
+    if show_position_management:
+        render_position_management(selected_ticker, selected_row, selected_data, key_prefix)
 
     st.caption(
         "For education and trade planning only. Not financial advice. Data may be delayed or inaccurate. "
