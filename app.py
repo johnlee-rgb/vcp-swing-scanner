@@ -1772,6 +1772,212 @@ def clean_why_selected(
     return f"Not selected yet: {trade_reason}"
 
 
+def classify_setup_type(
+    vcp_status: str,
+    action: str,
+    current_setup_status: str,
+    resistance_breakout_mode: str,
+    momentum_breakout_candidate: bool,
+    latest: pd.Series,
+) -> str:
+    """Separate pattern classification from the raw VCP detector."""
+    if momentum_breakout_candidate:
+        return "MOMENTUM BREAKOUT EXCEPTION"
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        return "RESISTANCE BREAKOUT WATCH"
+    if action == "EXTENDED" or current_setup_status == "EXTENDED":
+        return "EXTENDED"
+    if action == "FAILED" or current_setup_status == "FAILED BREAKOUT":
+        return "FAILED"
+    if vcp_status == "VALID VCP":
+        return "TRUE VCP"
+    if vcp_status == "EARLY VCP":
+        return "EARLY VCP"
+    if action == "PULLBACK ENTRY":
+        close = float(latest["Close"])
+        ma10_gap = abs(close - float(latest["MA10"])) / close * 100 if close else np.nan
+        ma20_gap = abs(close - float(latest["MA20"])) / close * 100 if close else np.nan
+        return "PULLBACK TO MA10" if pd.notna(ma10_gap) and ma10_gap <= 3 else "PULLBACK TO MA20" if pd.notna(ma20_gap) and ma20_gap <= 5 else "PULLBACK TO MA20"
+    return "BASE BUILDING"
+
+
+def determine_signal_state(
+    *,
+    setup_grade: str,
+    final_score: float,
+    rs_score: float,
+    explosive_score: int,
+    risk_pct: float,
+    latest: pd.Series,
+    ma10_rising: bool,
+    breakout_alert: str,
+    volume_confirmation: str,
+    earnings_risk_label: str,
+    vcp_status: str,
+    pivot: PivotInfo,
+    higher_low_structure: bool,
+    volume_contraction: bool,
+    ma10_distance: float,
+    rsi: float,
+    action: str,
+    momentum_breakout_candidate: bool,
+    resistance_breakout_mode: str,
+    resistance_distance_pct: float,
+    technical_score: int,
+    trend_score: int,
+) -> Tuple[str, str, str, str, str]:
+    """Map scanner evidence into J Law / Minervini-style signal states."""
+    price_above_key_mas = bool(latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"])
+    avg_vol20 = latest.get("AvgVol20", np.nan)
+    exceptional_volume = pd.notna(avg_vol20) and avg_vol20 > 0 and latest["Volume"] >= 1.3 * avg_vol20
+    volume_confirmed = volume_confirmation == "YES" or exceptional_volume
+    risk_ok = pd.notna(risk_pct) and risk_pct <= 10
+    risk_too_high = pd.isna(risk_pct) or risk_pct > 10
+    rs_buy_ok = score_at_least(rs_score, 7)
+    rs_momentum_ok = score_at_least(rs_score, 8)
+    setup_a = setup_grade in {"A+", "A"}
+    breakout_state = breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
+    near_pivot = pd.notna(pivot.distance_pct) and 0 <= pivot.distance_pct <= 5
+    near_resistance = pd.notna(resistance_distance_pct) and -1 <= resistance_distance_pct <= 5
+    structure_valid = action not in {"FAILED"} and latest["Close"] >= latest["MA50"]
+
+    if pd.notna(ma10_distance) and ma10_distance > 12:
+        return (
+            "EXTENDED DO NOT CHASE",
+            "NO",
+            "NO",
+            "EXTENDED DO NOT CHASE: price too far above MA10.",
+            "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+        )
+    if risk_too_high:
+        return (
+            "EXTENDED DO NOT CHASE",
+            "NO",
+            "NO",
+            "EXTENDED DO NOT CHASE: risk is above 10%.",
+            "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+        )
+    if pd.notna(rsi) and rsi > 85 and not exceptional_volume:
+        return (
+            "EXTENDED DO NOT CHASE",
+            "NO",
+            "NO",
+            "EXTENDED DO NOT CHASE: RSI is stretched without exceptional volume.",
+            "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+        )
+
+    momentum_base = (
+        final_score >= 90
+        and rs_momentum_ok
+        and explosive_score >= 8
+        and trend_score >= 7
+        and technical_score >= 7
+        and price_above_key_mas
+        and ma10_rising
+        and breakout_state
+        and risk_ok
+        and pd.notna(ma10_distance)
+        and ma10_distance <= 12
+        and earnings_risk_label != "HIGH RISK"
+    )
+    if momentum_base:
+        if volume_confirmed or momentum_breakout_candidate:
+            return (
+                "BUY NOW",
+                "YES",
+                "NO",
+                "BUY NOW: Momentum breakout exception, high RS, strong volume, risk controlled.",
+                "BUY NOW: momentum breakout exception, high RS, strong volume, risk controlled.",
+            )
+        return (
+            "BUY ON BREAKOUT",
+            "NO",
+            "YES",
+            "BUY ON BREAKOUT: high RS momentum setup, waiting for volume confirmation.",
+            "BUY ON BREAKOUT: high RS momentum setup, waiting for volume confirmation.",
+        )
+
+    common_buy = (
+        setup_a
+        and final_score >= 85
+        and rs_buy_ok
+        and explosive_score >= 7
+        and risk_ok
+        and price_above_key_mas
+        and ma10_rising
+        and breakout_state
+        and volume_confirmed
+        and earnings_risk_label != "HIGH RISK"
+    )
+    vcp_breakout = vcp_status in {"VALID VCP", "EARLY VCP"} and latest["Close"] >= pivot.pivot and volume_confirmed
+    pullback_entry = (
+        action == "PULLBACK ENTRY"
+        and (latest["Close"] > latest["MA10"] or latest["Close"] >= latest["MA20"])
+        and higher_low_structure
+        and volume_contraction
+        and volume_confirmed
+    )
+    if common_buy and (vcp_breakout or pullback_entry):
+        return (
+            "BUY NOW",
+            "YES",
+            "NO",
+            "BUY NOW: A+ setup, RS strong, breakout confirmed with volume, risk controlled.",
+            "BUY NOW: A+ setup, RS strong, breakout confirmed with volume, risk controlled.",
+        )
+
+    buy_on_breakout = (
+        setup_a
+        and final_score >= 85
+        and rs_buy_ok
+        and explosive_score >= 7
+        and risk_ok
+        and (near_pivot or near_resistance or resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH")
+        and not volume_confirmed
+        and structure_valid
+    )
+    if buy_on_breakout:
+        return (
+            "BUY ON BREAKOUT",
+            "NO",
+            "YES",
+            "BUY ON BREAKOUT: wait for price to break pivot/resistance with volume.",
+            "BUY ON BREAKOUT: strong setup but needs volume confirmation.",
+        )
+
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        return (
+            "WATCH",
+            "NO",
+            "YES",
+            "WATCH: resistance blocks clean entry; needs breakout above resistance.",
+            "WATCH: good structure but no clean trigger yet.",
+        )
+    if action == "EXTENDED":
+        return (
+            "WAIT PULLBACK",
+            "NO",
+            "YES",
+            "WAIT PULLBACK: extended from MA10, wait for MA10/MA20 support.",
+            "WAIT PULLBACK: extended from MA10, wait for MA10/MA20 support.",
+        )
+    if structure_valid and setup_grade != "Reject" and (vcp_status in {"VALID VCP", "EARLY VCP"} or final_score >= 70 or explosive_score >= 6):
+        return (
+            "WATCH",
+            "NO",
+            "YES",
+            "WATCH: good setup, wait for trigger.",
+            "WATCH: good structure but no clean trigger yet.",
+        )
+    return (
+        "REJECT",
+        "NO",
+        "NO",
+        "REJECT: weak RS, broken structure, or poor risk/reward.",
+        "REJECT: weak RS, broken structure, or poor risk/reward.",
+    )
+
+
 def calculate_rr_score(entry: float, stop: float, target_2r: float) -> Tuple[float | None, str]:
     """Classify risk/reward quality from the planned entry, stop, and 2R target."""
     risk = entry - stop
@@ -1881,10 +2087,46 @@ def calculate_explosive_score(data: pd.DataFrame, pivot: PivotInfo, higher_low_s
     return score, label
 
 
+def first_valid_frame(*frames: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Return the first non-empty dataframe from a list of optional benchmark frames."""
+    for frame in frames:
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            return frame
+    return None
+
+
+def select_rs_benchmarks(ticker: str, benchmark_data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Use HK benchmarks for HK tickers and US benchmarks for US tickers."""
+    if ticker.endswith(".HK"):
+        primary = first_valid_frame(benchmark_data.get("^HSI"), benchmark_data.get("SPY"))
+        fallback = first_valid_frame(benchmark_data.get("2800.HK"), benchmark_data.get("QQQ"), primary)
+        return primary, fallback
+    return first_valid_frame(benchmark_data.get("SPY")), first_valid_frame(benchmark_data.get("QQQ"))
+
+
+def numeric_or_na(value: float | int | str | None) -> float:
+    """Convert optional display values to a numeric value, preserving missing data as NaN."""
+    converted = pd.to_numeric(value, errors="coerce")
+    return float(converted) if pd.notna(converted) else np.nan
+
+
+def score_at_least(value: float | int | str | None, threshold: float) -> bool:
+    """Check numeric thresholds without treating missing RS as zero."""
+    numeric = numeric_or_na(value)
+    return bool(pd.notna(numeric) and numeric >= threshold)
+
+
+def format_score(value: float | int | str | None) -> str:
+    """Format optional scores for human-readable decision text."""
+    numeric = numeric_or_na(value)
+    return "N/A" if pd.isna(numeric) else f"{numeric:g}"
+
+
 def calculate_rs_score(data: pd.DataFrame, spy_data: pd.DataFrame | None, qqq_data: pd.DataFrame | None) -> float:
-    """Score relative strength against SPY and QQQ over 1M, 3M, and 6M."""
+    """Score relative strength against the right benchmarks over 1M, 3M, and 6M."""
     score = 0.0
     weights = {21: 2.0, 63: 1.5, 126: 1.5}
+    comparisons = 0
 
     for days, weight in weights.items():
         stock_return = period_return(data, days)
@@ -1892,12 +2134,15 @@ def calculate_rs_score(data: pd.DataFrame, spy_data: pd.DataFrame | None, qqq_da
             benchmark_return = period_return(benchmark, days)
             if pd.isna(stock_return) or pd.isna(benchmark_return):
                 continue
+            comparisons += 1
             outperformance = stock_return - benchmark_return
             if outperformance > 0:
                 score += weight
             elif outperformance > -2:
                 score += weight * 0.5
 
+    if comparisons == 0:
+        return np.nan
     return round(min(score, 10.0), 1)
 
 
@@ -1980,24 +2225,37 @@ def is_momentum_breakout_candidate(
     final_score: float,
     rs_score: float,
     explosive_score: int,
+    trend_score: int,
+    technical_score: int,
     breakout_alert: str,
     latest: pd.Series,
     volume_dry_up: bool,
     volume_confirmation: str,
     risk_pct: float,
+    ma10_distance: float,
+    earnings_risk_label: str,
+    ma10_rising: bool,
 ) -> bool:
     """Allow exceptional high-momentum breakouts even when they are not pure VCPs."""
     price_above_key_mas = latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"]
-    volume_ok = volume_dry_up or volume_confirmation == "YES"
+    avg_vol20 = latest.get("AvgVol20", np.nan)
+    exceptional_volume = pd.notna(avg_vol20) and avg_vol20 > 0 and latest["Volume"] >= 1.3 * avg_vol20
+    volume_ok = volume_dry_up or volume_confirmation == "YES" or exceptional_volume
     return bool(
         final_score >= 90
-        and rs_score >= 8
+        and score_at_least(rs_score, 8)
         and explosive_score >= 8
+        and trend_score >= 7
+        and technical_score >= 7
         and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
         and price_above_key_mas
+        and ma10_rising
         and volume_ok
         and pd.notna(risk_pct)
         and risk_pct <= 10
+        and pd.notna(ma10_distance)
+        and ma10_distance <= 12
+        and earnings_risk_label != "HIGH RISK"
     )
 
 
@@ -2076,10 +2334,12 @@ def ai_trade_label(row: pd.Series) -> str:
     """Summarize why an AI top-pick card is interesting or risky."""
     if row.get("Earnings Risk") == "HIGH RISK":
         return "EARNINGS RISK"
+    if row.get("Signal State") == "BUY ON BREAKOUT":
+        return "WATCH FOR BREAKOUT"
+    if row.get("Setup Type") == "MOMENTUM BREAKOUT EXCEPTION":
+        return "MOMENTUM BREAKOUT"
     if row.get("Action Label") == "EXTENDED":
         return "TOO EXTENDED"
-    if row.get("Entry Type") == "MOMENTUM BREAKOUT":
-        return "MOMENTUM BREAKOUT"
     if row.get("Trade") == "YES":
         return "BEST BUY SETUP"
     if row.get("Action Label") == "PULLBACK ENTRY":
@@ -2090,7 +2350,8 @@ def ai_trade_label(row: pd.Series) -> str:
 def build_ai_trading_notes(row: dict) -> str:
     """Create compact rule-based notes for table, cards, and alerts."""
     return (
-        f"{row['ticker']} {row['Action Label']} | {row.get('Setup Quality Grade', 'N/A')} | {row['VCP Status']} | "
+        f"{row['ticker']} {row.get('Signal State', row['Action Label'])} | {row.get('Setup Quality Grade', 'N/A')} | "
+        f"{row.get('Setup Type', 'N/A')} | {row['VCP Status']} | "
         f"Final {row['Final Score']}/100 | Explosive {row.get('Explosive Score', 'N/A')}/10 | {row['Breakout Alert']} | "
         f"Risk {row['Risk %']}% | TP quality {row.get('TP Quality Score', 'N/A')}/10 | Earnings {row['Earnings Risk']}"
     )
@@ -2105,10 +2366,11 @@ def calculate_final_score(
     tightness_score: int,
 ) -> float:
     """Blend the core decision inputs into a 0-100 score."""
+    rs_component = 5.0 if pd.isna(rs_score) else float(rs_score)
     score = (
         (trend_score / 7) * 25
         + (technical_score / 8) * 25
-        + (rs_score / 10) * 20
+        + (rs_component / 10) * 20
         + (sector_score / 3) * 10
         + (market_score / 4) * 10
         + (tightness_score / 5) * 10
@@ -2332,7 +2594,8 @@ def build_scan_row(
     entry, stop, risk_pct, target_1r, target_2r, target_3r, invalidation = build_trade_plan(data, action, pivot)
     rr_ratio, rr_score = calculate_rr_score(entry, stop, target_2r)
     tightness_score, tightness_label = calculate_tightness(data, vcp)
-    rs_score = calculate_rs_score(data, benchmark_data.get("SPY"), benchmark_data.get("QQQ"))
+    rs_primary, rs_fallback = select_rs_benchmarks(ticker, benchmark_data)
+    rs_score = calculate_rs_score(data, rs_primary, rs_fallback)
     sector_leadership, sector_spread = calculate_sector_leadership(data, benchmark_data.get(sector_etf))
     earnings_label, earnings_risk = classify_earnings_risk(earnings_info)
     volume_confirmation, volume_note = calculate_volume_confirmation(data, action, pivot)
@@ -2381,11 +2644,16 @@ def build_scan_row(
         final_score=final_score,
         rs_score=rs_score,
         explosive_score=explosive_score,
+        trend_score=trend_score,
+        technical_score=technical_score,
         breakout_alert=breakout_alert,
         latest=latest,
         volume_dry_up=vcp.volume_contraction,
         volume_confirmation=volume_confirmation,
         risk_pct=risk_pct,
+        ma10_distance=ma10_distance,
+        earnings_risk_label=earnings_label,
+        ma10_rising=ma10_rising,
     )
     if momentum_breakout_candidate:
         action = "MOMENTUM BREAKOUT"
@@ -2515,33 +2783,68 @@ def build_scan_row(
         watchlist_flag = "NO"
         watchlist_reason = "Already Trade YES"
         sell_strategy = "HOLD TO 3R IF VOLUME HOLDS" if explosive_score >= 9 else "PARTIAL AT 2R, TRAIL REST"
-    vcp_label = classify_vcp_label(vcp.status, action, current_setup_status, resistance_breakout_mode)
-    if momentum_breakout_candidate:
-        vcp_label = "Momentum Breakout Candidate"
-    why_selected = clean_why_selected(
-        why_selected=why_selected,
-        trade=trade,
-        trade_reason=trade_reason,
-        watchlist_flag=watchlist_flag,
+    setup_type = classify_setup_type(
         vcp_status=vcp.status,
+        action=action,
+        current_setup_status=current_setup_status,
         resistance_breakout_mode=resistance_breakout_mode,
+        momentum_breakout_candidate=momentum_breakout_candidate,
+        latest=latest,
     )
-    decision_reason = build_decision_reason(
-        trade=trade,
-        watchlist_flag=watchlist_flag,
-        trade_reason=trade_reason,
-        watchlist_reason=watchlist_reason,
+    signal_state, signal_trade, signal_watchlist, signal_why, signal_decision = determine_signal_state(
         setup_grade=quality_grade,
-        vcp_label=vcp_label,
+        final_score=final_score,
         rs_score=rs_score,
+        explosive_score=explosive_score,
         risk_pct=risk_pct,
-        ideal_r=ideal_r,
+        latest=latest,
+        ma10_rising=ma10_rising,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
+        earnings_risk_label=earnings_label,
+        vcp_status=vcp.status,
+        pivot=pivot,
+        higher_low_structure=higher_low_structure,
+        volume_contraction=vcp.volume_contraction,
+        ma10_distance=ma10_distance,
+        rsi=float(latest["RSI14"]),
+        action=action,
+        momentum_breakout_candidate=momentum_breakout_candidate,
         resistance_breakout_mode=resistance_breakout_mode,
-        ideal_tp_reason=ideal_tp_reason,
+        resistance_distance_pct=resistance_distance_pct,
+        technical_score=technical_score,
+        trend_score=trend_score,
     )
-    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+    trade = signal_trade
+    watchlist_flag = signal_watchlist
+    why_selected = signal_why
+    decision_reason = signal_decision
+    trade_reason = signal_decision
+    watchlist_reason = signal_why if watchlist_flag == "YES" else "Already Trade YES" if trade == "YES" else signal_why
+    if signal_state == "REJECT":
+        quality_grade = "Reject"
+        sell_strategy = "AVOID / NO TRADE"
+    if signal_state == "EXTENDED DO NOT CHASE":
+        action = "EXTENDED"
+        setup_type = "EXTENDED"
+        sell_strategy = "AVOID / NO TRADE"
+    if setup_type == "MOMENTUM BREAKOUT EXCEPTION":
+        action = "MOMENTUM BREAKOUT"
+        quality_grade = "A+" if trade == "YES" else "A"
+    if signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
+        sell_strategy = "WAIT FOR ENTRY"
+    if signal_state == "BUY NOW" and setup_type == "MOMENTUM BREAKOUT EXCEPTION":
+        sell_strategy = "HOLD TO 3R IF VOLUME HOLDS" if explosive_score >= 9 else "PARTIAL AT 2R, TRAIL REST"
+
+    vcp_label = classify_vcp_label(vcp.status, action, current_setup_status, resistance_breakout_mode)
+    if setup_type == "MOMENTUM BREAKOUT EXCEPTION":
+        vcp_label = "Momentum Breakout Candidate"
+    if setup_type == "RESISTANCE BREAKOUT WATCH":
+        vcp_label = "RESISTANCE BREAKOUT WATCH"
+
+    if setup_type == "RESISTANCE BREAKOUT WATCH":
         entry_type = "RESISTANCE BREAKOUT WATCH"
-    elif action == "MOMENTUM BREAKOUT":
+    elif setup_type == "MOMENTUM BREAKOUT EXCEPTION":
         entry_type = "MOMENTUM BREAKOUT"
     elif action == "READY" and vcp.status in {"VALID VCP", "EARLY VCP"}:
         entry_type = "VCP BREAKOUT"
@@ -2603,7 +2906,8 @@ def build_scan_row(
         "avg dollar volume": format_large_number(latest.get("AvgDollarVol50")),
         "avg dollar volume raw": latest.get("AvgDollarVol50"),
         "RSI": round(float(latest["RSI14"]), 1),
-        "RS Score": rs_score,
+        "RS Score": round(float(rs_score), 1) if pd.notna(rs_score) else "N/A",
+        "RS Score Raw": round(float(rs_score), 1) if pd.notna(rs_score) else np.nan,
         "Trend Score": trend_score,
         "Technical Score": technical_score,
         "Sector Score": sector_score,
@@ -2614,6 +2918,8 @@ def build_scan_row(
         "Final Score": final_score,
         "VCP Status": vcp.status,
         "VCP Label": vcp_label,
+        "Setup Type": setup_type,
+        "Signal State": signal_state,
         "Contractions": contraction_text,
         "contraction count": vcp.count,
         "final contraction %": vcp.final_pct,
@@ -2698,20 +3004,20 @@ def build_scan_row(
 
 
 def style_scan_table(row: pd.Series) -> List[str]:
-    """Color rows by action label for fast visual review."""
-    if row["Trade"] == "YES":
-        return ["background-color: #86efac; color: #052e16; font-weight: 800"] * len(row)
-    if row["WATCHLIST FLAG"] == "YES":
-        return ["background-color: #dbeafe; color: #1e3a8a; font-weight: 700"] * len(row)
-
+    """Color rows by signal state for fast visual review."""
     colors = {
+        "BUY NOW": "background-color: #86efac; color: #052e16; font-weight: 800",
+        "BUY ON BREAKOUT": "background-color: #bbf7d0; color: #14532d; font-weight: 750",
+        "WATCH": "background-color: #fef9c3; color: #713f12; font-weight: 650",
+        "WAIT PULLBACK": "background-color: #dbeafe; color: #1e3a8a; font-weight: 650",
+        "EXTENDED DO NOT CHASE": "background-color: #fed7aa; color: #7c2d12",
+        "REJECT": "background-color: #fee2e2; color: #7f1d1d",
         "READY": "background-color: #dcfce7; color: #14532d; font-weight: 700",
         "PULLBACK ENTRY": "background-color: #dbeafe; color: #1e3a8a; font-weight: 700",
-        "WATCH": "background-color: #fef9c3; color: #713f12",
         "EXTENDED": "background-color: #fed7aa; color: #7c2d12",
         "FAILED": "background-color: #fee2e2; color: #7f1d1d",
     }
-    return [colors.get(row["Action Label"], "")] * len(row)
+    return [colors.get(row.get("Signal State"), colors.get(row.get("Action Label"), ""))] * len(row)
 
 
 def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
@@ -2741,6 +3047,7 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "RR Ratio",
         "Final Score",
         "RS Score",
+        "RS Score Raw",
         "Avg RS Score",
         "Avg Explosive Score",
         "Avg Final Score",
@@ -2768,6 +3075,8 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "Sector / Industry",
         "VCP Status",
         "VCP Label",
+        "Setup Type",
+        "Signal State",
         "Setup Quality Grade",
         "Action Label",
         "Breakout Alert",
@@ -2873,6 +3182,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["TP Quality Score"] = 0
     if "Ideal TP R" not in ranked:
         ranked["Ideal TP R"] = 0
+    ranked["RS Sort"] = pd.to_numeric(ranked.get("RS Score Raw", ranked.get("RS Score")), errors="coerce")
     setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     breakout_priority = {
         "CONFIRMED BREAKOUT": 0,
@@ -2881,11 +3191,12 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         "NO BREAKOUT": 3,
     }
     vcp_mask = ranked["VCP Status"].isin(["VALID VCP", "EARLY VCP"])
-    strong_pullback_mask = (ranked["Action Label"] == "PULLBACK ENTRY") & (ranked["RS Score"] >= 6)
+    strong_pullback_mask = (ranked["Action Label"] == "PULLBACK ENTRY") & (ranked["RS Sort"] >= 6)
+    momentum_mask = ranked.get("Setup Type", pd.Series("", index=ranked.index)) == "MOMENTUM BREAKOUT EXCEPTION"
     sector_mask = (ranked["Sector Leadership"] == "Leader") | (ranked["Sector Score"] >= 3)
     candidate_mask = (
-        (vcp_mask | strong_pullback_mask)
-        & (ranked["RS Score"] >= 6)
+        (vcp_mask | strong_pullback_mask | momentum_mask)
+        & (ranked["RS Sort"] >= 6)
         & sector_mask
         & (ranked["Trade"] == "YES")
         & (ranked["Risk %"] <= 10)
@@ -2914,7 +3225,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Explosive Score",
             "TP Quality Score",
             "Ideal TP R",
-            "RS Score",
+            "RS Sort",
             "Tightness Score",
             "Risk %",
             "Final Score",
@@ -2931,6 +3242,8 @@ def alert_message(row: pd.Series) -> str:
         f"Ticker: {row.get('ticker', 'N/A')}\n"
         f"Sector / Industry: {row.get('Sector / Industry', 'N/A')}\n"
         f"Action: {row.get('Action Label', 'N/A')}\n"
+        f"Signal State: {row.get('Signal State', 'N/A')}\n"
+        f"Setup Type: {row.get('Setup Type', 'N/A')}\n"
         f"Entry Type: {row.get('Entry Type', 'N/A')}\n"
         f"VCP Status: {row.get('VCP Status', 'N/A')}\n"
         f"Decision Reason: {row.get('Decision Reason', 'N/A')}\n"
@@ -3124,8 +3437,12 @@ def scan_universe(
         quote_applied[symbol] = applied
     raw_data = synchronized_raw
 
-    spy_raw = raw_data.get("^HSI") if is_hk_scan and raw_data.get("^HSI") is not None else raw_data.get("SPY")
-    indicator_data = {ticker: add_indicators(frame, spy_raw) for ticker, frame in raw_data.items()}
+    us_benchmark_raw = first_valid_frame(raw_data.get("SPY"))
+    hk_benchmark_raw = first_valid_frame(raw_data.get("^HSI"), raw_data.get("2800.HK"))
+    indicator_data = {
+        ticker: add_indicators(frame, hk_benchmark_raw if ticker.endswith(".HK") else us_benchmark_raw)
+        for ticker, frame in raw_data.items()
+    }
     market_data = {ticker: indicator_data[ticker] for ticker in context_tickers if ticker in indicator_data}
     if is_hk_scan:
         market_data["SPY"] = market_data.get("^HSI", pd.DataFrame())
@@ -4663,6 +4980,8 @@ def render_top_5_trades() -> None:
             st.write(f"Sector Group: {row.get('Sector Group', 'N/A')}")
             st.write(f"Theme ETF: {row.get('Sector ETF', 'N/A')}")
             st.write(f"Quality: {row.get('Setup Quality Grade', 'N/A')}")
+            st.write(f"Signal: {row.get('Signal State', 'N/A')}")
+            st.write(f"Setup Type: {row.get('Setup Type', 'N/A')}")
             st.write(f"Entry Type: {row.get('Entry Type', 'N/A')}")
             st.write(f"VCP: {row.get('VCP Status', 'N/A')} | {row.get('Contractions', 'N/A')}")
             st.write(f"RS/Trend/Tech: {row.get('RS Score', 'N/A')} / {row.get('Trend Score', 'N/A')} / {row.get('Technical Score', 'N/A')}")
@@ -4710,6 +5029,8 @@ def render_alerts() -> None:
                         "ticker",
                         "Sector / Industry",
                         "VCP Status",
+                        "Setup Type",
+                        "Signal State",
                         "Contractions",
                         "Volume Dry-Up",
                         "RS Score",
@@ -5027,6 +5348,7 @@ def render_swing_scanner(
         "Tightness Score",
         "Tightness Label",
         "RS Score",
+        "RS Score Raw",
         "Sector Leadership",
         "Volume Confirmation",
         "Earnings Risk",
@@ -5034,6 +5356,8 @@ def render_swing_scanner(
         "Explosive Score",
         "Explosive Label",
         "Setup Quality Grade",
+        "Setup Type",
+        "Signal State",
         "VCP Status",
         "VCP Label",
         "Contractions",
@@ -5134,11 +5458,12 @@ def render_swing_scanner(
         & (results["Setup Quality Grade"] != "Reject")
     ].copy()
     if not qualified.empty:
+        qualified["RS Summary Score"] = pd.to_numeric(qualified.get("RS Score Raw", qualified.get("RS Score")), errors="coerce")
         sector_summary = (
             qualified.groupby("Sector Group", dropna=False)
             .agg(
                 qualified_setups=("ticker", "count"),
-                avg_rs_score=("RS Score", "mean"),
+                avg_rs_score=("RS Summary Score", "mean"),
                 avg_explosive_score=("Explosive Score", "mean"),
                 avg_final_score=("Final Score", "mean"),
             )
@@ -5181,24 +5506,25 @@ def render_swing_scanner(
         return
 
     visible = results.copy()
+    visible["RS Sort"] = pd.to_numeric(visible.get("RS Score Raw", visible.get("RS Score")), errors="coerce")
     if not show_all:
         visible = visible[
             (visible["Trend Score"] >= 4)
             & (visible["Technical Score"] >= 4)
-            & (visible["Action Label"] != "FAILED")
+            & (~visible["Signal State"].isin(["REJECT"]))
         ]
     if sector_filter != "All":
         visible = visible[visible["Sector Group"] == sector_filter]
     if only_ready_pullback:
-        visible = visible[visible["Action Label"].isin(["READY", "PULLBACK ENTRY", "MOMENTUM BREAKOUT"])]
+        visible = visible[visible["Signal State"].isin(["BUY NOW", "BUY ON BREAKOUT"]) | visible["Action Label"].isin(["PULLBACK ENTRY"])]
     if only_trade_watchlist:
         visible = visible[(visible["Trade"] == "YES") | (visible["WATCHLIST FLAG"] == "YES")]
     if hide_extended:
-        visible = visible[visible["Action Label"] != "EXTENDED"]
+        visible = visible[visible["Signal State"] != "EXTENDED DO NOT CHASE"]
     if only_a_setups:
         visible = visible[visible["Setup Quality Grade"].isin(["A+", "A"])]
     if hide_low_rs_non_vcp:
-        visible = visible[~((visible["VCP Status"] == "NOT VCP") & (visible["RS Score"] < 5))]
+        visible = visible[~((visible["VCP Status"] == "NOT VCP") & (visible["RS Sort"].notna()) & (visible["RS Sort"] < 5))]
     if only_true_vcp:
         visible = visible[visible["VCP Status"].isin(["VALID VCP", "EARLY VCP"])]
     if only_early_vcp:
@@ -5208,18 +5534,24 @@ def render_swing_scanner(
     if hide_resistance_blocked:
         visible = visible[visible["Resistance Blocked"] != "YES"]
     if hide_reject:
-        visible = visible[visible["Setup Quality Grade"] != "Reject"]
+        visible = visible[(visible["Setup Quality Grade"] != "Reject") & (visible["Signal State"] != "REJECT")]
     if only_strong_pullbacks:
-        visible = visible[(visible["Action Label"] == "PULLBACK ENTRY") & (visible["RS Score"] >= 6)]
+        visible = visible[(visible["Action Label"] == "PULLBACK ENTRY") & (visible["RS Sort"] >= 6)]
 
+    signal_priority = {
+        "BUY NOW": 0,
+        "BUY ON BREAKOUT": 1,
+        "WATCH": 2,
+        "WAIT PULLBACK": 3,
+        "EXTENDED DO NOT CHASE": 4,
+        "REJECT": 5,
+    }
     quality_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
-    visible["trade sort"] = np.where(visible["Trade"] == "YES", 0, 1)
-    visible["watchlist sort"] = np.where(visible["WATCHLIST FLAG"] == "YES", 0, 1)
+    visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
-    visible["vcp sort"] = np.where(visible["VCP Status"].isin(["VALID VCP", "EARLY VCP"]), 0, 1)
     visible = visible.sort_values(
-        ["quality sort", "trade sort", "vcp sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-        ascending=[True, True, True, False, False, False, True, False],
+        ["signal sort", "quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, True, False, False, False, True],
     )
 
     compact_columns = [
@@ -5227,35 +5559,45 @@ def render_swing_scanner(
         "Sector / Industry",
         "close",
         "VCP Status",
-        "VCP Label",
-        "Contractions",
-        "Volume Dry-Up",
-        "RS Score",
-        "Final Score",
-        "Trend Score",
-        "Technical Score",
-        "Tightness Score",
-        "Explosive Score",
+        "Setup Type",
+        "Signal State",
         "Setup Quality Grade",
         "Trade",
         "WATCHLIST FLAG",
-        "Entry Type",
-        "Action Label",
-        "Breakout Alert",
-        "Decision Reason",
-        "Current Price",
-        "Current Setup Status",
-        "Entry Trigger",
-        "Stop Loss",
+        "Final Score",
+        "RS Score",
+        "Explosive Score",
         "Risk %",
         "Target 1R",
         "Target 2R",
         "Target 3R",
+        "Pivot",
+        "Entry Trigger",
+        "Stop Loss",
+        "Ideal TP",
+        "Decision Reason",
+    ]
+    diagnostic_columns = compact_columns + [
+        "% Change",
+        "Sector Group",
+        "Sector Raw",
+        "Industry Raw",
+        "VCP Label",
+        "Contractions",
+        "Volume Dry-Up",
+        "Trend Score",
+        "Technical Score",
+        "Tightness Score",
+        "RS Score Raw",
+        "Entry Type",
+        "Action Label",
+        "Breakout Alert",
+        "Current Price",
+        "Current Setup Status",
         "Nearest Resistance",
         "Resistance Blocked",
         "Resistance Breakout Mode",
         "Breakout Above Resistance Trigger",
-        "Ideal TP",
         "Ideal TP Reason",
         "Sell Strategy",
         "Trail Stop Level",
@@ -5263,12 +5605,6 @@ def render_swing_scanner(
         "Data Warning",
         "Chart Sync",
         "Why Selected",
-    ]
-    diagnostic_columns = compact_columns + [
-        "% Change",
-        "Sector Group",
-        "Sector Raw",
-        "Industry Raw",
         "Premarket Price",
         "Afterhours Price",
         "Today's Volume",
@@ -5328,54 +5664,75 @@ def render_swing_scanner(
     display_columns = diagnostic_columns if show_full_diagnostics else compact_columns
 
     focus_source = results.copy()
+    focus_source["RS Sort"] = pd.to_numeric(focus_source.get("RS Score Raw", focus_source.get("RS Score")), errors="coerce")
+    focus_source["signal sort"] = focus_source["Signal State"].map(signal_priority).fillna(9)
     focus_source["trade sort"] = np.where(focus_source["Trade"] == "YES", 0, 1)
     focus_source["watchlist sort"] = np.where(focus_source["WATCHLIST FLAG"] == "YES", 0, 1)
     focus_source["quality sort"] = focus_source["Setup Quality Grade"].map(quality_priority).fillna(9)
 
-    trade_focus = focus_source[focus_source["Trade"] == "YES"].sort_values(
-        ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-        ascending=[True, False, False, False, True, False],
+    buy_now_focus = focus_source[focus_source["Signal State"] == "BUY NOW"].sort_values(
+        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
     )
-    momentum_focus = focus_source[
-        focus_source["Entry Type"] == "MOMENTUM BREAKOUT"
-    ].sort_values(
-        ["trade sort", "Explosive Score", "RS Score", "Final Score", "Risk %"],
+    buy_breakout_focus = focus_source[focus_source["Signal State"] == "BUY ON BREAKOUT"].sort_values(
+        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
         ascending=[True, False, False, False, True],
     )
     watchlist_focus = focus_source[
-        (focus_source["WATCHLIST FLAG"] == "YES")
-        & (focus_source["Trade"] != "YES")
-        & (focus_source["Resistance Breakout Mode"] != "RESISTANCE BREAKOUT WATCH")
-        & (focus_source["Entry Type"] != "MOMENTUM BREAKOUT")
+        (focus_source["Signal State"] == "WATCH")
+        & (focus_source["Setup Type"] != "MOMENTUM BREAKOUT EXCEPTION")
+        & (focus_source["Setup Type"] != "RESISTANCE BREAKOUT WATCH")
     ].sort_values(
-        ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-        ascending=[True, False, False, False, True, False],
+        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
+    )
+    momentum_focus = focus_source[
+        focus_source["Setup Type"] == "MOMENTUM BREAKOUT EXCEPTION"
+    ].sort_values(
+        ["signal sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
+    )
+    pullback_focus = focus_source[focus_source["Setup Type"].isin(["PULLBACK TO MA10", "PULLBACK TO MA20"])].sort_values(
+        ["signal sort", "quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, True, False, False, False, True],
+    )
+    extended_focus = focus_source[focus_source["Signal State"] == "EXTENDED DO NOT CHASE"].sort_values(
+        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
     )
     resistance_focus = focus_source[
-        focus_source["Resistance Breakout Mode"] == "RESISTANCE BREAKOUT WATCH"
+        focus_source["Setup Type"] == "RESISTANCE BREAKOUT WATCH"
     ].sort_values(
-        ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Resistance Breakout Risk %", "Final Score"],
+        ["quality sort", "Explosive Score", "RS Sort", "Tightness Score", "Resistance Breakout Risk %", "Final Score"],
         ascending=[True, False, False, False, True, False],
     )
     rejected_focus = focus_source[
-        (focus_source["Setup Quality Grade"] == "Reject")
-        | (focus_source["Action Label"].isin(["FAILED", "EXTENDED"]))
+        (focus_source["Signal State"] == "REJECT")
+        | (focus_source["Setup Quality Grade"] == "Reject")
+        | (focus_source["Action Label"] == "FAILED")
     ].sort_values(
         ["quality sort", "Risk %", "Final Score"],
         ascending=[True, True, False],
     )
 
     st.subheader("Daily Focus Summary")
-    focus_cols = st.columns(5)
+    if buy_now_focus.empty:
+        st.info("No clean BUY NOW today. Best action: wait. Watchlist candidates below.")
+    focus_cols = st.columns(4)
     with focus_cols[0]:
-        show_focus_group("Top Trade Now", trade_focus, "Decision Reason")
+        show_focus_group("Top BUY NOW", buy_now_focus, "Decision Reason")
     with focus_cols[1]:
-        show_focus_group("Top Momentum Breakouts", momentum_focus, "Decision Reason")
+        show_focus_group("Top BUY ON BREAKOUT", buy_breakout_focus, "Decision Reason")
     with focus_cols[2]:
         show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
     with focus_cols[3]:
-        show_focus_group("Top Breakout Above Resistance", resistance_focus, "Decision Reason")
-    with focus_cols[4]:
+        show_focus_group("Top Momentum Breakout Exceptions", momentum_focus, "Decision Reason")
+    lower_focus_cols = st.columns(3)
+    with lower_focus_cols[0]:
+        show_focus_group("Top Pullback Setups", pullback_focus, "Decision Reason")
+    with lower_focus_cols[1]:
+        show_focus_group("Extended / Do Not Chase", extended_focus, "Decision Reason")
+    with lower_focus_cols[2]:
         show_focus_group("Rejected / Avoid", rejected_focus, "Decision Reason")
 
     st.subheader("Best Setups")
@@ -5434,6 +5791,8 @@ def render_swing_scanner(
 
     with plan_col:
         st.subheader("Trade Plan")
+        st.metric("Signal State", selected_row["Signal State"])
+        st.metric("Setup Type", selected_row["Setup Type"])
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
         st.metric("Entry Type", selected_row["Entry Type"])
