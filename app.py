@@ -619,6 +619,7 @@ MARKET_TICKERS = [
     "SPY",
     "QQQ",
     "IWM",
+    "SOXX",
     "SMH",
     "XLK",
     "XLE",
@@ -890,6 +891,27 @@ def classify_sector_group(ticker: str, sector: str, industry: str) -> str:
     return "Other"
 
 
+def classify_theme_group(ticker: str, sector: str, industry: str) -> str:
+    """Map names into the trading themes used by the sector rotation engine."""
+    symbol = ticker.upper()
+    text = f"{sector} {industry} {symbol}".lower()
+    if symbol in PRESET_UNIVERSES.get("AI / Semiconductor", []) or any(term in text for term in ("semiconductor", "chip", "ai")):
+        return "AI / Semis"
+    if symbol in PRESET_UNIVERSES.get("AI Infrastructure / Power", []) or any(term in text for term in ("power", "electric", "utility", "grid")):
+        return "Power / Utilities"
+    if symbol in PRESET_UNIVERSES.get("Nuclear / Uranium", []) or any(term in text for term in ("nuclear", "uranium")):
+        return "Nuclear / Uranium"
+    if symbol in PRESET_UNIVERSES.get("Energy / Oil & Gas", []) or any(term in text for term in ("oil", "gas", "energy")):
+        return "Energy"
+    if symbol in PRESET_UNIVERSES.get("Financials / Fintech", []) or any(term in text for term in ("bank", "financial", "fintech", "capital markets")):
+        return "Financials"
+    if symbol in PRESET_UNIVERSES.get("Biotech / Healthcare Growth", []) or any(term in text for term in ("health", "biotech", "pharma")):
+        return "Healthcare"
+    if symbol in PRESET_UNIVERSES.get("Crypto / Blockchain Stocks", []) or any(term in text for term in ("crypto", "bitcoin", "blockchain")):
+        return "Crypto"
+    return classify_sector_group(ticker, sector, industry)
+
+
 @st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
 def fetch_sector_industry_one(ticker: str) -> dict:
     """Fetch one ticker's sector/industry metadata and cache it for seven days."""
@@ -916,6 +938,7 @@ def fetch_sector_industry_one(ticker: str) -> dict:
         "industry": industry,
         "sector_industry": display,
         "sector_group": classify_sector_group(ticker, sector, industry),
+        "theme_group": classify_theme_group(ticker, sector, industry),
     }
 
 
@@ -1124,6 +1147,65 @@ def chart_sync_status(chart_close: float, quote_price: float) -> Tuple[str, floa
     return "Synced", round(mismatch_pct, 2)
 
 
+def market_day_fraction(session_status: str) -> float:
+    """Approximate how much of the regular NY trading day has elapsed."""
+    if session_status in {"MARKET CLOSED", "AFTER HOURS"}:
+        return 1.0
+    if session_status == "PREMARKET":
+        return 0.05
+    now = datetime.now(ZoneInfo("America/New_York"))
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    elapsed = (now - open_time).total_seconds()
+    total = (close_time - open_time).total_seconds()
+    return float(min(max(elapsed / total, 0.05), 1.0))
+
+
+def calculate_intraday_volume_metrics(latest: pd.Series, quote_info: dict, session_status: str) -> Tuple[float, float, str]:
+    """Estimate RVOL from current day volume versus expected 20-session volume at this time of day."""
+    avg_vol20 = latest.get("AvgVol20", np.nan)
+    current_volume = quote_info.get("day_volume", np.nan)
+    if pd.isna(current_volume) or float(current_volume) <= 0:
+        current_volume = latest.get("Volume", np.nan)
+    if pd.isna(avg_vol20) or float(avg_vol20) <= 0 or pd.isna(current_volume):
+        return np.nan, np.nan, "N/A"
+
+    fraction = market_day_fraction(session_status)
+    expected_intraday_volume = max(float(avg_vol20) * fraction, 1.0)
+    intraday_ratio = float(current_volume) / expected_intraday_volume
+    rvol = float(current_volume) / float(avg_vol20) if session_status in {"MARKET CLOSED", "AFTER HOURS"} else intraday_ratio
+
+    if rvol > 2:
+        label = "INSTITUTIONAL ACTIVITY"
+    elif rvol >= 1.5:
+        label = "STRONG"
+    elif rvol >= 1:
+        label = "NORMAL"
+    else:
+        label = "WEAK"
+    return round(rvol, 2), round(intraday_ratio, 2), label
+
+
+def detect_live_breakout_status(
+    latest: pd.Series,
+    pivot: PivotInfo,
+    rvol: float,
+    intraday_volume_ratio: float,
+    rs_score: float,
+    setup_grade: str,
+) -> str:
+    """Classify intraday breakout trigger quality from synchronized quote and volume."""
+    if pd.isna(pivot.pivot) or latest["Close"] <= pivot.pivot:
+        if latest["Close"] < latest["MA10"] or latest["Close"] < latest["MA20"]:
+            return "FAILED BREAKOUT"
+        return "NO BREAKOUT"
+    price_above_key_mas = latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"]
+    strong_volume = pd.notna(intraday_volume_ratio) and intraday_volume_ratio > 1.5 and pd.notna(rvol) and rvol > 2
+    if strong_volume and price_above_key_mas and score_at_least(rs_score, 7) and setup_grade in {"A+", "A"}:
+        return "LIVE BREAKOUT"
+    return "BREAKOUT STARTING"
+
+
 def classify_current_setup_status(data: pd.DataFrame, pivot: PivotInfo, extended: bool, breakout_alert: str) -> str:
     """Summarize the current chart state from the latest synchronized candle."""
     latest = data.iloc[-1]
@@ -1199,6 +1281,86 @@ def calculate_hk_market_score(market_data: Dict[str, pd.DataFrame]) -> Tuple[int
     else:
         status = "RISKY"
     return score, status, details
+
+
+def distribution_days_count(data: pd.DataFrame, lookback: int = 25) -> int:
+    """Count recent institutional selling days from price down plus higher volume."""
+    if data is None or data.empty or len(data) < 3:
+        return 0
+    recent = data.tail(lookback + 1).copy()
+    price_change = recent["Close"].pct_change() * 100
+    volume_up = recent["Volume"] > recent["Volume"].shift(1)
+    distribution = (price_change <= -0.2) & volume_up
+    return int(distribution.tail(lookback).sum())
+
+
+def detect_follow_through_day(data: pd.DataFrame) -> bool:
+    """Approximate IBD-style follow-through from a strong index up day on rising volume."""
+    if data is None or data.empty or len(data) < 10:
+        return False
+    recent = data.tail(10).copy()
+    pct = recent["Close"].pct_change() * 100
+    volume_up = recent["Volume"] > recent["Volume"].shift(1)
+    close_above_ma10 = recent["Close"] > recent["MA10"]
+    return bool(((pct >= 1.2) & volume_up & close_above_ma10).tail(10).any())
+
+
+def calculate_market_environment(market_data: Dict[str, pd.DataFrame], is_hk_scan: bool = False) -> dict:
+    """Classify the broader market as confirmed uptrend, under pressure, or correction."""
+    primary_symbol = "^HSI" if is_hk_scan else "SPY"
+    fallback_symbol = "2800.HK" if is_hk_scan else "QQQ"
+    primary = first_valid_frame(market_data.get(primary_symbol), market_data.get(fallback_symbol))
+    growth = first_valid_frame(market_data.get("3033.HK"), market_data.get("QQQ")) if is_hk_scan else first_valid_frame(market_data.get("QQQ"))
+    small = first_valid_frame(market_data.get("3067.HK"), market_data.get("IWM")) if is_hk_scan else first_valid_frame(market_data.get("IWM"))
+    semis = first_valid_frame(market_data.get("SOXX"), market_data.get("SMH"))
+
+    if primary is None or primary.empty:
+        return {
+            "status": "UPTREND UNDER PRESSURE",
+            "distribution_days": 0,
+            "follow_through_day": False,
+            "details": "Market data unavailable; use reduced confidence.",
+        }
+
+    latest = primary.iloc[-1]
+    primary_above = bool(latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"])
+    primary_below_ma50 = bool(latest["Close"] < latest["MA50"])
+    primary_below_ma200 = bool(latest["Close"] < latest["MA200"]) if pd.notna(latest.get("MA200", np.nan)) else False
+    dist = distribution_days_count(primary)
+    ftd = detect_follow_through_day(primary)
+    growth_above = False
+    if growth is not None and not growth.empty:
+        g_latest = growth.iloc[-1]
+        growth_above = bool(g_latest["Close"] > g_latest["MA20"] and g_latest["Close"] > g_latest["MA50"])
+    breadth_ok = False
+    if small is not None and not small.empty:
+        s_latest = small.iloc[-1]
+        breadth_ok = bool(s_latest["Close"] > s_latest["MA20"])
+    semis_ok = False
+    if semis is not None and not semis.empty:
+        semi_latest = semis.iloc[-1]
+        semis_ok = bool(semi_latest["Close"] > semi_latest["MA20"] and semi_latest["Close"] > semi_latest["MA50"])
+
+    if primary_below_ma50 and (primary_below_ma200 or dist >= 5):
+        status = "CORRECTION"
+    elif primary_above and growth_above and dist <= 3:
+        status = "CONFIRMED UPTREND"
+    else:
+        status = "UPTREND UNDER PRESSURE"
+
+    details = (
+        f"{primary_symbol if is_hk_scan else 'SPY'} {'above' if primary_above else 'below'} MA20/MA50 | "
+        f"Growth {'healthy' if growth_above else 'mixed'} | "
+        f"Breadth {'ok' if breadth_ok else 'weak'} | "
+        f"Semis {'supportive' if semis_ok else 'mixed'} | "
+        f"Distribution days {dist} | Follow-through day {'Yes' if ftd else 'No'}"
+    )
+    return {
+        "status": status,
+        "distribution_days": dist,
+        "follow_through_day": ftd,
+        "details": details,
+    }
 
 
 def calculate_sector_score(mode: str, market_data: Dict[str, pd.DataFrame]) -> Tuple[int, str]:
@@ -1825,6 +1987,12 @@ def determine_signal_state(
     resistance_distance_pct: float,
     technical_score: int,
     trend_score: int,
+    tightness_score: int,
+    breakout_quality_score: int,
+    rvol: float,
+    market_environment: str,
+    live_breakout_status: str,
+    stage_label: str,
 ) -> Tuple[str, str, str, str, str]:
     """Map scanner evidence into J Law / Minervini-style signal states."""
     price_above_key_mas = bool(latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"])
@@ -1840,6 +2008,9 @@ def determine_signal_state(
     near_pivot = pd.notna(pivot.distance_pct) and 0 <= pivot.distance_pct <= 5
     near_resistance = pd.notna(resistance_distance_pct) and -1 <= resistance_distance_pct <= 5
     structure_valid = action not in {"FAILED"} and latest["Close"] >= latest["MA50"]
+
+    market_correction = market_environment == "CORRECTION"
+    rvol_confirmed = pd.notna(rvol) and rvol > 2
 
     if pd.notna(ma10_distance) and ma10_distance > 12:
         return (
@@ -1870,6 +2041,7 @@ def determine_signal_state(
         final_score >= 90
         and rs_momentum_ok
         and explosive_score >= 8
+        and breakout_quality_score >= 7
         and trend_score >= 7
         and technical_score >= 7
         and price_above_key_mas
@@ -1879,9 +2051,10 @@ def determine_signal_state(
         and pd.notna(ma10_distance)
         and ma10_distance <= 12
         and earnings_risk_label != "HIGH RISK"
+        and stage_label not in {"STAGE 3 RISK", "STAGE 4"}
     )
     if momentum_base:
-        if volume_confirmed or momentum_breakout_candidate:
+        if (volume_confirmed or momentum_breakout_candidate or live_breakout_status == "LIVE BREAKOUT") and not market_correction:
             return (
                 "BUY NOW",
                 "YES",
@@ -1902,12 +2075,15 @@ def determine_signal_state(
         and final_score >= 85
         and rs_buy_ok
         and explosive_score >= 7
+        and breakout_quality_score >= 7
         and risk_ok
         and price_above_key_mas
         and ma10_rising
         and breakout_state
-        and volume_confirmed
+        and (volume_confirmed or rvol_confirmed or live_breakout_status == "LIVE BREAKOUT")
         and earnings_risk_label != "HIGH RISK"
+        and not market_correction
+        and stage_label not in {"STAGE 3 RISK", "STAGE 4"}
     )
     vcp_breakout = vcp_status in {"VALID VCP", "EARLY VCP"} and latest["Close"] >= pivot.pivot and volume_confirmed
     pullback_entry = (
@@ -1931,10 +2107,12 @@ def determine_signal_state(
         and final_score >= 85
         and rs_buy_ok
         and explosive_score >= 7
+        and breakout_quality_score >= 6
         and risk_ok
         and (near_pivot or near_resistance or resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH")
-        and not volume_confirmed
+        and not (volume_confirmed or rvol_confirmed)
         and structure_valid
+        and stage_label not in {"STAGE 4"}
     )
     if buy_on_breakout:
         return (
@@ -1961,7 +2139,16 @@ def determine_signal_state(
             "WAIT PULLBACK: extended from MA10, wait for MA10/MA20 support.",
             "WAIT PULLBACK: extended from MA10, wait for MA10/MA20 support.",
         )
-    if structure_valid and setup_grade != "Reject" and (vcp_status in {"VALID VCP", "EARLY VCP"} or final_score >= 70 or explosive_score >= 6):
+    watchlist_quality = (
+        structure_valid
+        and setup_grade != "Reject"
+        and tightness_score >= 3
+        and volume_contraction
+        and (near_pivot or near_resistance or vcp_status in {"VALID VCP", "EARLY VCP"})
+        and (score_at_least(rs_score, 6) or pd.isna(numeric_or_na(rs_score)))
+        and stage_label not in {"STAGE 4"}
+    )
+    if watchlist_quality:
         return (
             "WATCH",
             "NO",
@@ -2085,6 +2272,119 @@ def calculate_explosive_score(data: pd.DataFrame, pivot: PivotInfo, higher_low_s
     else:
         label = "LOW MOMENTUM"
     return score, label
+
+
+def detect_stage_analysis(data: pd.DataFrame) -> str:
+    """Classify the longer-term stage using MA150/MA200 and trend maturity."""
+    if len(data) < 210:
+        return "BASE BUILDING"
+    latest = data.iloc[-1]
+    close = latest["Close"]
+    ma150 = latest["MA150"]
+    ma200 = latest["MA200"]
+    ma200_rising = is_rising(data["MA200"], lookback=20)
+    high52 = latest.get("High52W", np.nan)
+    days_above_ma50 = int((data["Close"].tail(80) > data["MA50"].tail(80)).sum())
+
+    if close < ma150 and close < ma200:
+        return "STAGE 4"
+    if close > ma150 and close > ma200 and ma150 > ma200 and ma200_rising:
+        if days_above_ma50 < 35:
+            return "EARLY STAGE 2"
+        if pd.notna(high52) and close >= high52 * 0.95 and latest["RSI14"] > 75:
+            return "LATE STAGE 2"
+        return "MID STAGE 2"
+    if close > ma150 and not ma200_rising:
+        return "STAGE 3 RISK"
+    return "STAGE 1 BASE"
+
+
+def detect_institutional_action(data: pd.DataFrame) -> str:
+    """Detect accumulation, support, or distribution from price/volume behavior."""
+    if len(data) < 30:
+        return "N/A"
+    recent = data.tail(20)
+    closes = recent["Close"]
+    ma10 = recent["MA10"]
+    support_ma10 = int(((recent["Low"] <= ma10 * 1.01) & (closes >= ma10)).sum())
+    tight_closes = (closes.tail(5).max() - closes.tail(5).min()) / closes.iloc[-1] * 100 <= 3
+    low_volume_pullbacks = has_volume_contraction(data)
+    pct_change = data["Close"].pct_change() * 100
+    accumulation_days = int(((pct_change.tail(20) >= 0.4) & (data["Volume"].tail(20) > data["Volume"].shift(1).tail(20))).sum())
+    distribution_days = distribution_days_count(data, lookback=20)
+    avg_vol20 = data.iloc[-1].get("AvgVol20", np.nan)
+    pocket_pivot = bool(
+        pd.notna(avg_vol20)
+        and data.iloc[-1]["Close"] > data.iloc[-1]["MA10"]
+        and data.iloc[-1]["Volume"] > 1.2 * avg_vol20
+        and data.iloc[-1]["Close"] > data.iloc[-2]["High"]
+    )
+
+    if distribution_days >= 4 and accumulation_days <= 2:
+        return "DISTRIBUTION"
+    if pocket_pivot or (support_ma10 >= 3 and tight_closes and accumulation_days >= 3):
+        return "ACCUMULATION"
+    if support_ma10 >= 2 and low_volume_pullbacks:
+        return "SUPPORTING ACTION"
+    return "NEUTRAL"
+
+
+def calculate_breakout_quality_score(
+    data: pd.DataFrame,
+    pivot: PivotInfo,
+    rvol: float,
+    rs_score: float,
+    market_environment: str,
+    extended: bool,
+    stage_label: str,
+) -> int:
+    """Score the quality of a breakout trigger from 0 to 10."""
+    latest = data.iloc[-1]
+    score = 0
+    close_band_pct = (
+        (data["Close"].tail(5).max() - data["Close"].tail(5).min()) / latest["Close"] * 100
+        if len(data) >= 5 and latest["Close"]
+        else np.nan
+    )
+    if pd.notna(close_band_pct) and close_band_pct <= 3:
+        score += 2
+    elif pd.notna(close_band_pct) and close_band_pct <= 5:
+        score += 1
+
+    if has_volume_contraction(data):
+        score += 2
+    if pd.notna(rvol) and rvol > 2:
+        score += 2
+    elif pd.notna(rvol) and rvol >= 1.5:
+        score += 1
+    if pivot.label == "Breakout in progress" or (pd.notna(pivot.distance_pct) and -2 <= pivot.distance_pct <= 5):
+        score += 1
+    if score_at_least(rs_score, 7):
+        score += 1
+    if market_environment == "CONFIRMED UPTREND":
+        score += 1
+
+    wide_candle = bool(latest.get("RangePct", np.nan) > data["RangePct"].tail(20).mean() * 1.8) if len(data) >= 20 else False
+    if extended:
+        score -= 2
+    if wide_candle:
+        score -= 1
+    if pd.notna(rvol) and rvol < 1:
+        score -= 1
+    if stage_label in {"LATE STAGE 2", "STAGE 3 RISK", "STAGE 4"}:
+        score -= 1
+    return int(min(max(score, 0), 10))
+
+
+def earnings_intelligence_label(earnings_label: str, post_earnings_label: str) -> str:
+    """Summarize earnings context into one tradable label."""
+    if earnings_label == "HIGH RISK":
+        return "EARNINGS RISK HIGH"
+    if earnings_label == "MEDIUM RISK":
+        return "EARNINGS SOON"
+    if post_earnings_label in {"EARNINGS GAP UP HOLDING", "EARNINGS GAP DOWN RECOVERING"}:
+        return "POST-EARNINGS BREAKOUT"
+    return "NO EARNINGS EDGE"
 
 
 def first_valid_frame(*frames: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -2235,12 +2535,14 @@ def is_momentum_breakout_candidate(
     ma10_distance: float,
     earnings_risk_label: str,
     ma10_rising: bool,
+    breakout_quality_score: int = 0,
+    rvol: float = np.nan,
 ) -> bool:
     """Allow exceptional high-momentum breakouts even when they are not pure VCPs."""
     price_above_key_mas = latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"]
     avg_vol20 = latest.get("AvgVol20", np.nan)
     exceptional_volume = pd.notna(avg_vol20) and avg_vol20 > 0 and latest["Volume"] >= 1.3 * avg_vol20
-    volume_ok = volume_dry_up or volume_confirmation == "YES" or exceptional_volume
+    volume_ok = volume_dry_up or volume_confirmation == "YES" or exceptional_volume or (pd.notna(rvol) and rvol >= 1.5)
     return bool(
         final_score >= 90
         and score_at_least(rs_score, 8)
@@ -2251,6 +2553,7 @@ def is_momentum_breakout_candidate(
         and price_above_key_mas
         and ma10_rising
         and volume_ok
+        and breakout_quality_score >= 7
         and pd.notna(risk_pct)
         and risk_pct <= 10
         and pd.notna(ma10_distance)
@@ -2352,7 +2655,8 @@ def build_ai_trading_notes(row: dict) -> str:
     return (
         f"{row['ticker']} {row.get('Signal State', row['Action Label'])} | {row.get('Setup Quality Grade', 'N/A')} | "
         f"{row.get('Setup Type', 'N/A')} | {row['VCP Status']} | "
-        f"Final {row['Final Score']}/100 | Explosive {row.get('Explosive Score', 'N/A')}/10 | {row['Breakout Alert']} | "
+        f"Final {row['Final Score']}/100 | BQ {row.get('Breakout Quality Score', 'N/A')}/10 | "
+        f"RVOL {row.get('RVOL', 'N/A')} | {row.get('Live Breakout Status', row['Breakout Alert'])} | "
         f"Risk {row['Risk %']}% | TP quality {row.get('TP Quality Score', 'N/A')}/10 | Earnings {row['Earnings Risk']}"
     )
 
@@ -2581,6 +2885,7 @@ def build_scan_row(
     sector_score: int,
     benchmark_data: Dict[str, pd.DataFrame],
     sector_etf: str,
+    market_environment: str = "UPTREND UNDER PRESSURE",
     aggressive_mode: bool = False,
 ) -> dict:
     """Build the output row and stash chart-specific detail fields."""
@@ -2618,6 +2923,21 @@ def build_scan_row(
         market_score=market_score,
         tightness_score=tightness_score,
     )
+    rvol, intraday_volume_ratio, rvol_label = calculate_intraday_volume_metrics(
+        latest, quote_info, scan_timestamps.get("session_status", "MARKET CLOSED")
+    )
+    stage_label = detect_stage_analysis(data)
+    institutional_action = detect_institutional_action(data)
+    breakout_quality_score = calculate_breakout_quality_score(
+        data=data,
+        pivot=pivot,
+        rvol=rvol,
+        rs_score=rs_score,
+        market_environment=market_environment,
+        extended=extended,
+        stage_label=stage_label,
+    )
+    earnings_intelligence = earnings_intelligence_label(earnings_label, post_earnings_label)
     trade, trade_reason = decide_trade(
         action=action,
         technical_score=technical_score,
@@ -2654,6 +2974,8 @@ def build_scan_row(
         ma10_distance=ma10_distance,
         earnings_risk_label=earnings_label,
         ma10_rising=ma10_rising,
+        breakout_quality_score=breakout_quality_score,
+        rvol=rvol,
     )
     if momentum_breakout_candidate:
         action = "MOMENTUM BREAKOUT"
@@ -2692,6 +3014,18 @@ def build_scan_row(
     if (not momentum_breakout_candidate) and quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
+    live_breakout_status = detect_live_breakout_status(
+        latest=latest,
+        pivot=pivot,
+        rvol=rvol,
+        intraday_volume_ratio=intraday_volume_ratio,
+        rs_score=rs_score,
+        setup_grade=quality_grade,
+    )
+    if live_breakout_status == "LIVE BREAKOUT" and quality_grade in {"A+", "A"}:
+        volume_confirmation = "YES"
+        breakout_alert = "CONFIRMED BREAKOUT"
+        current_setup_status = "ACTIVE BREAKOUT"
     nearest_resistance = detect_nearest_resistance(data, entry)
     resistance_blocks_1r = nearest_resistance > entry and nearest_resistance < target_1r
     resistance_distance_pct = (nearest_resistance - float(latest["Close"])) / float(latest["Close"]) * 100
@@ -2814,6 +3148,12 @@ def build_scan_row(
         resistance_distance_pct=resistance_distance_pct,
         technical_score=technical_score,
         trend_score=trend_score,
+        tightness_score=tightness_score,
+        breakout_quality_score=breakout_quality_score,
+        rvol=rvol,
+        market_environment=market_environment,
+        live_breakout_status=live_breakout_status,
+        stage_label=stage_label,
     )
     trade = signal_trade
     watchlist_flag = signal_watchlist
@@ -2876,6 +3216,10 @@ def build_scan_row(
             extension_note,
             volume_note,
             f"Sector {sector_etf}: {sector_leadership}",
+            f"Market: {market_environment}",
+            f"RVOL: {rvol_label}",
+            f"Stage: {stage_label}",
+            f"Institutional action: {institutional_action}",
             f"Earnings: {earnings_label}",
             f"TP: {ideal_tp_reason}",
             stale_warning,
@@ -2890,6 +3234,7 @@ def build_scan_row(
         "ticker": ticker,
         "Sector / Industry": sector_info.get("sector_industry", "N/A"),
         "Sector Group": sector_info.get("sector_group", "Other"),
+        "Theme Group": sector_info.get("theme_group", sector_info.get("sector_group", "Other")),
         "Sector Raw": sector_info.get("sector", "N/A"),
         "Industry Raw": sector_info.get("industry", "N/A"),
         "close": round(float(latest["Close"]), 2),
@@ -2898,7 +3243,10 @@ def build_scan_row(
         "Premarket Price": round(float(quote_info.get("premarket_price", np.nan)), 2) if pd.notna(quote_info.get("premarket_price", np.nan)) else "N/A",
         "Afterhours Price": round(float(quote_info.get("afterhours_price", np.nan)), 2) if pd.notna(quote_info.get("afterhours_price", np.nan)) else "N/A",
         "Today's Volume": format_count_number(latest.get("Volume")),
-        "Relative Volume": round(rel_volume, 2) if pd.notna(rel_volume) else "N/A",
+        "Relative Volume": round(rvol, 2) if pd.notna(rvol) else "N/A",
+        "RVOL": round(rvol, 2) if pd.notna(rvol) else "N/A",
+        "RVOL Label": rvol_label,
+        "Intraday Volume Ratio": round(intraday_volume_ratio, 2) if pd.notna(intraday_volume_ratio) else "N/A",
         "52-week high": round(float(latest["High52W"]), 2) if pd.notna(latest.get("High52W", np.nan)) else "N/A",
         "Distance From High %": round(distance_from_high, 2) if pd.notna(distance_from_high) else "N/A",
         "market cap": format_large_number(market_cap),
@@ -2915,7 +3263,11 @@ def build_scan_row(
         "Sector Leadership": sector_leadership,
         "Sector Spread %": sector_spread if sector_spread is not None else "N/A",
         "Market Score": market_score,
+        "Market Environment": market_environment,
         "Final Score": final_score,
+        "Breakout Quality Score": breakout_quality_score,
+        "Stage Analysis": stage_label,
+        "Institutional Action": institutional_action,
         "VCP Status": vcp.status,
         "VCP Label": vcp_label,
         "Setup Type": setup_type,
@@ -2937,6 +3289,8 @@ def build_scan_row(
         "RR Score": rr_score,
         "Volume Confirmation": volume_confirmation,
         "Breakout Alert": breakout_alert,
+        "Live Breakout Status": live_breakout_status,
+        "Alert Event": "LIVE BREAKOUT" if live_breakout_status == "LIVE BREAKOUT" else "TRADE YES" if trade == "YES" else breakout_alert,
         "Current Setup Status": current_setup_status,
         "Earnings Date": earnings_info.get("next_date") or "N/A",
         "Days to Earnings": earnings_info.get("days_to_earnings") if earnings_info.get("days_to_earnings") is not None else "N/A",
@@ -2949,6 +3303,7 @@ def build_scan_row(
         "Earnings Setup Score": earnings_setup_score,
         "Earnings Strategy": earnings_strategy,
         "Post-Earnings Label": post_earnings_label,
+        "Earnings Intelligence": earnings_intelligence,
         "Trade": trade,
         "Trade Reason": trade_reason,
         "Entry Type": entry_type,
@@ -2981,6 +3336,8 @@ def build_scan_row(
         "Ideal TP R": ideal_r,
         "MA10 Distance %": ma10_distance,
         "MA20 Distance %": ma20_distance,
+        "1D Return %": round(period_return(data, 1), 2) if pd.notna(period_return(data, 1)) else "N/A",
+        "1W Return %": round(period_return(data, 5), 2) if pd.notna(period_return(data, 5)) else "N/A",
         "Last Updated": scan_timestamps.get("market_timestamp", "N/A"),
         "Local Last Updated": scan_timestamps.get("local_timestamp", "N/A"),
         "Market Session": scan_timestamps.get("session_status", "N/A"),
@@ -3005,6 +3362,8 @@ def build_scan_row(
 
 def style_scan_table(row: pd.Series) -> List[str]:
     """Color rows by signal state for fast visual review."""
+    if row.get("Live Breakout Status") == "LIVE BREAKOUT":
+        return ["background-color: #22c55e; color: #052e16; font-weight: 900"] * len(row)
     colors = {
         "BUY NOW": "background-color: #86efac; color: #052e16; font-weight: 800",
         "BUY ON BREAKOUT": "background-color: #bbf7d0; color: #14532d; font-weight: 750",
@@ -3018,6 +3377,20 @@ def style_scan_table(row: pd.Series) -> List[str]:
         "FAILED": "background-color: #fee2e2; color: #7f1d1d",
     }
     return [colors.get(row.get("Signal State"), colors.get(row.get("Action Label"), ""))] * len(row)
+
+
+def style_rvol_cell(value: object) -> str:
+    """Color RVOL cells by institutional activity band."""
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return ""
+    if numeric > 2:
+        return "background-color: #22c55e; color: #052e16; font-weight: 900"
+    if numeric >= 1.5:
+        return "background-color: #bbf7d0; color: #14532d; font-weight: 700"
+    if numeric < 1:
+        return "background-color: #e5e7eb; color: #374151"
+    return ""
 
 
 def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
@@ -3045,12 +3418,21 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Trail Stop Level",
         "Ideal TP R",
         "RR Ratio",
+        "RVOL",
+        "Relative Volume",
+        "Intraday Volume Ratio",
         "Final Score",
+        "Breakout Quality Score",
         "RS Score",
         "RS Score Raw",
         "Avg RS Score",
         "Avg Explosive Score",
         "Avg Final Score",
+        "Avg Breakout Quality",
+        "Avg Today %",
+        "Avg Week %",
+        "1D Return %",
+        "1W Return %",
         "Sector Spread %",
         "MA10 Distance %",
         "MA20 Distance %",
@@ -3080,8 +3462,11 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "Setup Quality Grade",
         "Action Label",
         "Breakout Alert",
+        "Live Breakout Status",
         "Final Score",
+        "Breakout Quality Score",
         "RS Score",
+        "RVOL",
         "Explosive Score",
         "Pivot",
         "Distance to Pivot %",
@@ -3182,7 +3567,12 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["TP Quality Score"] = 0
     if "Ideal TP R" not in ranked:
         ranked["Ideal TP R"] = 0
+    if "Breakout Quality Score" not in ranked:
+        ranked["Breakout Quality Score"] = 0
+    if "RVOL" not in ranked:
+        ranked["RVOL"] = 0
     ranked["RS Sort"] = pd.to_numeric(ranked.get("RS Score Raw", ranked.get("RS Score")), errors="coerce")
+    ranked["RVOL Sort"] = pd.to_numeric(ranked.get("RVOL"), errors="coerce").fillna(0)
     setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     breakout_priority = {
         "CONFIRMED BREAKOUT": 0,
@@ -3203,6 +3593,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         & (ranked["volume contraction"] == "Yes")
         & (ranked["Setup Quality Grade"].isin(["A+", "A"]))
         & (ranked["Explosive Score"] >= 7)
+        & (ranked["Breakout Quality Score"] >= 7)
         & (ranked["TP Quality Score"] >= 7)
         & (ranked["Ideal TP R"] >= 1.8)
         & (ranked["Earnings Risk"] != "HIGH RISK")
@@ -3222,6 +3613,8 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "trade sort",
             "vcp sort",
             "breakout sort",
+            "Breakout Quality Score",
+            "RVOL Sort",
             "Explosive Score",
             "TP Quality Score",
             "Ideal TP R",
@@ -3231,7 +3624,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Final Score",
             "earnings sort",
         ],
-        ascending=[True, True, True, True, False, False, False, False, False, True, False, True],
+        ascending=[True, True, True, True, False, False, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -3245,6 +3638,10 @@ def alert_message(row: pd.Series) -> str:
         f"Signal State: {row.get('Signal State', 'N/A')}\n"
         f"Setup Type: {row.get('Setup Type', 'N/A')}\n"
         f"Entry Type: {row.get('Entry Type', 'N/A')}\n"
+        f"Live Breakout Status: {row.get('Live Breakout Status', 'N/A')}\n"
+        f"RVOL: {row.get('RVOL', 'N/A')}\n"
+        f"Breakout Quality Score: {row.get('Breakout Quality Score', 'N/A')}\n"
+        f"Market Environment: {row.get('Market Environment', 'N/A')}\n"
         f"VCP Status: {row.get('VCP Status', 'N/A')}\n"
         f"Decision Reason: {row.get('Decision Reason', 'N/A')}\n"
         f"Final Score: {row.get('Final Score', 'N/A')}\n"
@@ -3444,13 +3841,11 @@ def scan_universe(
         for ticker, frame in raw_data.items()
     }
     market_data = {ticker: indicator_data[ticker] for ticker in context_tickers if ticker in indicator_data}
-    if is_hk_scan:
-        market_data["SPY"] = market_data.get("^HSI", pd.DataFrame())
-        market_data["QQQ"] = market_data.get("2800.HK", pd.DataFrame())
     if is_hk_scan and mode == "HK Pro Market Scan":
         market_score, market_status, market_details = calculate_hk_market_score(market_data)
     else:
         market_score, market_status, market_details = calculate_market_score(market_data)
+    market_environment = calculate_market_environment(market_data, is_hk_scan=is_hk_scan and mode == "HK Pro Market Scan")
     sector_score, sector_details = calculate_sector_score(mode, market_data)
     market_caps = download_market_caps(tuple(tickers))
     earnings_data = download_earnings_data(tuple(tickers))
@@ -3495,6 +3890,7 @@ def scan_universe(
                     sector_score=sector_score,
                     benchmark_data=market_data,
                     sector_etf=sector_etf,
+                    market_environment=market_environment.get("status", "UPTREND UNDER PRESSURE"),
                     aggressive_mode=aggressive_mode,
                 )
             )
@@ -3506,6 +3902,10 @@ def scan_universe(
     summary = {
         "market_score": market_score,
         "market_status": market_status,
+        "market_environment": market_environment.get("status", "UPTREND UNDER PRESSURE"),
+        "market_environment_details": market_environment.get("details", ""),
+        "distribution_days": market_environment.get("distribution_days", 0),
+        "follow_through_day": market_environment.get("follow_through_day", False),
         "market_details": market_details,
         "market_timestamp": market_timestamp,
         "local_timestamp": local_timestamp,
@@ -4985,6 +5385,9 @@ def render_top_5_trades() -> None:
             st.write(f"Entry Type: {row.get('Entry Type', 'N/A')}")
             st.write(f"VCP: {row.get('VCP Status', 'N/A')} | {row.get('Contractions', 'N/A')}")
             st.write(f"RS/Trend/Tech: {row.get('RS Score', 'N/A')} / {row.get('Trend Score', 'N/A')} / {row.get('Technical Score', 'N/A')}")
+            st.write(f"Breakout quality / RVOL: {row.get('Breakout Quality Score', 'N/A')}/10 / {row.get('RVOL', 'N/A')}x")
+            st.write(f"Live status: {row.get('Live Breakout Status', 'N/A')}")
+            st.write(f"Stage: {row.get('Stage Analysis', 'N/A')} | {row.get('Institutional Action', 'N/A')}")
             st.write(f"Explosive: {row.get('Explosive Score', 'N/A')}/10 - {row.get('Explosive Label', 'N/A')}")
             st.write(f"Close: {row.get('close', 'N/A')}")
             st.write(f"Pivot: {row.get('Pivot', 'N/A')}")
@@ -5019,6 +5422,35 @@ def render_alerts() -> None:
 
     picks = select_ai_top_5(results)
     st.write("Today alert candidates:")
+    live_alerts = results[
+        results.get("Live Breakout Status", pd.Series("", index=results.index)).isin(["LIVE BREAKOUT", "BREAKOUT STARTING"])
+        | (results.get("Signal State", pd.Series("", index=results.index)) == "BUY NOW")
+        | (results.get("Earnings Risk", pd.Series("", index=results.index)) == "HIGH RISK")
+    ].copy()
+    if not live_alerts.empty:
+        st.write("Live trigger queue:")
+        st.dataframe(
+            round_display_values(
+                live_alerts[
+                    [
+                        "ticker",
+                        "Signal State",
+                        "Live Breakout Status",
+                        "Alert Event",
+                        "Breakout Quality Score",
+                        "RVOL",
+                        "Pivot",
+                        "Entry Trigger",
+                        "Stop Loss",
+                        "Risk %",
+                        "Earnings Risk",
+                        "Decision Reason",
+                    ]
+                ].head(15)
+            ),
+            width="stretch",
+            hide_index=True,
+        )
     if picks.empty:
         st.info("No clean trade today. Best action: wait.")
     else:
@@ -5031,6 +5463,9 @@ def render_alerts() -> None:
                         "VCP Status",
                         "Setup Type",
                         "Signal State",
+                        "Live Breakout Status",
+                        "Breakout Quality Score",
+                        "RVOL",
                         "Contractions",
                         "Volume Dry-Up",
                         "RS Score",
@@ -5101,6 +5536,7 @@ def manage_active_position(
     position_size: float,
     ma10: float | None,
     prior_day_low: float | None,
+    heavy_volume_ma10_break: bool = False,
 ) -> dict:
     """Calculate active-position status and a rule-based management action."""
     risk_per_share = entry_price - stop_loss
@@ -5120,13 +5556,13 @@ def manage_active_position(
     suggested_stop = stop_loss
     partial_note = "No partial sale suggested yet."
 
-    if pd.notna(ma10_value) and current_price < ma10_value:
-        suggested_action = "EXIT"
-        action_reason = "Breakout failed below MA10; exit remaining position."
+    if heavy_volume_ma10_break or (pd.notna(ma10_value) and current_price < ma10_value):
+        suggested_action = "EXIT POSITION"
+        action_reason = "Breakout failed below MA10 on heavy or concerning volume; exit remaining position."
         suggested_stop = current_price
         partial_note = "Exit remaining shares."
     elif pd.notna(extended_from_ma10) and extended_from_ma10 > 15:
-        suggested_action = "MOVE STOP"
+        suggested_action = "TRAIL MA10"
         suggested_stop = prior_low_value if pd.notna(prior_low_value) else max(stop_loss, ma10_value)
         action_reason = "Price is more than 15% above MA10; tighten stop to prior day low."
         partial_note = "Consider locking gains if position is outsized."
@@ -5141,7 +5577,7 @@ def manage_active_position(
         action_reason = "Position is above 1.5R; take 30-50% partial or trail by MA10."
         partial_note = "Take 30-50% partial, or trail all by MA10 if momentum is strong."
     elif pd.notna(current_r) and current_r >= 1:
-        suggested_action = "MOVE STOP"
+        suggested_action = "MOVE STOP TO BREAKEVEN"
         suggested_stop = max(stop_loss, entry_price, ma10_value if pd.notna(ma10_value) else entry_price)
         action_reason = "Position reached 1R; move stop to breakeven or MA10."
         partial_note = "No partial required, but remove downside risk."
@@ -5200,7 +5636,22 @@ def render_position_management(selected_ticker: str, selected_row: pd.Series, se
 
         ma10 = float(latest["MA10"]) if latest is not None and pd.notna(latest.get("MA10", np.nan)) else np.nan
         prior_day_low = float(prior["Low"]) if prior is not None and pd.notna(prior.get("Low", np.nan)) else np.nan
-        management = manage_active_position(entry_price, current_price, stop_loss, position_size, ma10, prior_day_low)
+        heavy_volume_ma10_break = bool(
+            latest is not None
+            and pd.notna(latest.get("MA10", np.nan))
+            and pd.notna(latest.get("AvgVol20", np.nan))
+            and latest["Close"] < latest["MA10"]
+            and latest["Volume"] > 1.3 * latest["AvgVol20"]
+        )
+        management = manage_active_position(
+            entry_price,
+            current_price,
+            stop_loss,
+            position_size,
+            ma10,
+            prior_day_low,
+            heavy_volume_ma10_break,
+        )
 
         metric_cols = st.columns(5)
         metric_cols[0].metric("Current gain %", f"{management['gain_pct']:.2f}%" if pd.notna(management["gain_pct"]) else "N/A")
@@ -5343,6 +5794,7 @@ def render_swing_scanner(
         "Entry Type",
         "Sector / Industry",
         "Sector Group",
+        "Theme Group",
         "RR Ratio",
         "RR Score",
         "Tightness Score",
@@ -5394,6 +5846,18 @@ def render_swing_scanner(
         "Afterhours Price",
         "Today's Volume",
         "Relative Volume",
+        "RVOL",
+        "RVOL Label",
+        "Intraday Volume Ratio",
+        "Live Breakout Status",
+        "Alert Event",
+        "Breakout Quality Score",
+        "Market Environment",
+        "Stage Analysis",
+        "Institutional Action",
+        "Earnings Intelligence",
+        "1D Return %",
+        "1W Return %",
         "52-week high",
         "Distance From High %",
         "Current Setup Status",
@@ -5420,26 +5884,32 @@ def render_swing_scanner(
 
     market_score = summary.get("market_score", 0)
     market_status = summary.get("market_status", "N/A")
+    market_environment = summary.get("market_environment", "UPTREND UNDER PRESSURE")
+    market_environment_details = summary.get("market_environment_details", "")
     sector_score = summary.get("sector_score", 0)
     session_status = summary.get("session_status", "N/A")
     market_timestamp = summary.get("market_timestamp", "N/A")
     local_timestamp = summary.get("local_timestamp", "N/A")
 
-    metric_cols = st.columns(5)
+    market_tone = "normal" if market_environment == "CONFIRMED UPTREND" else "inverse" if market_environment == "CORRECTION" else "off"
+    st.metric("Current Market Status", market_environment, market_environment_details, delta_color=market_tone)
+    metric_cols = st.columns(6)
     metric_cols[0].metric("Market Status", market_status)
     metric_cols[1].metric("Market Score", f"{market_score}/4")
-    metric_cols[2].metric("Sector Score", f"{sector_score}/3")
-    metric_cols[3].metric("Stocks Passed", len(results))
-    metric_cols[4].metric("Mode", st.session_state.get(f"{key_prefix}_last_scan_mode", scan_mode))
+    metric_cols[2].metric("Distribution Days", summary.get("distribution_days", 0))
+    metric_cols[3].metric("Follow Through Day", "YES" if summary.get("follow_through_day", False) else "NO")
+    metric_cols[4].metric("Stocks Passed", len(results))
+    metric_cols[5].metric("Mode", st.session_state.get(f"{key_prefix}_last_scan_mode", scan_mode))
 
-    dashboard_cols = st.columns(6)
+    dashboard_cols = st.columns(7)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
     dashboard_cols[1].metric("Watchlist", int((results["WATCHLIST FLAG"] == "YES").sum()))
-    dashboard_cols[2].metric("Near Breakouts", int((results["Breakout Alert"] == "NEAR BREAKOUT").sum()))
-    dashboard_cols[3].metric("Confirmed Breakouts", int((results["Breakout Alert"] == "CONFIRMED BREAKOUT").sum()))
-    dashboard_cols[4].metric("Earnings Risk", int((results["Earnings Risk"] == "HIGH RISK").sum()))
+    dashboard_cols[2].metric("Live Breakouts", int((results["Live Breakout Status"] == "LIVE BREAKOUT").sum()))
+    dashboard_cols[3].metric("Near Breakouts", int((results["Breakout Alert"] == "NEAR BREAKOUT").sum()))
+    dashboard_cols[4].metric("Confirmed Breakouts", int((results["Breakout Alert"] == "CONFIRMED BREAKOUT").sum()))
+    dashboard_cols[5].metric("Earnings Risk", int((results["Earnings Risk"] == "HIGH RISK").sum()))
     best_sector = results.groupby("Sector ETF")["Final Score"].mean().sort_values(ascending=False).index[0] if not results.empty else "N/A"
-    dashboard_cols[5].metric("Best Sector", best_sector)
+    dashboard_cols[6].metric("Best Sector", best_sector)
     high_earnings_count = int((results["Earnings Risk"] == "HIGH RISK").sum())
     if high_earnings_count:
         st.warning(f"Earnings risk active: {high_earnings_count} stocks report within 7 days.")
@@ -5463,25 +5933,62 @@ def render_swing_scanner(
             qualified.groupby("Sector Group", dropna=False)
             .agg(
                 qualified_setups=("ticker", "count"),
+                buy_now_setups=("Signal State", lambda values: int((values == "BUY NOW").sum())),
+                avg_today_return=("1D Return %", lambda values: pd.to_numeric(values, errors="coerce").mean()),
+                avg_week_return=("1W Return %", lambda values: pd.to_numeric(values, errors="coerce").mean()),
                 avg_rs_score=("RS Summary Score", "mean"),
                 avg_explosive_score=("Explosive Score", "mean"),
                 avg_final_score=("Final Score", "mean"),
             )
             .reset_index()
-            .sort_values(["avg_rs_score", "avg_explosive_score", "qualified_setups"], ascending=[False, False, False])
+            .sort_values(["avg_week_return", "avg_rs_score", "buy_now_setups"], ascending=[False, False, False])
         )
         strongest_sector = sector_summary.iloc[0]["Sector Group"]
+        strongest_today = sector_summary.sort_values("avg_today_return", ascending=False).iloc[0]["Sector Group"]
+        strongest_week = sector_summary.sort_values("avg_week_return", ascending=False).iloc[0]["Sector Group"]
         st.subheader("Sector Strength Summary")
-        st.caption(f"Strongest sector today: {strongest_sector}")
+        st.caption(f"Strongest sector today: {strongest_today} | Strongest sector this week: {strongest_week} | Overall leadership: {strongest_sector}")
         st.dataframe(
             round_display_values(
                 sector_summary.rename(
                     columns={
                         "Sector Group": "Sector",
                         "qualified_setups": "Qualified Setups",
+                        "buy_now_setups": "BUY NOW Setups",
+                        "avg_today_return": "Avg Today %",
+                        "avg_week_return": "Avg Week %",
                         "avg_rs_score": "Avg RS Score",
                         "avg_explosive_score": "Avg Explosive Score",
                         "avg_final_score": "Avg Final Score",
+                    }
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        theme_summary = (
+            qualified.groupby("Theme Group", dropna=False)
+            .agg(
+                buy_now_setups=("Signal State", lambda values: int((values == "BUY NOW").sum())),
+                avg_today_return=("1D Return %", lambda values: pd.to_numeric(values, errors="coerce").mean()),
+                avg_week_return=("1W Return %", lambda values: pd.to_numeric(values, errors="coerce").mean()),
+                avg_rs_score=("RS Summary Score", "mean"),
+                avg_breakout_quality=("Breakout Quality Score", "mean"),
+            )
+            .reset_index()
+            .sort_values(["avg_week_return", "avg_breakout_quality", "buy_now_setups"], ascending=[False, False, False])
+        )
+        st.caption("Sector rotation engine: strongest themes by week, breakout quality, and BUY NOW count.")
+        st.dataframe(
+            round_display_values(
+                theme_summary.rename(
+                    columns={
+                        "Theme Group": "Theme",
+                        "buy_now_setups": "BUY NOW Setups",
+                        "avg_today_return": "Avg Today %",
+                        "avg_week_return": "Avg Week %",
+                        "avg_rs_score": "Avg RS Score",
+                        "avg_breakout_quality": "Avg Breakout Quality",
                     }
                 )
             ),
@@ -5507,6 +6014,7 @@ def render_swing_scanner(
 
     visible = results.copy()
     visible["RS Sort"] = pd.to_numeric(visible.get("RS Score Raw", visible.get("RS Score")), errors="coerce")
+    visible["RVOL Sort"] = pd.to_numeric(visible.get("RVOL"), errors="coerce")
     if not show_all:
         visible = visible[
             (visible["Trend Score"] >= 4)
@@ -5550,36 +6058,39 @@ def render_swing_scanner(
     visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
     visible = visible.sort_values(
-        ["signal sort", "quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, True, False, False, False, True],
+        ["signal sort", "quality sort", "Breakout Quality Score", "Final Score", "RVOL Sort", "RS Sort", "Risk %"],
+        ascending=[True, True, False, False, False, False, True],
     )
 
     compact_columns = [
         "ticker",
         "Sector / Industry",
-        "close",
-        "VCP Status",
         "Setup Type",
         "Signal State",
-        "Setup Quality Grade",
         "Trade",
-        "WATCHLIST FLAG",
         "Final Score",
+        "Breakout Quality Score",
         "RS Score",
-        "Explosive Score",
+        "RVOL",
         "Risk %",
-        "Target 1R",
-        "Target 2R",
-        "Target 3R",
+        "Ideal TP",
+        "Decision Reason",
+        "close",
+        "VCP Status",
+        "Setup Quality Grade",
+        "WATCHLIST FLAG",
+        "Live Breakout Status",
+        "Stage Analysis",
+        "Institutional Action",
+        "Earnings Intelligence",
         "Pivot",
         "Entry Trigger",
         "Stop Loss",
-        "Ideal TP",
-        "Decision Reason",
     ]
     diagnostic_columns = compact_columns + [
         "% Change",
         "Sector Group",
+        "Theme Group",
         "Sector Raw",
         "Industry Raw",
         "VCP Label",
@@ -5588,7 +6099,14 @@ def render_swing_scanner(
         "Trend Score",
         "Technical Score",
         "Tightness Score",
+        "Explosive Score",
         "RS Score Raw",
+        "Intraday Volume Ratio",
+        "RVOL Label",
+        "Alert Event",
+        "Market Environment",
+        "1D Return %",
+        "1W Return %",
         "Entry Type",
         "Action Label",
         "Breakout Alert",
@@ -5661,7 +6179,10 @@ def render_swing_scanner(
         "Chart/Quote Mismatch %",
         "Notes",
     ]
-    display_columns = diagnostic_columns if show_full_diagnostics else compact_columns
+    compact_columns = list(dict.fromkeys(compact_columns))
+    diagnostic_columns = list(dict.fromkeys(diagnostic_columns))
+    display_columns = compact_columns
+    export_columns = diagnostic_columns if show_full_diagnostics else compact_columns
 
     focus_source = results.copy()
     focus_source["RS Sort"] = pd.to_numeric(focus_source.get("RS Score Raw", focus_source.get("RS Score")), errors="coerce")
@@ -5740,12 +6261,19 @@ def render_swing_scanner(
         st.info("No rows match the current display filters.")
     else:
         table_display = round_display_values(visible[display_columns])
+        styled_table = table_display.style.apply(style_scan_table, axis=1)
+        if "RVOL" in table_display.columns:
+            styled_table = styled_table.map(style_rvol_cell, subset=["RVOL"])
         st.dataframe(
-            table_display.style.apply(style_scan_table, axis=1),
+            styled_table,
             width="stretch",
             hide_index=True,
         )
         export_frame = round_display_values(visible[display_columns])
+        if show_full_diagnostics:
+            with st.expander("Full diagnostics", expanded=False):
+                st.dataframe(round_display_values(visible[diagnostic_columns]), width="stretch", hide_index=True)
+            export_frame = round_display_values(visible[export_columns])
         st.download_button(
             "Export scanner table CSV",
             data=export_frame.to_csv(index=False).encode("utf-8"),
@@ -5774,6 +6302,12 @@ def render_swing_scanner(
     live_cols[3].metric("52W High", selected_row["52-week high"], f"{selected_row['Distance From High %']}%")
     live_cols[4].metric("Volume", selected_row["Today's Volume"], f"RelVol {selected_row['Relative Volume']}")
     live_cols[5].metric("Setup Status", selected_row["Current Setup Status"])
+    breakout_cols = st.columns(5)
+    breakout_cols[0].metric("Live Breakout", selected_row.get("Live Breakout Status", "N/A"))
+    breakout_cols[1].metric("RVOL", selected_row.get("RVOL", "N/A"), selected_row.get("RVOL Label", ""))
+    breakout_cols[2].metric("Intraday Volume Ratio", selected_row.get("Intraday Volume Ratio", "N/A"))
+    breakout_cols[3].metric("Breakout Quality", f"{selected_row.get('Breakout Quality Score', 'N/A')}/10")
+    breakout_cols[4].metric("Stage", selected_row.get("Stage Analysis", "N/A"))
     st.caption(
         f"Latest candle: {selected_row['Latest Candle Date']} | Dataframe last index: {selected_row['Dataframe Last Index']} | "
         f"Rows: {selected_row['Fetched Rows']} | Quote source: {selected_row['Quote Source']} | Quote time: {selected_row['Quote Time']} | "
@@ -5793,6 +6327,8 @@ def render_swing_scanner(
         st.subheader("Trade Plan")
         st.metric("Signal State", selected_row["Signal State"])
         st.metric("Setup Type", selected_row["Setup Type"])
+        st.metric("Breakout Quality", f"{selected_row.get('Breakout Quality Score', 'N/A')}/10", selected_row.get("Live Breakout Status", "N/A"))
+        st.metric("Institutional Action", selected_row.get("Institutional Action", "N/A"))
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
         st.metric("Entry Type", selected_row["Entry Type"])
