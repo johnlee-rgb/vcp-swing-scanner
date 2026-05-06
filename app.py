@@ -1196,8 +1196,8 @@ def choose_action_label(
     return "FAILED" if latest["Close"] < latest["MA50"] else "WATCH"
 
 
-def build_trade_plan(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple[float, float, float, float, float, str]:
-    """Calculate entry, stop, risk, 2R, 3R, and invalidation notes."""
+def build_trade_plan(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple[float, float, float, float, float, float, str]:
+    """Calculate entry, stop, risk, 1R, 2R, 3R, and invalidation notes."""
     latest = data.iloc[-1]
     previous = data.iloc[-2] if len(data) >= 2 else latest
     atr = latest["ATR14"] if pd.notna(latest["ATR14"]) else latest["Close"] * 0.03
@@ -1214,6 +1214,7 @@ def build_trade_plan(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple
     stop = max(stop, 0.01)
     risk_dollars = max(entry - stop, 0.01)
     risk_pct = risk_dollars / entry * 100 if entry > 0 else np.nan
+    target_1r = entry + risk_dollars
     target_2r = entry + 2 * risk_dollars
     target_3r = entry + 3 * risk_dollars
     invalidation = "Close below MA20, close below recent structure low, or high-volume failed breakout."
@@ -1222,10 +1223,189 @@ def build_trade_plan(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple
         round(entry, 2),
         round(stop, 2),
         round(risk_pct, 2),
+        round(target_1r, 2),
         round(target_2r, 2),
         round(target_3r, 2),
         invalidation,
     )
+
+
+def round_number_resistance(price: float) -> float:
+    """Find the next common round-number resistance above a planned entry."""
+    if price <= 20:
+        step = 1
+    elif price <= 100:
+        step = 5
+    elif price <= 500:
+        step = 10
+    else:
+        step = 25
+    level = np.ceil(price / step) * step
+    if level <= price * 1.005:
+        level += step
+    return float(level)
+
+
+def detect_nearest_resistance(data: pd.DataFrame, entry: float) -> float:
+    """Estimate the nearest overhead resistance using highs, swings, gaps, and round numbers."""
+    latest = data.iloc[-1]
+    candidates: List[float] = []
+
+    for column in ("High20", "High52W"):
+        value = latest.get(column, np.nan)
+        if pd.notna(value):
+            candidates.append(float(value))
+
+    if len(data) >= 50:
+        candidates.append(float(data["High"].tail(50).max()))
+
+    for point in find_swing_points(data, lookback=120):
+        if point["type"] == "H":
+            candidates.append(float(point["price"]))
+
+    if len(data) >= 2:
+        recent = data.tail(120)
+        previous_low = recent["Low"].shift(1)
+        gap_down = recent["High"] < previous_low * 0.98
+        candidates.extend(float(value) for value in previous_low[gap_down].dropna().tolist())
+
+    candidates.append(round_number_resistance(entry))
+    overhead = sorted({round(value, 2) for value in candidates if pd.notna(value) and value > entry * 1.005})
+    if overhead:
+        return overhead[0]
+
+    fallback = max(float(latest.get("High52W", entry * 1.1)), round_number_resistance(entry))
+    return round(fallback, 2)
+
+
+def risk_note(risk_pct: float, aggressive_mode: bool) -> str:
+    """Label risk quality so borderline setups are obvious."""
+    if pd.isna(risk_pct):
+        return "Invalid risk"
+    if risk_pct <= 8:
+        return "Preferred risk"
+    if risk_pct <= 10:
+        return "Borderline risk"
+    return "Aggressive risk allowed" if aggressive_mode else "Risk above 10%"
+
+
+def calculate_ideal_tp_plan(
+    entry: float,
+    stop: float,
+    target_1r: float,
+    target_2r: float,
+    target_3r: float,
+    nearest_resistance: float,
+    current_close: float,
+    ma10: float,
+    prior_day_low: float,
+    two_day_low: float,
+    ma10_distance: float,
+    setup_grade: str,
+    explosive_score: int,
+    rs_score: float,
+    volume_confirmation: str,
+    extended: bool,
+    risk_pct: float,
+    rsi: float,
+    earnings_risk_label: str,
+    watchlist_flag: str = "NO",
+) -> Tuple[float, str, str, float, int, float]:
+    """Choose a realistic TP zone and score whether enough upside exists before resistance."""
+    risk_per_share = max(entry - stop, 0.01)
+    resistance_r = (nearest_resistance - entry) / risk_per_share if nearest_resistance > entry else 0
+    strong_momentum = setup_grade in {"A+", "A"} and explosive_score >= 8 and rs_score >= 7 and volume_confirmation == "YES"
+
+    if setup_grade == "Reject":
+        ideal_tp = min(target_1r, nearest_resistance) if nearest_resistance > entry else target_1r
+        reason = "Rejected setup; do not plan an upside trade"
+        sell_strategy = "AVOID / NO TRADE"
+    elif watchlist_flag == "YES":
+        ideal_tp = min(target_2r, nearest_resistance) if nearest_resistance > entry else target_2r
+        reason = "Watchlist only; wait for a clean entry before using targets"
+        sell_strategy = "WAIT FOR ENTRY"
+    elif earnings_risk_label == "HIGH RISK":
+        ideal_tp = min(target_1r, nearest_resistance) if nearest_resistance > entry else target_1r
+        reason = "Earnings risk soon"
+        sell_strategy = "TAKE 1R FAST"
+    elif extended or risk_pct > 12 or rsi > 80:
+        ideal_tp = min(target_1r, nearest_resistance) if nearest_resistance > entry else target_1r
+        reason = "Extended; take profit faster"
+        sell_strategy = "QUICK SCALP"
+    elif nearest_resistance < target_1r:
+        ideal_tp = nearest_resistance if nearest_resistance > entry else target_1r
+        reason = "Nearest resistance before 1R; upside too limited"
+        sell_strategy = "QUICK SCALP"
+    elif strong_momentum:
+        ideal_tp = target_3r
+        reason = "Strong momentum setup; allow runner"
+        sell_strategy = "HOLD TO 3R IF VOLUME HOLDS"
+    elif target_1r <= nearest_resistance <= target_2r:
+        ideal_tp = nearest_resistance
+        reason = "Nearest resistance before 2R"
+        sell_strategy = "TAKE 1R FAST"
+    elif target_2r < nearest_resistance <= target_3r:
+        ideal_tp = min(nearest_resistance, target_2r)
+        reason = "Resistance near 2R-3R zone"
+        sell_strategy = "SELL INTO 2R"
+    elif setup_grade == "B":
+        ideal_tp = min(target_2r, nearest_resistance) if nearest_resistance > entry else target_1r
+        reason = "Lower quality setup; take profit earlier"
+        sell_strategy = "SELL INTO 2R" if ideal_tp >= target_2r * 0.98 else "TAKE 1R FAST"
+    elif setup_grade in {"A+", "A"}:
+        ideal_tp = min(target_3r, nearest_resistance) if nearest_resistance > entry else target_2r
+        reason = "High quality setup; allow larger target"
+        sell_strategy = "PARTIAL AT 2R, TRAIL REST" if ideal_tp >= target_2r else "SELL INTO 2R"
+    else:
+        ideal_tp = min(target_1r, nearest_resistance) if nearest_resistance > entry else target_1r
+        reason = "Limited upside before resistance"
+        sell_strategy = "QUICK SCALP"
+
+    ideal_r = round((ideal_tp - entry) / risk_per_share, 2)
+    if ma10_distance > 15:
+        trail_stop = prior_day_low
+    elif current_close >= target_2r:
+        trail_stop = max(ma10, two_day_low)
+    elif current_close >= target_1r:
+        trail_stop = max(ma10, prior_day_low)
+    else:
+        trail_stop = max(stop, min(ma10, prior_day_low))
+
+    tp_score = 0
+    if nearest_resistance >= target_2r:
+        tp_score += 2
+    elif nearest_resistance >= target_1r:
+        tp_score += 1
+    if nearest_resistance >= target_3r:
+        tp_score += 2
+    elif nearest_resistance >= target_2r:
+        tp_score += 1
+    if setup_grade in {"A+", "A"}:
+        tp_score += 2
+    elif setup_grade == "B":
+        tp_score += 1
+    if explosive_score >= 8:
+        tp_score += 1
+    if volume_confirmation == "YES":
+        tp_score += 1
+    if earnings_risk_label not in {"HIGH RISK", "MEDIUM RISK"}:
+        tp_score += 1
+    if nearest_resistance < target_1r:
+        tp_score -= 2
+    if risk_pct > 10:
+        tp_score -= 2
+    elif risk_pct > 8:
+        tp_score -= 1
+    if earnings_risk_label == "HIGH RISK":
+        tp_score -= 2
+    elif earnings_risk_label == "MEDIUM RISK":
+        tp_score -= 1
+    if setup_grade == "Reject":
+        tp_score -= 3
+    if extended:
+        tp_score -= 2
+
+    return round(float(ideal_tp), 2), reason, sell_strategy, round(float(trail_stop), 2), int(min(max(tp_score, 0), 10)), ideal_r
 
 
 def calculate_rr_score(entry: float, stop: float, target_2r: float) -> Tuple[float | None, str]:
@@ -1521,7 +1701,7 @@ def build_ai_trading_notes(row: dict) -> str:
     return (
         f"{row['ticker']} {row['Action Label']} | {row.get('Setup Quality Grade', 'N/A')} | {row['VCP Status']} | "
         f"Final {row['Final Score']}/100 | Explosive {row.get('Explosive Score', 'N/A')}/10 | {row['Breakout Alert']} | "
-        f"Risk {row['Risk %']}% | Earnings {row['Earnings Risk']}"
+        f"Risk {row['Risk %']}% | TP quality {row.get('TP Quality Score', 'N/A')}/10 | Earnings {row['Earnings Risk']}"
     )
 
 
@@ -1565,6 +1745,7 @@ def decide_trade(
     ma10_rising: bool,
     higher_low_structure: bool,
     volume_contraction: bool,
+    aggressive_mode: bool = False,
 ) -> Tuple[str, str]:
     """Return the final YES/NO decision and the first practical blocker."""
     if action not in {"READY", "PULLBACK ENTRY"}:
@@ -1577,7 +1758,9 @@ def decide_trade(
         return "NO", "Final score below 75"
     if technical_score < 6 or trend_score < 5:
         return "NO", "Trend or technical score too low"
-    if pd.isna(risk_pct) or risk_pct > 10:
+    if pd.isna(risk_pct):
+        return "NO", "Risk invalid"
+    if risk_pct > 10 and not aggressive_mode:
         return "NO", "Risk too high"
     if rr_score not in {"A+", "A"}:
         return "NO", "RR below A"
@@ -1601,7 +1784,7 @@ def decide_trade(
             (price_above_ma10 or holding_ma20)
             and ma10_rising
             and higher_low_structure
-            and risk_pct <= 10
+            and (risk_pct <= 10 or aggressive_mode)
             and rs_score >= 6
             and volume_contraction
         )
@@ -1741,6 +1924,7 @@ def build_scan_row(
     sector_score: int,
     benchmark_data: Dict[str, pd.DataFrame],
     sector_etf: str,
+    aggressive_mode: bool = False,
 ) -> dict:
     """Build the output row and stash chart-specific detail fields."""
     latest = data.iloc[-1]
@@ -1750,7 +1934,7 @@ def build_scan_row(
     technical_score, technical_notes = score_technical(data, pivot)
     extended, ma10_distance, ma20_distance, extension_note = detect_extension(data)
     action = choose_action_label(data, trend_score, technical_score, pivot, vcp, extended)
-    entry, stop, risk_pct, target_2r, target_3r, invalidation = build_trade_plan(data, action, pivot)
+    entry, stop, risk_pct, target_1r, target_2r, target_3r, invalidation = build_trade_plan(data, action, pivot)
     rr_ratio, rr_score = calculate_rr_score(entry, stop, target_2r)
     tightness_score, tightness_label = calculate_tightness(data, vcp)
     rs_score = calculate_rs_score(data, benchmark_data.get("SPY"), benchmark_data.get("QQQ"))
@@ -1795,6 +1979,7 @@ def build_scan_row(
         ma10_rising=ma10_rising,
         higher_low_structure=higher_low_structure,
         volume_contraction=vcp.volume_contraction,
+        aggressive_mode=aggressive_mode,
     )
     quality_grade, why_selected = setup_quality_grade(
         action=action,
@@ -1826,6 +2011,40 @@ def build_scan_row(
     if quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
+    nearest_resistance = detect_nearest_resistance(data, entry)
+    ideal_tp, ideal_tp_reason, sell_strategy, trail_stop, tp_quality_score, ideal_r = calculate_ideal_tp_plan(
+        entry=entry,
+        stop=stop,
+        target_1r=target_1r,
+        target_2r=target_2r,
+        target_3r=target_3r,
+        nearest_resistance=nearest_resistance,
+        current_close=float(latest["Close"]),
+        ma10=float(latest["MA10"]),
+        prior_day_low=float(data["Low"].iloc[-2]) if len(data) >= 2 else float(latest["Low"]),
+        two_day_low=float(data["Low"].tail(2).min()),
+        ma10_distance=ma10_distance,
+        setup_grade=quality_grade,
+        explosive_score=explosive_score,
+        rs_score=rs_score,
+        volume_confirmation=volume_confirmation,
+        extended=extended,
+        risk_pct=risk_pct,
+        rsi=float(latest["RSI14"]),
+        earnings_risk_label=earnings_label,
+    )
+    risk_quality_note = risk_note(risk_pct, aggressive_mode)
+    if trade == "YES" and risk_pct > 10 and not aggressive_mode:
+        trade = "NO"
+        trade_reason = "Risk too high"
+    if trade == "YES" and ideal_r < 1.8:
+        trade = "NO"
+        trade_reason = "Reward too limited before resistance"
+        why_selected = "rejected because reward is too limited before resistance"
+    if trade == "YES" and tp_quality_score < 5:
+        trade = "NO"
+        trade_reason = "TP quality too low"
+        why_selected = "rejected because upside before resistance is too limited"
     watchlist_flag, watchlist_reason = decide_watchlist_flag(
         trade=trade,
         vcp_status=vcp.status,
@@ -1842,6 +2061,12 @@ def build_scan_row(
         sector_score=sector_score,
         earnings_risk_label=earnings_label,
     )
+    if trade == "NO" and watchlist_flag == "YES":
+        sell_strategy = "WAIT FOR ENTRY"
+        if ideal_tp_reason.startswith("Watchlist only") is False:
+            ideal_tp_reason = f"{ideal_tp_reason}; watchlist only"
+    elif trade == "NO" and quality_grade == "Reject":
+        sell_strategy = "AVOID / NO TRADE"
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
 
     notes = "; ".join(
@@ -1851,6 +2076,7 @@ def build_scan_row(
             volume_note,
             f"Sector {sector_etf}: {sector_leadership}",
             f"Earnings: {earnings_label}",
+            f"TP: {ideal_tp_reason}",
             *trend_notes[:2],
             *technical_notes[:3],
             invalidation,
@@ -1910,8 +2136,17 @@ def build_scan_row(
         "Entry Trigger": entry,
         "Stop Loss": stop,
         "Risk %": risk_pct,
+        "Risk Note": risk_quality_note,
+        "Target 1R": target_1r,
         "Target 2R": target_2r,
         "Target 3R": target_3r,
+        "Nearest Resistance": nearest_resistance,
+        "Ideal TP": ideal_tp,
+        "Ideal TP Reason": ideal_tp_reason,
+        "Sell Strategy": sell_strategy,
+        "Trail Stop Level": trail_stop,
+        "TP Quality Score": tp_quality_score,
+        "Ideal TP R": ideal_r,
         "MA10 Distance %": ma10_distance,
         "MA20 Distance %": ma20_distance,
         "Notes": notes,
@@ -1950,8 +2185,13 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Entry Trigger",
         "Stop Loss",
         "Risk %",
+        "Target 1R",
         "Target 2R",
         "Target 3R",
+        "Nearest Resistance",
+        "Ideal TP",
+        "Trail Stop Level",
+        "Ideal TP R",
         "RR Ratio",
         "Final Score",
         "RS Score",
@@ -1984,6 +2224,8 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "Stop Loss",
         "Risk %",
         "RR Score",
+        "Ideal TP",
+        "TP Quality Score",
         "Reason",
     ]
     return round_display_values(summary[columns])
@@ -2014,6 +2256,10 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["Explosive Score"] = 0
     if "Explosive Label" not in ranked:
         ranked["Explosive Label"] = "LOW MOMENTUM"
+    if "TP Quality Score" not in ranked:
+        ranked["TP Quality Score"] = 0
+    if "Ideal TP R" not in ranked:
+        ranked["Ideal TP R"] = 0
     setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     breakout_priority = {
         "CONFIRMED BREAKOUT": 0,
@@ -2028,10 +2274,13 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         (vcp_mask | strong_pullback_mask)
         & (ranked["RS Score"] >= 6)
         & sector_mask
+        & (ranked["Trade"] == "YES")
         & (ranked["Risk %"] <= 10)
         & (ranked["volume contraction"] == "Yes")
         & (ranked["Setup Quality Grade"].isin(["A+", "A"]))
         & (ranked["Explosive Score"] >= 7)
+        & (ranked["TP Quality Score"] >= 7)
+        & (ranked["Ideal TP R"] >= 1.8)
         & (ranked["Earnings Risk"] != "HIGH RISK")
     )
     ranked = ranked[candidate_mask].copy()
@@ -2050,13 +2299,15 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "vcp sort",
             "breakout sort",
             "Explosive Score",
+            "TP Quality Score",
+            "Ideal TP R",
             "RS Score",
             "Tightness Score",
             "Risk %",
             "Final Score",
             "earnings sort",
         ],
-        ascending=[True, True, True, True, False, False, False, True, False, True],
+        ascending=[True, True, True, True, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -2071,8 +2322,12 @@ def alert_message(row: pd.Series) -> str:
         f"Entry Trigger: {row.get('Entry Trigger', 'N/A')}\n"
         f"Stop Loss: {row.get('Stop Loss', 'N/A')}\n"
         f"Risk %: {row.get('Risk %', 'N/A')}\n"
+        f"Target 1R: {row.get('Target 1R', 'N/A')}\n"
         f"Target 2R: {row.get('Target 2R', 'N/A')}\n"
         f"Target 3R: {row.get('Target 3R', 'N/A')}\n"
+        f"Ideal TP: {row.get('Ideal TP', 'N/A')}\n"
+        f"Ideal TP Reason: {row.get('Ideal TP Reason', 'N/A')}\n"
+        f"Sell Strategy: {row.get('Sell Strategy', 'N/A')}\n"
         f"Breakout Alert: {row.get('Breakout Alert', 'N/A')}\n"
         f"Earnings Date: {row.get('Earnings Date', 'N/A')}\n"
         f"Earnings Risk: {row.get('Earnings Risk', 'N/A')}\n"
@@ -2166,8 +2421,12 @@ def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
         ("Pivot", row["Pivot"], "#111827"),
         ("Entry", row["Entry Trigger"], "#2563eb"),
         ("Stop", row["Stop Loss"], "#dc2626"),
+        ("1R", row.get("Target 1R", np.nan), "#22c55e"),
         ("2R", row["Target 2R"], "#16a34a"),
         ("3R", row["Target 3R"], "#15803d"),
+        ("Resistance", row.get("Nearest Resistance", np.nan), "#9333ea"),
+        ("Ideal TP", row.get("Ideal TP", np.nan), "#0f766e"),
+        ("Trail", row.get("Trail Stop Level", np.nan), "#ea580c"),
     ]
     for label, value, color in level_specs:
         if pd.notna(value):
@@ -2206,6 +2465,7 @@ def scan_universe(
     min_price: float,
     min_market_cap: float,
     min_dollar_volume: float,
+    aggressive_mode: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], dict]:
     """Download, filter, score, and return scanner results."""
     tickers = tickers[:500]
@@ -2258,6 +2518,7 @@ def scan_universe(
                     sector_score=sector_score,
                     benchmark_data=market_data,
                     sector_etf=sector_etf,
+                    aggressive_mode=aggressive_mode,
                 )
             )
         except Exception as exc:
@@ -3726,7 +3987,7 @@ def render_top_5_trades() -> None:
 
     picks = select_ai_top_5(results)
     if picks.empty:
-        st.info("No Top 5 candidates meet the stricter A/A+, Explosive Score >= 7, and Risk <= 10% rules yet.")
+        st.info("No clean trade today. Best action: wait.")
         return
     cols = st.columns(5)
     for index, (_, row) in enumerate(picks.iterrows()):
@@ -3744,7 +4005,9 @@ def render_top_5_trades() -> None:
             st.write(f"Entry: {row.get('Entry Trigger', 'N/A')}")
             st.write(f"Stop: {row.get('Stop Loss', 'N/A')}")
             st.write(f"Risk: {row.get('Risk %', 'N/A')}%")
-            st.write(f"2R / 3R: {row.get('Target 2R', 'N/A')} / {row.get('Target 3R', 'N/A')}")
+            st.write(f"Ideal TP: {row.get('Ideal TP', 'N/A')} ({row.get('Ideal TP Reason', 'N/A')})")
+            st.write(f"1R / 2R / 3R: {row.get('Target 1R', 'N/A')} / {row.get('Target 2R', 'N/A')} / {row.get('Target 3R', 'N/A')}")
+            st.write(f"Sell: {row.get('Sell Strategy', 'N/A')}")
             st.write(f"Earnings: {row.get('Earnings Date', 'N/A')} ({row.get('Earnings Risk', 'N/A')})")
             st.write(row.get("Why Selected", ""))
             st.caption(row.get("AI Trading Notes", ""))
@@ -3771,7 +4034,7 @@ def render_alerts() -> None:
     picks = select_ai_top_5(results)
     st.write("Today alert candidates:")
     if picks.empty:
-        st.info("No alert candidates meet the stricter A/A+, Explosive Score >= 7, and Risk <= 10% Top 5 rules.")
+        st.info("No clean trade today. Best action: wait.")
     else:
         st.dataframe(
             round_display_values(
@@ -3781,6 +4044,9 @@ def render_alerts() -> None:
                         "Setup Quality Grade",
                         "Explosive Score",
                         "Explosive Label",
+                        "TP Quality Score",
+                        "Ideal TP",
+                        "Ideal TP Reason",
                         "Action Label",
                         "Final Score",
                         "Breakout Alert",
@@ -3814,7 +4080,7 @@ def render_alerts() -> None:
 
     if st.button("Send Today's Top 5 Alert", type="primary"):
         if picks.empty:
-            st.info("No Top 5 alert was sent because no candidates meet the stricter selection rules.")
+            st.info("No clean trade today. Best action: wait.")
             return
         message = "\n\n---\n\n".join(alert_message(row) for _, row in picks.iterrows())
         send_message(message)
@@ -3870,6 +4136,12 @@ def render_swing_scanner(
         min_market_cap_b = st.number_input("Minimum market cap ($B)", min_value=0.0, value=5.0, step=0.5, key=f"{key_prefix}_min_cap")
         min_dollar_volume_m = st.number_input("Minimum avg turnover / dollar volume ($M)", min_value=0.0, value=20.0, step=5.0, key=f"{key_prefix}_min_dv")
         include_small_caps = st.checkbox("Include small caps", value=False, key=f"{key_prefix}_small_caps") if is_hk_mode else False
+        aggressive_mode = st.checkbox(
+            "Aggressive Mode: allow risk above 10%",
+            value=False,
+            key=f"{key_prefix}_aggressive_mode",
+            help="Default keeps Trade = NO when Risk % is above 10. Top 5 still requires Risk % <= 10.",
+        )
 
         st.divider()
         show_all = st.checkbox("Show all", value=False, key=f"{key_prefix}_show_all")
@@ -3895,6 +4167,7 @@ def render_swing_scanner(
                 min_price=min_price,
                 min_market_cap=(0 if include_small_caps else min_market_cap_b * 1_000_000_000),
                 min_dollar_volume=min_dollar_volume_m * 1_000_000,
+                aggressive_mode=aggressive_mode,
             )
             st.session_state[f"{key_prefix}_results"] = results
             st.session_state[f"{key_prefix}_indicator_data"] = indicator_data
@@ -3934,6 +4207,15 @@ def render_swing_scanner(
         "Earnings Date",
         "Days to Earnings",
         "Earnings Setup Score",
+        "Target 1R",
+        "Nearest Resistance",
+        "Ideal TP",
+        "Ideal TP Reason",
+        "Sell Strategy",
+        "Trail Stop Level",
+        "TP Quality Score",
+        "Ideal TP R",
+        "Risk Note",
         "AI Trading Notes",
     }
 
@@ -4016,14 +4298,29 @@ def render_swing_scanner(
     compact_columns = [
         "ticker",
         "close",
-        "Final Score",
         "Setup Quality Grade",
         "Explosive Score",
-        "Explosive Label",
         "Trade",
         "WATCHLIST FLAG",
         "Action Label",
         "Breakout Alert",
+        "Entry Trigger",
+        "Stop Loss",
+        "Risk %",
+        "Target 1R",
+        "Target 2R",
+        "Target 3R",
+        "Nearest Resistance",
+        "Ideal TP",
+        "Ideal TP Reason",
+        "Sell Strategy",
+        "Trail Stop Level",
+        "TP Quality Score",
+        "Why Selected",
+    ]
+    diagnostic_columns = compact_columns + [
+        "Final Score",
+        "Explosive Label",
         "Earnings Date",
         "Earnings Risk",
         "Earnings Setup Score",
@@ -4033,15 +4330,9 @@ def render_swing_scanner(
         "Tightness Score",
         "RR Score",
         "Pivot",
-        "Entry Trigger",
-        "Stop Loss",
-        "Risk %",
-        "Target 2R",
-        "Target 3R",
-        "Why Selected",
+        "Ideal TP R",
+        "Risk Note",
         "AI Trading Notes",
-    ]
-    diagnostic_columns = compact_columns + [
         "market cap",
         "avg dollar volume",
         "RSI",
@@ -4135,13 +4426,17 @@ def render_swing_scanner(
         st.metric("Watchlist", selected_row["WATCHLIST FLAG"], selected_row["Watchlist Reason"])
         st.metric("Final Score", f"{selected_row['Final Score']:.1f}/100")
         st.metric("Entry Trigger", f"${selected_row['Entry Trigger']:.2f}")
-        st.metric("Stop Loss", f"${selected_row['Stop Loss']:.2f}", f"Risk {selected_row['Risk %']:.2f}%")
-        st.metric("Targets", f"2R ${selected_row['Target 2R']:.2f}", f"3R ${selected_row['Target 3R']:.2f}")
+        st.metric("Stop Loss", f"${selected_row['Stop Loss']:.2f}", f"Risk {selected_row['Risk %']:.2f}% - {selected_row['Risk Note']}")
+        st.metric("Ideal TP", f"${selected_row['Ideal TP']:.2f}", selected_row["Ideal TP Reason"])
+        st.metric("TP Quality", f"{selected_row['TP Quality Score']}/10", f"{selected_row['Ideal TP R']:.2f}R available")
+        st.metric("Targets", f"1R ${selected_row['Target 1R']:.2f}", f"2R ${selected_row['Target 2R']:.2f} / 3R ${selected_row['Target 3R']:.2f}")
+        st.metric("Trail Stop", f"${selected_row['Trail Stop Level']:.2f}", selected_row["Sell Strategy"])
         st.write(f"RS Score: {selected_row['RS Score']}/10")
         st.write(f"Sector: {selected_row['Sector Leadership']} vs {selected_row['Sector ETF']}")
         st.write(f"Volume confirmation: {selected_row['Volume Confirmation']}")
         st.write(f"Earnings: {selected_row['Earnings Risk']}")
         st.write(f"RR: {selected_row['RR Ratio']} ({selected_row['RR Score']})")
+        st.write(f"Nearest resistance: ${selected_row['Nearest Resistance']:.2f}")
         st.write(f"Tightness: {selected_row['Tightness Score']}/5, {selected_row['Tightness Label']}")
         st.write(f"VCP: {selected_row['VCP Status']} ({selected_row['Contractions']})")
         st.write(f"Pivot: ${selected_row['Pivot']:.2f}, distance {selected_row['Distance to Pivot %']:.2f}%")
