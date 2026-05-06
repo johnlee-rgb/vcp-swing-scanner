@@ -2115,6 +2115,30 @@ def grey_market_assessment(grey_price, ipo_price):
     return round(premium, 2), label
 
 
+def ipo_trade_plan(entry, strength_label):
+    """Create IPO stop and targets from grey-market strength."""
+    entry_value = parse_price_midpoint(entry)
+    if entry_value is None or entry_value <= 0:
+        return None, None, None, None
+
+    if strength_label == "HOT (SCALP)":
+        sl = entry_value * 0.92
+        tp1 = entry_value * 1.15
+        tp2 = entry_value * 1.30
+        tp3 = entry_value * 1.50
+    elif strength_label == "STRONG":
+        sl = entry_value * 0.93
+        tp1 = entry_value * 1.12
+        tp2 = entry_value * 1.25
+        tp3 = entry_value * 1.40
+    else:
+        sl = entry_value * 0.95
+        tp1 = entry_value * 1.08
+        tp2 = entry_value * 1.15
+        tp3 = entry_value * 1.25
+    return round(sl, 2), round(tp1, 2), round(tp2, 2), round(tp3, 2)
+
+
 def open_decision(open_price, ipo_price, vol_ratio, first_5m_high):
     """Classify IPO open behavior from opening gap and early volume confirmation."""
     open_value = parse_price_midpoint(open_price)
@@ -2289,13 +2313,17 @@ def ipo_first_day_plan(offer_price: float | None, grey_price: float | None, prem
     if entry <= 0:
         return {"entry": "N/A", "stop loss": "N/A", "TP1": "N/A", "TP2": "N/A", "TP3": "N/A", "first day strategy": "Data unavailable"}
 
-    stop_candidates = [entry * 0.93]
-    if offer_price:
-        stop_candidates.append(offer_price * 0.99)
-    stop_loss = min(stop_candidates)
-    tp1 = entry * 1.12
-    tp2 = entry * 1.28
-    tp3 = entry * 1.50
+    if premium_pct is not None and premium_pct >= 20:
+        strength_label = "HOT (SCALP)"
+    elif premium_pct is not None and premium_pct >= 10:
+        strength_label = "STRONG"
+    elif premium_pct is not None and premium_pct > 0:
+        strength_label = "WEAK POSITIVE"
+    elif premium_pct is not None:
+        strength_label = "NEGATIVE RISK"
+    else:
+        _, strength_label = grey_market_assessment(grey_price, offer_price)
+    stop_loss, tp1, tp2, tp3 = ipo_trade_plan(entry, strength_label)
 
     if premium_pct is not None and premium_pct > 20:
         strategy = "Take profit quickly on open spike"
@@ -2308,10 +2336,10 @@ def ipo_first_day_plan(offer_price: float | None, grey_price: float | None, prem
 
     return {
         "entry": round(entry, 2),
-        "stop loss": round(stop_loss, 2),
-        "TP1": round(tp1, 2),
-        "TP2": round(tp2, 2),
-        "TP3": round(tp3, 2),
+        "stop loss": stop_loss,
+        "TP1": tp1,
+        "TP2": tp2,
+        "TP3": tp3,
         "first day strategy": strategy,
     }
 
@@ -2866,11 +2894,12 @@ def render_ipo_manual_calculator() -> None:
 
     entry_price = grey_entry
     breakout_level = expected_open * 1.03
-    stop_loss = min(entry_price * 0.93, listing_reference * 0.99) if listing_reference > 0 else entry_price * 0.93
+    stop_loss, tp1, tp2, tp3 = ipo_trade_plan(entry_price, grey_market_label)
+    stop_loss = stop_loss or 0
+    tp1 = tp1 or 0
+    tp2 = tp2 or 0
+    tp3 = tp3 or 0
     risk_pct = ((entry_price - stop_loss) / entry_price * 100) if entry_price > 0 else 0
-    tp1 = entry_price * 1.15
-    tp2 = entry_price * 1.30
-    tp3 = entry_price * 1.50
     shares = lots * lot_size
     total_capital = max(min_subscription * lots, shares * entry_price)
     max_risk = max(entry_price - stop_loss, 0) * shares
