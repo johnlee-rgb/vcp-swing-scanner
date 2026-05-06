@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 
 PRESET_UNIVERSES = {
@@ -2065,6 +2066,86 @@ NEGATIVE_IPO_KEYWORDS = (
     "low subscription", "poor grey market", "high valuation", "down round", "lawsuit", "cash burn",
 )
 
+IPO_DATA = [
+    {
+        "ticker": "07666.HK",
+        "company": "齊泰科技",
+        "market": "HK",
+        "status": "applying",
+        "offer_price": "10.50",
+        "lot_size": 500,
+        "minimum_subscription_amount": 5302.95,
+        "application_deadline": "2026-05-08",
+        "listing_date": "2026-05-15",
+        "industry": "AI / biotech platform",
+        "sponsor": "N/A",
+        "cornerstone_investors": "N/A",
+        "oversubscription": "N/A",
+        "grey_market_price": "N/A",
+        "grey_market_premium": "N/A",
+        "latest_news": "Manual fallback IPO row. Confirm official prospectus and broker data.",
+        "source": "manual fallback",
+    },
+    {
+        "ticker": "01236.HK",
+        "company": "Ldrobot",
+        "market": "HK",
+        "status": "applying",
+        "offer_price": "24-30",
+        "lot_size": 200,
+        "minimum_subscription_amount": 6060.51,
+        "application_deadline": "2026-05-06",
+        "listing_date": "2026-05-11",
+        "industry": "AI / robotics / advanced hardware",
+        "sponsor": "N/A",
+        "cornerstone_investors": "N/A",
+        "oversubscription": "N/A",
+        "grey_market_price": "N/A",
+        "grey_market_premium": "N/A",
+        "latest_news": "Manual fallback IPO row. Confirm official prospectus and broker data.",
+        "source": "manual fallback",
+    },
+    {
+        "ticker": "USIPO1",
+        "company": "Manual US IPO Watchlist",
+        "market": "US",
+        "status": "manual input",
+        "offer_price": "N/A",
+        "lot_size": "N/A",
+        "minimum_subscription_amount": "N/A",
+        "application_deadline": "N/A",
+        "listing_date": "N/A",
+        "industry": "Manual fallback",
+        "sponsor": "N/A",
+        "cornerstone_investors": "N/A",
+        "oversubscription": "N/A",
+        "grey_market_price": "N/A",
+        "grey_market_premium": "N/A",
+        "latest_news": "Use the manual override table to add a US IPO candidate.",
+        "source": "manual fallback",
+    },
+]
+
+MANUAL_IPO_INPUT_COLUMNS = [
+    "ticker",
+    "company",
+    "market",
+    "status",
+    "offer price",
+    "lot size",
+    "minimum subscription amount",
+    "application deadline",
+    "listing date",
+    "sponsor / underwriter",
+    "industry / theme",
+    "cornerstone investors",
+    "oversubscription",
+    "grey market price",
+    "grey market premium %",
+    "latest news summary",
+    "source",
+]
+
 
 def keyword_sentiment_score(text: str) -> int:
     """Lightweight IPO news sentiment from positive and negative keywords."""
@@ -2344,6 +2425,31 @@ def ipo_first_day_plan(offer_price: float | None, grey_price: float | None, prem
     }
 
 
+def simulated_grey_market_range(score: int, offer_price: float | None) -> Tuple[str, float | None]:
+    """Estimate a grey-market range when no live grey price is available."""
+    if score >= 80:
+        low_pct, high_pct = 10, 30
+    elif score >= 65:
+        low_pct, high_pct = 0, 15
+    elif score >= 50:
+        low_pct, high_pct = -5, 8
+    else:
+        low_pct, high_pct = -15, 5
+
+    if offer_price is None or offer_price <= 0:
+        return f"{low_pct}% to +{high_pct}% (simulation, not live grey market)", None
+
+    low_price = offer_price * (1 + low_pct / 100)
+    high_price = offer_price * (1 + high_pct / 100)
+    mid_price = (low_price + high_price) / 2
+    low_text = f"{low_pct}%" if low_pct < 0 else f"+{low_pct}%"
+    high_text = f"+{high_pct}%"
+    return (
+        f"{low_price:.2f}-{high_price:.2f} ({low_text} to {high_text}; simulation, not live grey market)",
+        round(mid_price, 2),
+    )
+
+
 def live_news_summary(*parts: str) -> Tuple[str, int]:
     """Summarize available source text and score keyword sentiment."""
     text = " ".join(part for part in parts if part and part != "N/A")
@@ -2358,7 +2464,7 @@ def score_live_ipo(record: dict) -> dict:
     offer_price = parse_price_midpoint(record.get("offer price"))
     grey_price = parse_price_midpoint(record.get("grey market price"))
     assessed_premium, grey_label = grey_market_assessment(record.get("grey market price"), record.get("offer price"))
-    premium = record.get("grey market premium %")
+    premium = parse_first_number(record.get("grey market premium %"))
     if premium is None:
         premium = assessed_premium
     premium = round(float(premium), 2) if premium is not None and not pd.isna(premium) else None
@@ -2404,7 +2510,22 @@ def score_live_ipo(record: dict) -> dict:
         + ipo_grey_score(premium)
     )
     score = int(max(0, min(score + sentiment * 3, 100)))
-    plan = ipo_first_day_plan(offer_price, grey_price, premium)
+    simulated_range, simulated_open = simulated_grey_market_range(score, offer_price)
+    expected_open_price = grey_price or parse_price_midpoint(record.get("expected open price")) or simulated_open or offer_price
+    plan_premium = premium
+    if plan_premium is None and expected_open_price and offer_price:
+        plan_premium = (expected_open_price - offer_price) / offer_price * 100
+    plan = ipo_first_day_plan(offer_price, expected_open_price, plan_premium)
+    open_behavior = (
+        open_decision(
+            expected_open_price,
+            offer_price,
+            record.get("opening volume ratio", 0),
+            record.get("first 5m high", "N/A"),
+        )
+        if expected_open_price is not None and offer_price is not None
+        else "Await open data"
+    )
 
     enriched = {
         "ticker": record.get("ticker", "N/A"),
@@ -2417,7 +2538,8 @@ def score_live_ipo(record: dict) -> dict:
         "application deadline": record.get("application deadline", "N/A"),
         "listing date": record.get("listing date", record.get("expected IPO date", "N/A")),
         "sponsor / underwriter": record.get("sponsor / underwriter", "N/A"),
-        "theme": record.get("theme", "N/A"),
+        "theme": record.get("theme", record.get("industry / theme", "N/A")),
+        "industry / theme": record.get("industry / theme", record.get("theme", "N/A")),
         "cornerstone investors": record.get("cornerstone investors", "N/A"),
         "oversubscription": record.get("oversubscription", "N/A"),
         "cornerstone quality": "Strong" if ipo_institutional_score(record.get("cornerstone investors", "")) >= 12 else "Average",
@@ -2425,6 +2547,9 @@ def score_live_ipo(record: dict) -> dict:
         "grey market premium %": "Grey market unavailable" if premium is None else round(premium, 2),
         "grey market label": grey_label,
         "grey market source": record.get("grey market source", "N/A"),
+        "simulated grey market range": "Live grey market available" if premium is not None else simulated_range,
+        "expected open price": format_price(expected_open_price),
+        "source": record.get("source", record.get("grey market source", "N/A")),
         "last updated": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
         "IPO score": score,
         "Win Probability %": win_probability,
@@ -2454,36 +2579,10 @@ def unavailable_ipo_row(market: str, reason: str) -> dict:
 
 def manual_fallback_ipo_rows(market: str, reason: str) -> pd.DataFrame:
     """Return editable-looking fallback rows with all common IPO fields."""
-    templates = [
-        ("Manual IPO 1", "applying / upcoming"),
-        ("Manual IPO 2", "grey market / upcoming"),
-        ("Manual IPO 3", "watchlist"),
-    ]
-    rows = []
-    for index, (company, status) in enumerate(templates, start=1):
-        rows.append(
-            score_live_ipo(
-                {
-                    "ticker": f"MANUAL{index}",
-                    "company": company,
-                    "market": market,
-                    "status": f"{status} - live data unavailable",
-                    "offer price": "N/A",
-                    "lot size": "N/A",
-                    "minimum subscription amount": "N/A",
-                    "application deadline": "N/A",
-                    "listing date": "N/A",
-                    "sponsor / underwriter": "N/A",
-                    "cornerstone investors": "N/A",
-                    "oversubscription": "N/A",
-                    "theme": "Manual fallback",
-                    "latest news summary": reason,
-                    "grey market price": "N/A",
-                    "grey market source": "Grey market unavailable",
-                }
-            )
-        )
-    return pd.DataFrame(rows)
+    fallback = fallback_ipo_dataframe(market)
+    if not fallback.empty:
+        fallback["latest news summary"] = fallback["latest news summary"].replace("N/A", reason)
+    return fallback
 
 
 def source_debug(name: str, ok: bool, count: int = 0, error: str = "") -> dict:
@@ -2538,6 +2637,98 @@ def value_by_keywords(row: pd.Series, keywords: Tuple[str, ...], default: str = 
         if any(keyword in column_text for keyword in keywords) and cleaned != "N/A":
             return cleaned
     return default
+
+
+def standardize_ipo_record(record: dict) -> dict:
+    """Map official, RSS, scraped, and manual IPO fields into one schema."""
+    aliases = {
+        "offer price": ("offer price", "offer_price", "price range", "price_range", "ipo price", "listing price"),
+        "lot size": ("lot size", "lot_size", "board lot"),
+        "minimum subscription amount": ("minimum subscription amount", "minimum_subscription_amount", "entry fee"),
+        "application deadline": ("application deadline", "application_deadline", "closing date", "deadline"),
+        "listing date": ("listing date", "listing_date", "expected IPO date", "expected_ipo_date", "priced date"),
+        "sponsor / underwriter": ("sponsor / underwriter", "sponsor", "underwriter", "underwriters", "bookrunner"),
+        "industry / theme": ("industry / theme", "industry", "theme", "sector", "business"),
+        "cornerstone investors": ("cornerstone investors", "cornerstone_investors", "cornerstone"),
+        "grey market price": ("grey market price", "grey_market_price", "grey price", "gray market price"),
+        "grey market premium %": ("grey market premium %", "grey_market_premium", "grey market premium"),
+        "latest news summary": ("latest news summary", "latest news", "latest_news", "news", "headline"),
+    }
+
+    def pick(*keys: str, default: str = "N/A") -> str:
+        for key in keys:
+            value = record.get(key)
+            cleaned = clean_ipo_text(value)
+            if cleaned != "N/A":
+                return cleaned
+        return default
+
+    standardized = {
+        "ticker": pick("ticker", "symbol"),
+        "company": pick("company", "company name", "name"),
+        "market": pick("market", "exchange", default="HK"),
+        "status": pick("status", default="upcoming"),
+        "oversubscription": pick("oversubscription", "over-sub", "subscription"),
+        "source": pick("source", default="N/A"),
+        "last updated": pick("last updated", "last_updated", default=pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")),
+    }
+    for target, keys in aliases.items():
+        standardized[target] = pick(*keys)
+    standardized["theme"] = standardized["industry / theme"]
+    standardized["latest news headline"] = standardized["latest news summary"]
+    standardized["grey market source"] = (
+        standardized["source"] if standardized["grey market price"] != "N/A" else "Grey market unavailable"
+    )
+    if standardized["company"] == "N/A" and standardized["ticker"] != "N/A":
+        standardized["company"] = standardized["ticker"]
+    if standardized["ticker"] == "N/A" and standardized["company"] == "N/A":
+        standardized["company"] = "Manual IPO candidate"
+    return standardized
+
+
+def normalize_ipo_data(records: List[dict] | pd.DataFrame, fallback_market: str = "HK") -> pd.DataFrame:
+    """Normalize and score IPO records from any source without crashing on missing fields."""
+    if isinstance(records, pd.DataFrame):
+        raw_records = records.fillna("N/A").to_dict("records")
+    else:
+        raw_records = records or []
+
+    scored = []
+    for raw in raw_records:
+        try:
+            standardized = standardize_ipo_record(raw)
+            if standardized["market"] == "N/A":
+                standardized["market"] = fallback_market
+            scored.append(score_live_ipo(standardized))
+        except Exception:
+            continue
+    return pd.DataFrame(scored)
+
+
+def fallback_ipo_dataframe(market: str | None = None) -> pd.DataFrame:
+    """Return built-in manual IPO rows, filtered by market when requested."""
+    rows = IPO_DATA if market is None else [row for row in IPO_DATA if row.get("market") == market]
+    if not rows:
+        rows = [row for row in IPO_DATA if row.get("source") == "manual fallback"]
+    return normalize_ipo_data(rows, fallback_market=market or "HK")
+
+
+def merge_ipo_sources(*frames: pd.DataFrame) -> pd.DataFrame:
+    """Merge IPO sources, dedupe by market/ticker/company, and keep useful rows."""
+    usable = [frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not usable:
+        return pd.DataFrame()
+    merged = pd.concat(usable, ignore_index=True)
+    merged = merged.replace("", "N/A").fillna("N/A")
+    merged["_dedupe_key"] = (
+        merged.get("market", "N/A").astype(str)
+        + "|"
+        + merged.get("ticker", "N/A").astype(str)
+        + "|"
+        + merged.get("company", "N/A").astype(str)
+    )
+    merged = merged.drop_duplicates("_dedupe_key", keep="first").drop(columns=["_dedupe_key"])
+    return merged
 
 
 def looks_like_hk_ipo_table(table: pd.DataFrame) -> bool:
@@ -2658,28 +2849,167 @@ def normalize_hk_ipo_table(table: pd.DataFrame, source_name: str, source_url: st
                     "latest news summary": f"{source_name}: {joined[:180]}",
                     "grey market price": grey,
                     "grey market source": "Grey market unavailable" if grey == "N/A" else source_name,
+                    "source": source_name,
                 }
             )
         )
     return records
 
 
+def fetch_html_ipo_tables(source_name: str, url: str, market: str, headers: dict) -> Tuple[pd.DataFrame, dict]:
+    """Fetch an IPO-like HTML page and normalize any usable tables."""
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()
+    records: List[dict] = []
+    for table in safe_read_html_tables(response.text):
+        if market == "HK":
+            records.extend(normalize_hk_ipo_table(table, source_name, url))
+        else:
+            table = table.fillna("N/A")
+            if isinstance(table.columns, pd.MultiIndex):
+                table.columns = [" ".join(str(part) for part in column if str(part) != "nan") for column in table.columns]
+            text = " ".join(str(value).lower() for value in table.head(8).to_numpy().flatten())
+            cols = " ".join(str(column).lower() for column in table.columns)
+            if not any(word in f"{cols} {text}" for word in ("ipo", "company", "exchange", "price", "listing", "underwriter")):
+                continue
+            for _, row in table.head(30).iterrows():
+                joined = " | ".join(clean_ipo_text(value) for value in row.tolist())
+                if re.search(r"\bno\s+(filed|amended|priced|ipo|deals?)\s+(deals?\s+)?found\b", joined, flags=re.IGNORECASE):
+                    continue
+                company = value_by_keywords(row, ("company", "name"), "N/A")
+                ticker_match = re.search(r"\(([A-Z.]{1,8})\)", joined)
+                ticker = ticker_match.group(1) if ticker_match else value_by_keywords(row, ("ticker", "symbol"), "N/A")
+                if company == "N/A" and ticker == "N/A":
+                    continue
+                records.append(
+                    standardize_ipo_record(
+                        {
+                            "ticker": ticker,
+                            "company": company,
+                            "market": market,
+                            "status": "upcoming",
+                            "offer price": value_by_keywords(row, ("price", "range"), "N/A"),
+                            "listing date": value_by_keywords(row, ("listing", "date", "ipo"), "N/A"),
+                            "sponsor / underwriter": value_by_keywords(row, ("underwriter", "sponsor"), "N/A"),
+                            "industry / theme": value_by_keywords(row, ("sector", "industry", "exchange"), "N/A"),
+                            "latest news summary": f"{source_name}: {joined[:180]}",
+                            "source": source_name,
+                        }
+                    )
+                )
+    normalized = normalize_ipo_data(records, fallback_market=market)
+    return normalized, source_debug(source_name, not normalized.empty, len(normalized), "" if not normalized.empty else "No usable IPO rows found")
+
+
 @st.cache_data(ttl=60 * 30, show_spinner=False)
-def fetch_us_live_ipos() -> pd.DataFrame:
-    """Best-effort US IPO calendar fetch from Nasdaq public calendar endpoint."""
+def fetch_ipo_news_rss(market: str = "HK") -> Tuple[pd.DataFrame, dict]:
+    """Fetch lightweight IPO discovery rows from RSS/news feeds."""
+    try:
+        import feedparser
+
+        feeds = [
+            ("Yahoo Finance IPO RSS", "https://finance.yahoo.com/rss/ipo"),
+            ("Yahoo Finance News RSS", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=IPO&region=US&lang=en-US"),
+        ]
+        records = []
+        market_terms = ("hong kong", "hk", "h-share", "hkex") if market == "HK" else ("nasdaq", "nyse", "us ipo", "ipo")
+        for source_name, url in feeds:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:12]:
+                title = clean_ipo_text(entry.get("title", "N/A"))
+                summary = clean_ipo_text(entry.get("summary", title))
+                combined = f"{title} {summary}".lower()
+                if not re.search(r"\bipo\b|initial public offering", combined):
+                    continue
+                if market == "HK" and not any(term in combined for term in market_terms):
+                    continue
+                records.append(
+                    {
+                        "ticker": "N/A",
+                        "company": title[:80],
+                        "market": market,
+                        "status": "news watch",
+                        "industry / theme": title,
+                        "latest news summary": summary[:240],
+                        "source": source_name,
+                    }
+                )
+        normalized = normalize_ipo_data(records, fallback_market=market)
+        return normalized, source_debug("Yahoo Finance / RSS news search", not normalized.empty, len(normalized), "" if not normalized.empty else "No IPO RSS entries")
+    except Exception as exc:
+        return pd.DataFrame(), source_debug("Yahoo Finance / RSS news search", False, 0, str(exc))
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def fetch_hk_ipo_live() -> Tuple[pd.DataFrame, dict]:
+    """Hybrid HK IPO discovery using official pages, IPO centers, RSS, and built-in fallback data."""
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36"}
+    last_updated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    sources = [
+        ("HKEX New Listing Information", "https://www.hkex.com.hk/Listing/IPO/New-Listing-Information/Main-Board?sc_lang=en"),
+        ("HKEX AP / PHIP / Application Proof", "https://www.hkexnews.hk/app/appindex.html"),
+        ("HKEX Newly Listed Securities", "https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities?sc_lang=en"),
+        ("AAStocks IPO Center", "https://www.aastocks.com/en/stocks/market/ipo/upcomingipo/company-summary"),
+        ("ETNet IPO Center", "https://www.etnet.com.hk/www/eng/stocks/ipo/ipo.php"),
+    ]
+    frames: List[pd.DataFrame] = []
+    failed: List[dict] = []
+    health: List[dict] = []
+
+    for source_name, url in sources:
+        try:
+            frame, status = fetch_html_ipo_tables(source_name, url, "HK", headers)
+            health.append(status)
+            if frame.empty:
+                failed.append(status)
+            else:
+                frames.append(frame)
+        except Exception as exc:
+            status = source_debug(source_name, False, 0, str(exc))
+            health.append(status)
+            failed.append(status)
+
+    rss_frame, rss_status = fetch_ipo_news_rss("HK")
+    health.append(rss_status)
+    if rss_frame.empty:
+        failed.append(rss_status)
+    else:
+        frames.append(rss_frame)
+
+    merged = merge_ipo_sources(*frames)
+    source_used = "Hybrid HK live/RSS sources"
+    if merged.empty:
+        merged = fallback_ipo_dataframe("HK")
+        source_used = "manual fallback"
+        health.append(source_debug("IPO_DATA manual fallback", True, len(merged), "Automatic HK sources returned no usable rows"))
+
+    debug = {
+        "source_used": source_used,
+        "last_updated": last_updated,
+        "count": len(merged),
+        "failed_sources": failed,
+        "source_health": health,
+    }
+    return merged, debug
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def fetch_us_ipo_live() -> Tuple[pd.DataFrame, dict]:
+    """Hybrid US IPO discovery using Nasdaq, NYSE/MarketWatch pages, RSS, and fallback rows."""
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://www.nasdaq.com",
         "Referer": "https://www.nasdaq.com/market-activity/ipos",
     }
-    date_key = pd.Timestamp.today().strftime("%Y-%m")
+    last_updated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    frames: List[pd.DataFrame] = []
+    failed: List[dict] = []
+    health: List[dict] = []
+
     try:
-        response = requests.get(
-            f"https://api.nasdaq.com/api/ipo/calendar?date={date_key}",
-            headers=headers,
-            timeout=8,
-        )
+        date_key = pd.Timestamp.today().strftime("%Y-%m")
+        response = requests.get(f"https://api.nasdaq.com/api/ipo/calendar?date={date_key}", headers=headers, timeout=8)
         response.raise_for_status()
         payload = response.json()
         rows = payload.get("data", {}).get("priced", {}).get("rows", [])
@@ -2688,105 +3018,82 @@ def fetch_us_live_ipos() -> pd.DataFrame:
         for row in rows:
             company = row.get("companyName") or row.get("name") or "N/A"
             ticker = row.get("proposedTickerSymbol") or row.get("symbol") or "N/A"
-            price_range = row.get("proposedSharePrice") or row.get("price") or "N/A"
             records.append(
-                score_live_ipo(
-                    {
-                        "ticker": ticker,
-                        "company": company,
-                        "market": "US",
-                        "status": "upcoming",
-                        "offer price": price_range,
-                        "listing date": row.get("expectedPriceDate") or row.get("pricedDate") or "N/A",
-                        "application deadline": "N/A",
-                        "shares offered": row.get("sharesOffered", "N/A"),
-                        "sponsor / underwriter": row.get("underwriters", "N/A"),
-                        "theme": row.get("sector") or row.get("industry") or "N/A",
-                        "latest news summary": f"{company} IPO calendar entry from Nasdaq.",
-                    }
-                )
-            )
-        return pd.DataFrame(records) if records else pd.DataFrame([unavailable_ipo_row("US", "Data unavailable")])
-    except Exception as exc:
-        return pd.DataFrame([unavailable_ipo_row("US", f"Data unavailable: {exc}")])
-
-
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def fetch_hk_live_ipos() -> Tuple[pd.DataFrame, dict]:
-    """Best-effort HK IPO scrape with ordered fallbacks and visible debug metadata."""
-    sources = [
-        ("HKEX new listings", "https://www.hkexnews.hk/app/appindex.html"),
-        ("AAStocks IPO Center", "https://www.aastocks.com/en/stocks/market/ipo/upcomingipo/company-summary"),
-        ("ETNet IPO Center", "https://www.etnet.com.hk/www/eng/stocks/ipo/ipo.php"),
-        ("Investing.com IPO Calendar", "https://www.investing.com/ipo-calendar/"),
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36"}
-    failed: List[dict] = []
-    last_updated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for source_name, url in sources:
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            tables = safe_read_html_tables(response.text)
-            records: List[dict] = []
-            for table in tables:
-                records.extend(normalize_hk_ipo_table(table, source_name, url))
-            deduped = list({(record["ticker"], record["company"]): record for record in records}.values())
-            if deduped:
-                debug = {
-                    "source_used": source_name,
-                    "last_updated": last_updated,
-                    "count": len(deduped),
-                    "failed_sources": failed,
+                {
+                    "ticker": ticker,
+                    "company": company,
+                    "market": "US",
+                    "status": "upcoming",
+                    "offer price": row.get("proposedSharePrice") or row.get("price") or "N/A",
+                    "listing date": row.get("expectedPriceDate") or row.get("pricedDate") or "N/A",
+                    "shares offered": row.get("sharesOffered", "N/A"),
+                    "sponsor / underwriter": row.get("underwriters", "N/A"),
+                    "industry / theme": row.get("sector") or row.get("industry") or "N/A",
+                    "latest news summary": f"{company} IPO calendar entry from Nasdaq.",
+                    "source": "Nasdaq IPO Calendar",
                 }
-                return pd.DataFrame(deduped), debug
-            failed.append(source_debug(source_name, False, 0, "No usable IPO rows found"))
-        except Exception as exc:
-            failed.append(source_debug(source_name, False, 0, str(exc)))
-
-    try:
-        import feedparser
-
-        feed = feedparser.parse("https://finance.yahoo.com/rss/ipo")
-        records = []
-        for entry in feed.entries[:10]:
-            title = entry.get("title", "N/A")
-            records.append(
-                score_live_ipo(
-                    {
-                        "ticker": "N/A",
-                        "company": title[:80],
-                        "market": "HK",
-                        "status": "news watch",
-                        "offer price": "N/A",
-                        "theme": title,
-                        "latest news summary": title,
-                        "grey market price": "N/A",
-                        "grey market source": "Grey market unavailable",
-                    }
-                )
             )
-        if records:
-            debug = {
-                "source_used": "Yahoo Finance / RSS news search",
-                "last_updated": last_updated,
-                "count": len(records),
-                "failed_sources": failed,
-            }
-            return pd.DataFrame(records), debug
-        failed.append(source_debug("Yahoo Finance / RSS news search", False, 0, "No feed entries"))
+        frame = normalize_ipo_data(records, fallback_market="US")
+        status = source_debug("Nasdaq IPO Calendar", not frame.empty, len(frame), "" if not frame.empty else "No Nasdaq IPO rows found")
+        health.append(status)
+        if frame.empty:
+            failed.append(status)
+        else:
+            frames.append(frame)
     except Exception as exc:
-        failed.append(source_debug("Yahoo Finance / RSS news search", False, 0, str(exc)))
+        status = source_debug("Nasdaq IPO Calendar", False, 0, str(exc))
+        health.append(status)
+        failed.append(status)
 
-    reason = "All live sources failed; using manual fallback table."
+    for source_name, url in [
+        ("NYSE IPO Center", "https://www.nyse.com/ipo-center/filings"),
+        ("MarketWatch IPO Calendar", "https://www.marketwatch.com/tools/ipo-calendar"),
+    ]:
+        try:
+            frame, status = fetch_html_ipo_tables(source_name, url, "US", headers)
+            health.append(status)
+            if frame.empty:
+                failed.append(status)
+            else:
+                frames.append(frame)
+        except Exception as exc:
+            status = source_debug(source_name, False, 0, str(exc))
+            health.append(status)
+            failed.append(status)
+
+    rss_frame, rss_status = fetch_ipo_news_rss("US")
+    health.append(rss_status)
+    if rss_frame.empty:
+        failed.append(rss_status)
+    else:
+        frames.append(rss_frame)
+
+    merged = merge_ipo_sources(*frames)
+    source_used = "Hybrid US live/RSS sources"
+    if merged.empty:
+        merged = fallback_ipo_dataframe("US")
+        source_used = "manual fallback"
+        health.append(source_debug("IPO_DATA manual fallback", True, len(merged), "Automatic US sources returned no usable rows"))
+
     debug = {
-        "source_used": "Manual fallback table",
+        "source_used": source_used,
         "last_updated": last_updated,
-        "count": 3,
+        "count": len(merged),
         "failed_sources": failed,
+        "source_health": health,
     }
-    return manual_fallback_ipo_rows("HK", reason), debug
+    return merged, debug
+
+
+def fetch_hk_live_ipos() -> Tuple[pd.DataFrame, dict]:
+    """Backward-compatible wrapper for the upgraded HK IPO fetcher."""
+    return fetch_hk_ipo_live()
+
+
+def fetch_us_live_ipos() -> pd.DataFrame:
+    """Backward-compatible wrapper for older callers expecting only a DataFrame."""
+    frame, _debug = fetch_us_ipo_live()
+    return frame
 
 
 def render_status_card(title: str, value: str, tone: str, detail: str = "") -> None:
@@ -3004,7 +3311,7 @@ LIVE_IPO_COLUMNS = [
     "application deadline",
     "listing date",
     "sponsor / underwriter",
-    "theme",
+    "industry / theme",
     "cornerstone investors",
     "oversubscription",
     "cornerstone quality",
@@ -3012,17 +3319,21 @@ LIVE_IPO_COLUMNS = [
     "grey market premium %",
     "grey market label",
     "grey market source",
+    "simulated grey market range",
     "IPO score",
     "Win Probability %",
     "action",
+    "expected open price",
     "open decision",
     "entry",
     "stop loss",
     "TP1",
     "TP2",
+    "TP3",
     "first day strategy",
     "latest news headline",
     "latest news summary",
+    "source",
     "last updated",
 ]
 
@@ -3039,30 +3350,38 @@ def live_ipo_summary_cards(data: pd.DataFrame, market: str) -> None:
     grey_winner = source.loc[grey_numeric.idxmax()] if grey_numeric.notna().any() else None
     high_risk = source.sort_values("IPO score", ascending=True).iloc[0]
 
-    cards = st.columns(5)
+    cards = st.columns(6)
     with cards[0]:
         render_status_card("Best IPO to apply", best["ticker"], "green" if best["IPO score"] >= 80 else "yellow", best["action"])
     with cards[1]:
         render_status_card(f"Hottest {market} IPO", best["company"][:24], "green", f"Score {best['IPO score']}")
     with cards[2]:
-        if market == "HK" and grey_winner is not None:
+        if grey_winner is not None:
             render_status_card("Grey market winner", grey_winner["ticker"], "green", f"{grey_winner['grey market premium %']}%")
         else:
             render_status_card("Grey market winner", "N/A", "yellow", "Grey market unavailable")
     with cards[3]:
         render_status_card("High risk IPO", high_risk["ticker"], "red", high_risk["action"])
     with cards[4]:
-        render_status_card("Live source", "Best effort", "yellow", "Confirm with broker/prospectus")
+        us_rows = source[source["market"] == "US"] if "market" in source else pd.DataFrame()
+        hottest_us = us_rows.sort_values("IPO score", ascending=False).iloc[0] if not us_rows.empty else None
+        render_status_card("Hottest US IPO", hottest_us["ticker"] if hottest_us is not None else "N/A", "yellow", hottest_us["action"] if hottest_us is not None else "Use US IPO tab")
+    with cards[5]:
+        render_status_card("Data source status", "Hybrid", "yellow", "Live + RSS + manual fallback")
 
 
 def render_ipo_debug(debug: dict | None) -> None:
     """Show visible live IPO source diagnostics."""
     if not debug:
         return
-    with st.expander("Live IPO source debug", expanded=True):
+    with st.expander("Data Source Health", expanded=True):
         st.write(f"Source used: {debug.get('source_used', 'N/A')}")
         st.write(f"Last updated: {debug.get('last_updated', 'N/A')}")
         st.write(f"Number of IPOs found: {debug.get('count', 0)}")
+        health = debug.get("source_health", [])
+        if health:
+            st.write("Source status:")
+            st.dataframe(pd.DataFrame(health), width="stretch", hide_index=True)
         failed = debug.get("failed_sources", [])
         if failed:
             st.write("Failed sources:")
@@ -3075,10 +3394,32 @@ def render_live_ipo_table(market: str, data: pd.DataFrame, debug: dict | None = 
     """Render filters, grey-market override, and the live IPO table."""
     st.subheader(f"{market} IPO Live Watchlist")
     if data.empty:
-        st.warning("Data unavailable")
-        return
+        st.warning("Live data unavailable. Showing manual fallback IPO_DATA rows.")
+        data = fallback_ipo_dataframe(market)
 
     render_ipo_debug(debug)
+
+    with st.expander("Editable manual IPO override", expanded=False):
+        st.caption("Add or edit upcoming IPOs here. Rows with a ticker or company are merged into the live table and scored automatically.")
+        blank_row = {column: "N/A" for column in MANUAL_IPO_INPUT_COLUMNS}
+        blank_row["market"] = market
+        blank_row["source"] = "manual override"
+        manual_seed = pd.DataFrame([blank_row])
+        edited_manual = st.data_editor(
+            manual_seed,
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key=f"{market}_manual_ipo_editor",
+        )
+        manual_candidates = edited_manual[
+            (edited_manual["ticker"].astype(str).str.strip().str.upper() != "N/A")
+            | (edited_manual["company"].astype(str).str.strip().str.upper() != "N/A")
+        ]
+        if not manual_candidates.empty:
+            manual_frame = normalize_ipo_data(manual_candidates, fallback_market=market)
+            data = merge_ipo_sources(manual_frame, data)
+
     live_ipo_summary_cards(data, market)
 
     filter_cols = st.columns(5)
@@ -3117,7 +3458,8 @@ def render_live_ipo_table(market: str, data: pd.DataFrame, debug: dict | None = 
     if display.empty:
         st.info("No IPOs match the current filters.")
     else:
-        st.dataframe(display.reindex(columns=LIVE_IPO_COLUMNS, fill_value="N/A"), width="stretch", hide_index=True)
+        table_display = display.reindex(columns=LIVE_IPO_COLUMNS, fill_value="N/A").astype(str)
+        st.dataframe(table_display, width="stretch", hide_index=True)
 
     st.caption(
         "IPO data, grey market price, news and sentiment may be delayed or inaccurate. "
@@ -3131,12 +3473,12 @@ def render_ipo_scanner() -> None:
     hk_tab, us_tab, manual_tab = st.tabs(["HK IPO Live", "US IPO Live", "IPO Manual Calculator"])
 
     with hk_tab:
-        hk_data, hk_debug = fetch_hk_live_ipos()
+        hk_data, hk_debug = fetch_hk_ipo_live()
         render_live_ipo_table("HK", hk_data, hk_debug)
 
     with us_tab:
-        us_data = fetch_us_live_ipos()
-        render_live_ipo_table("US", us_data)
+        us_data, us_debug = fetch_us_ipo_live()
+        render_live_ipo_table("US", us_data, us_debug)
 
     with manual_tab:
         render_ipo_manual_calculator()
