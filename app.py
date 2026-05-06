@@ -861,6 +861,70 @@ def download_market_caps(tickers: Tuple[str, ...]) -> Dict[str, float | None]:
     return caps
 
 
+def classify_sector_group(ticker: str, sector: str, industry: str) -> str:
+    """Map yfinance sector/industry into a compact scanner filter group."""
+    text = f"{sector} {industry} {ticker}".lower()
+    crypto_symbols = {"COIN", "HOOD", "MSTR", "MARA", "RIOT", "CLSK", "IREN", "HUT", "BTBT", "WULF", "CIFR", "CORZ"}
+    if ticker.upper() in crypto_symbols or any(term in text for term in ("crypto", "bitcoin", "blockchain", "digital assets")):
+        return "Crypto / Digital Assets"
+    if any(term in text for term in ("semiconductor", "semiconductors", "chip", "integrated circuits")):
+        return "Semiconductors"
+    if any(term in text for term in ("technology", "software", "internet", "information technology", "communication equipment")):
+        return "Technology"
+    if any(term in text for term in ("energy", "oil", "gas", "uranium", "coal")):
+        return "Energy"
+    if any(term in text for term in ("utilities", "utility", "electric", "power")):
+        return "Utilities"
+    if any(term in text for term in ("healthcare", "health care", "biotech", "biotechnology", "pharmaceutical", "medical")):
+        return "Healthcare"
+    if any(term in text for term in ("financial", "bank", "capital markets", "insurance", "credit")):
+        return "Financials"
+    if any(term in text for term in ("industrial", "aerospace", "defense", "construction", "machinery", "infrastructure")):
+        return "Industrials"
+    if any(term in text for term in ("consumer", "retail", "restaurant", "apparel", "auto", "entertainment")):
+        return "Consumer"
+    if any(term in text for term in ("real estate", "reit")):
+        return "Real Estate"
+    if any(term in text for term in ("materials", "chemical", "metals", "mining", "steel", "gold")):
+        return "Materials"
+    return "Other"
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def fetch_sector_industry_one(ticker: str) -> dict:
+    """Fetch one ticker's sector/industry metadata and cache it for seven days."""
+    sector = "N/A"
+    industry = "N/A"
+    try:
+        info = yf.Ticker(ticker).info or {}
+        sector = info.get("sector") or "N/A"
+        industry = info.get("industry") or "N/A"
+    except Exception:
+        pass
+
+    if sector == "N/A" and industry == "N/A":
+        display = "N/A"
+    elif sector == "N/A":
+        display = industry
+    elif industry == "N/A":
+        display = sector
+    else:
+        display = f"{sector} / {industry}"
+
+    return {
+        "sector": sector,
+        "industry": industry,
+        "sector_industry": display,
+        "sector_group": classify_sector_group(ticker, sector, industry),
+    }
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def download_sector_industry(tickers: Tuple[str, ...]) -> Dict[str, dict]:
+    """Fetch sector/industry metadata from yfinance and cache it for seven days."""
+    return {ticker: fetch_sector_industry_one(ticker) for ticker in tickers}
+
+
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def download_next_earnings_dates(tickers: Tuple[str, ...]) -> Dict[str, str | None]:
     """Fetch the next known earnings date and tolerate missing calendar data."""
@@ -1636,6 +1700,8 @@ def classify_vcp_label(
     """Provide a clear human-readable VCP/pattern label while preserving raw VCP Status."""
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
         return "RESISTANCE BREAKOUT WATCH"
+    if action == "MOMENTUM BREAKOUT":
+        return "Momentum Breakout Candidate"
     if action == "EXTENDED" or current_setup_status == "EXTENDED":
         return "EXTENDED"
     if action == "FAILED" or current_setup_status == "FAILED BREAKOUT":
@@ -1665,6 +1731,10 @@ def build_decision_reason(
     """Explain the decision in one direct sentence."""
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
         return "WATCH: resistance blocks 1R; needs clean breakout above resistance before swing entry"
+    if vcp_label == "Momentum Breakout Candidate":
+        status = "YES" if trade == "YES" else "WATCH"
+        volume_text = "volume confirmed" if trade == "YES" else "needs volume confirmation"
+        return f"{status}: momentum breakout candidate, RS {rs_score:g}, explosive score strong, {volume_text}"
     if trade == "YES":
         risk_text = "risk <= 8%" if pd.notna(risk_pct) and risk_pct <= 8 else "borderline risk"
         return f"YES: {setup_grade} setup, {vcp_label.lower()}, RS {rs_score:g}, {risk_text}, TP {ideal_r:g}R"
@@ -1690,6 +1760,10 @@ def clean_why_selected(
     """Avoid contradictory selected/rejected wording when Trade is NO."""
     selected_text = why_selected.lower().startswith("selected because")
     if trade == "YES" or not selected_text:
+        return why_selected
+    if "Momentum breakout candidate" in why_selected:
+        return why_selected
+    if why_selected == "Momentum breakout candidate despite not being pure VCP":
         return why_selected
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
         return "Watchlist only: needs clean breakout above resistance before swing entry"
@@ -1902,6 +1976,31 @@ def detect_breakout_alert(data: pd.DataFrame, pivot: PivotInfo, volume_confirmat
     return "NO BREAKOUT"
 
 
+def is_momentum_breakout_candidate(
+    final_score: float,
+    rs_score: float,
+    explosive_score: int,
+    breakout_alert: str,
+    latest: pd.Series,
+    volume_dry_up: bool,
+    volume_confirmation: str,
+    risk_pct: float,
+) -> bool:
+    """Allow exceptional high-momentum breakouts even when they are not pure VCPs."""
+    price_above_key_mas = latest["Close"] > latest["MA10"] and latest["Close"] > latest["MA20"] and latest["Close"] > latest["MA50"]
+    volume_ok = volume_dry_up or volume_confirmation == "YES"
+    return bool(
+        final_score >= 90
+        and rs_score >= 8
+        and explosive_score >= 8
+        and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
+        and price_above_key_mas
+        and volume_ok
+        and pd.notna(risk_pct)
+        and risk_pct <= 10
+    )
+
+
 def calculate_earnings_setup(
     data: pd.DataFrame,
     trend_score: int,
@@ -1979,6 +2078,8 @@ def ai_trade_label(row: pd.Series) -> str:
         return "EARNINGS RISK"
     if row.get("Action Label") == "EXTENDED":
         return "TOO EXTENDED"
+    if row.get("Entry Type") == "MOMENTUM BREAKOUT":
+        return "MOMENTUM BREAKOUT"
     if row.get("Trade") == "YES":
         return "BEST BUY SETUP"
     if row.get("Action Label") == "PULLBACK ENTRY":
@@ -2210,6 +2311,7 @@ def build_scan_row(
     data: pd.DataFrame,
     market_cap: float | None,
     earnings_info: dict,
+    sector_info: dict,
     quote_info: dict,
     sync_info: dict,
     scan_timestamps: dict,
@@ -2275,6 +2377,20 @@ def build_scan_row(
         volume_contraction=vcp.volume_contraction,
         aggressive_mode=aggressive_mode,
     )
+    momentum_breakout_candidate = is_momentum_breakout_candidate(
+        final_score=final_score,
+        rs_score=rs_score,
+        explosive_score=explosive_score,
+        breakout_alert=breakout_alert,
+        latest=latest,
+        volume_dry_up=vcp.volume_contraction,
+        volume_confirmation=volume_confirmation,
+        risk_pct=risk_pct,
+    )
+    if momentum_breakout_candidate:
+        action = "MOMENTUM BREAKOUT"
+        trade = "YES" if volume_confirmation == "YES" else "WATCH"
+        trade_reason = "Momentum breakout with volume confirmation" if volume_confirmation == "YES" else "Momentum breakout needs volume confirmation"
     quality_grade, why_selected = setup_quality_grade(
         action=action,
         trade=trade,
@@ -2289,20 +2405,23 @@ def build_scan_row(
         tightness_score=tightness_score,
         volume_confirmation=volume_confirmation,
     )
+    if momentum_breakout_candidate:
+        quality_grade = "A+" if volume_confirmation == "YES" else "A"
+        why_selected = "Momentum breakout candidate despite not being pure VCP"
     if quality_grade == "Reject" and trade == "YES":
         trade = "NO"
         trade_reason = why_selected
-    if vcp.status == "NOT VCP" and rs_score < 5 and explosive_score < 6:
+    if (not momentum_breakout_candidate) and vcp.status == "NOT VCP" and rs_score < 5 and explosive_score < 6:
         trade = "NO"
         quality_grade = "Reject"
         trade_reason = "Low momentum + not VCP"
         why_selected = "Low momentum + not VCP"
-    if tightness_score < 3 and not vcp.volume_contraction:
+    if (not momentum_breakout_candidate) and tightness_score < 3 and not vcp.volume_contraction:
         trade = "NO"
         quality_grade = "Reject"
         trade_reason = "No compression = no breakout energy"
         why_selected = "No compression = no breakout energy"
-    if quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
+    if (not momentum_breakout_candidate) and quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
     nearest_resistance = detect_nearest_resistance(data, entry)
@@ -2354,11 +2473,11 @@ def build_scan_row(
         trail_stop = rb_stop
         ideal_r = round((ideal_tp - rb_entry) / max(rb_entry - rb_stop, 0.01), 2)
         tp_quality_score = max(tp_quality_score, 6)
-    if trade == "YES" and ideal_r < 1.8:
+    if trade == "YES" and (not momentum_breakout_candidate) and ideal_r < 1.8:
         trade = "NO"
         trade_reason = "Reward too limited before resistance"
         why_selected = "rejected because reward is too limited before resistance"
-    if trade == "YES" and tp_quality_score < 5:
+    if trade == "YES" and (not momentum_breakout_candidate) and tp_quality_score < 5:
         trade = "NO"
         trade_reason = "TP quality too low"
         why_selected = "rejected because upside before resistance is too limited"
@@ -2388,7 +2507,17 @@ def build_scan_row(
         watchlist_flag = "YES"
         watchlist_reason = "Needs clean breakout above resistance before swing entry"
         sell_strategy = "WATCH / SCALP ONLY"
+    if momentum_breakout_candidate and trade == "WATCH":
+        watchlist_flag = "YES"
+        watchlist_reason = "Momentum breakout candidate needs volume confirmation"
+        sell_strategy = "WAIT FOR ENTRY"
+    elif momentum_breakout_candidate and trade == "YES":
+        watchlist_flag = "NO"
+        watchlist_reason = "Already Trade YES"
+        sell_strategy = "HOLD TO 3R IF VOLUME HOLDS" if explosive_score >= 9 else "PARTIAL AT 2R, TRAIL REST"
     vcp_label = classify_vcp_label(vcp.status, action, current_setup_status, resistance_breakout_mode)
+    if momentum_breakout_candidate:
+        vcp_label = "Momentum Breakout Candidate"
     why_selected = clean_why_selected(
         why_selected=why_selected,
         trade=trade,
@@ -2410,6 +2539,18 @@ def build_scan_row(
         resistance_breakout_mode=resistance_breakout_mode,
         ideal_tp_reason=ideal_tp_reason,
     )
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        entry_type = "RESISTANCE BREAKOUT WATCH"
+    elif action == "MOMENTUM BREAKOUT":
+        entry_type = "MOMENTUM BREAKOUT"
+    elif action == "READY" and vcp.status in {"VALID VCP", "EARLY VCP"}:
+        entry_type = "VCP BREAKOUT"
+    elif action == "PULLBACK ENTRY":
+        entry_type = "PULLBACK ENTRY"
+    elif action == "EXTENDED":
+        entry_type = "EXTENDED DO NOT CHASE"
+    else:
+        entry_type = "NO TRADE"
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
     latest_candle = pd.Timestamp(data.index[-1])
     data_stale, stale_warning = is_data_stale(latest_candle)
@@ -2444,6 +2585,10 @@ def build_scan_row(
 
     row = {
         "ticker": ticker,
+        "Sector / Industry": sector_info.get("sector_industry", "N/A"),
+        "Sector Group": sector_info.get("sector_group", "Other"),
+        "Sector Raw": sector_info.get("sector", "N/A"),
+        "Industry Raw": sector_info.get("industry", "N/A"),
         "close": round(float(latest["Close"]), 2),
         "Current Price": round(float(quote_price), 2) if pd.notna(quote_price) else round(float(latest["Close"]), 2),
         "% Change": round(float(quote_info.get("percent_change", np.nan)), 2) if pd.notna(quote_info.get("percent_change", np.nan)) else "N/A",
@@ -2500,6 +2645,7 @@ def build_scan_row(
         "Post-Earnings Label": post_earnings_label,
         "Trade": trade,
         "Trade Reason": trade_reason,
+        "Entry Type": entry_type,
         "Decision Reason": decision_reason,
         "Why Selected": why_selected,
         "WATCHLIST FLAG": watchlist_flag,
@@ -2595,6 +2741,9 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "RR Ratio",
         "Final Score",
         "RS Score",
+        "Avg RS Score",
+        "Avg Explosive Score",
+        "Avg Final Score",
         "Sector Spread %",
         "MA10 Distance %",
         "MA20 Distance %",
@@ -2616,6 +2765,7 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
     summary["Reason"] = summary[reason_column]
     columns = [
         "ticker",
+        "Sector / Industry",
         "VCP Status",
         "VCP Label",
         "Setup Quality Grade",
@@ -2646,6 +2796,62 @@ def show_focus_group(title: str, frame: pd.DataFrame, reason_column: str) -> Non
         st.caption("No current matches.")
     else:
         st.dataframe(focus, width="stretch", hide_index=True, height=220)
+
+
+def escape_pdf_text(value: str) -> str:
+    """Escape text for a tiny built-in PDF export."""
+    return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def dataframe_to_simple_pdf(frame: pd.DataFrame, title: str) -> bytes:
+    """Create a basic text PDF without adding heavyweight dependencies."""
+    export = frame.fillna("N/A").astype(str)
+    lines = [title, ""]
+    lines.append(" | ".join(export.columns))
+    lines.append("-" * 120)
+    for _, row in export.iterrows():
+        lines.append(" | ".join(str(row[column])[:40] for column in export.columns))
+
+    pages = [lines[index : index + 42] for index in range(0, len(lines), 42)] or [[title]]
+    objects: List[str] = []
+    page_refs: List[int] = []
+    font_obj_num = 3
+
+    for page_lines in pages:
+        content_lines = ["BT", "/F1 7 Tf", "36 792 Td", "9 TL"]
+        for line in page_lines:
+            content_lines.append(f"({escape_pdf_text(line)}) Tj")
+            content_lines.append("T*")
+        content_lines.append("ET")
+        content = "\n".join(content_lines)
+        content_obj_num = len(objects) + 4
+        page_obj_num = len(objects) + 5
+        objects.append(f"{content_obj_num} 0 obj\n<< /Length {len(content.encode('latin-1', errors='ignore'))} >>\nstream\n{content}\nendstream\nendobj\n")
+        objects.append(
+            f"{page_obj_num} 0 obj\n"
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] "
+            f"/Contents {content_obj_num} 0 R /Resources << /Font << /F1 {font_obj_num} 0 R >> >> >>\n"
+            "endobj\n"
+        )
+        page_refs.append(page_obj_num)
+
+    base_objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        f"2 0 obj\n<< /Type /Pages /Kids [{' '.join(f'{ref} 0 R' for ref in page_refs)}] /Count {len(page_refs)} >>\nendobj\n",
+        "3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>\nendobj\n",
+    ]
+    all_objects = base_objects + objects
+    pdf = "%PDF-1.4\n"
+    offsets = [0]
+    for obj in all_objects:
+        offsets.append(len(pdf.encode("latin-1", errors="ignore")))
+        pdf += obj
+    xref_pos = len(pdf.encode("latin-1", errors="ignore"))
+    pdf += f"xref\n0 {len(all_objects) + 1}\n0000000000 65535 f \n"
+    for offset in offsets[1:]:
+        pdf += f"{offset:010d} 00000 n \n"
+    pdf += f"trailer\n<< /Size {len(all_objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF"
+    return pdf.encode("latin-1", errors="ignore")
 
 
 def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
@@ -2723,7 +2929,9 @@ def alert_message(row: pd.Series) -> str:
     """Build the requested alert message format."""
     return (
         f"Ticker: {row.get('ticker', 'N/A')}\n"
+        f"Sector / Industry: {row.get('Sector / Industry', 'N/A')}\n"
         f"Action: {row.get('Action Label', 'N/A')}\n"
+        f"Entry Type: {row.get('Entry Type', 'N/A')}\n"
         f"VCP Status: {row.get('VCP Status', 'N/A')}\n"
         f"Decision Reason: {row.get('Decision Reason', 'N/A')}\n"
         f"Final Score: {row.get('Final Score', 'N/A')}\n"
@@ -2955,12 +3163,14 @@ def scan_universe(
 
         try:
             sector_etf = SECTOR_ETF_BY_TICKER.get(ticker, SECTOR_ETFS_BY_MODE.get(mode, ["SPY"])[0])
+            sector_info = fetch_sector_industry_one(ticker)
             rows.append(
                 build_scan_row(
                     ticker=ticker,
                     data=data,
                     market_cap=market_cap,
                     earnings_info=earnings_data.get(ticker, {}),
+                    sector_info=sector_info,
                     quote_info=quote_data.get(ticker, {}),
                     sync_info=quote_applied,
                     scan_timestamps=scan_timestamps,
@@ -4449,8 +4659,11 @@ def render_top_5_trades() -> None:
             tone = "red" if label in {"TOO EXTENDED", "EARNINGS RISK"} else "green" if label == "BEST BUY SETUP" else "yellow"
             render_status_card(row["ticker"], label, tone, f"Final {row['Final Score']} | {row['Action Label']}")
             st.write(f"Company: {row.get('Company Name', 'N/A')}")
-            st.write(f"Theme: {row.get('Sector ETF', 'N/A')}")
+            st.write(f"Sector / Industry: {row.get('Sector / Industry', 'N/A')}")
+            st.write(f"Sector Group: {row.get('Sector Group', 'N/A')}")
+            st.write(f"Theme ETF: {row.get('Sector ETF', 'N/A')}")
             st.write(f"Quality: {row.get('Setup Quality Grade', 'N/A')}")
+            st.write(f"Entry Type: {row.get('Entry Type', 'N/A')}")
             st.write(f"VCP: {row.get('VCP Status', 'N/A')} | {row.get('Contractions', 'N/A')}")
             st.write(f"RS/Trend/Tech: {row.get('RS Score', 'N/A')} / {row.get('Trend Score', 'N/A')} / {row.get('Technical Score', 'N/A')}")
             st.write(f"Explosive: {row.get('Explosive Score', 'N/A')}/10 - {row.get('Explosive Label', 'N/A')}")
@@ -4495,6 +4708,7 @@ def render_alerts() -> None:
                 picks[
                     [
                         "ticker",
+                        "Sector / Industry",
                         "VCP Status",
                         "Contractions",
                         "Volume Dry-Up",
@@ -4503,6 +4717,7 @@ def render_alerts() -> None:
                         "Trend Score",
                         "Technical Score",
                         "Tightness Score",
+                        "Entry Type",
                         "Setup Quality Grade",
                         "Explosive Score",
                         "Explosive Label",
@@ -4558,6 +4773,128 @@ def render_settings() -> None:
     st.write("The app skips failed tickers and missing yfinance earnings data instead of crashing.")
 
 
+def manage_active_position(
+    entry_price: float,
+    current_price: float,
+    stop_loss: float,
+    position_size: float,
+    ma10: float | None,
+    prior_day_low: float | None,
+) -> dict:
+    """Calculate active-position status and a rule-based management action."""
+    risk_per_share = entry_price - stop_loss
+    gain_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else np.nan
+    current_r = (current_price - entry_price) / risk_per_share if risk_per_share > 0 else np.nan
+    position_pl = (current_price - entry_price) * position_size
+    ma10_value = ma10 if ma10 is not None and pd.notna(ma10) else np.nan
+    prior_low_value = prior_day_low if prior_day_low is not None and pd.notna(prior_day_low) else np.nan
+    extended_from_ma10 = (
+        (current_price / ma10_value - 1) * 100
+        if pd.notna(ma10_value) and ma10_value > 0
+        else np.nan
+    )
+
+    suggested_action = "HOLD"
+    action_reason = "Position has not reached 1R yet; keep original risk plan."
+    suggested_stop = stop_loss
+    partial_note = "No partial sale suggested yet."
+
+    if pd.notna(ma10_value) and current_price < ma10_value:
+        suggested_action = "EXIT"
+        action_reason = "Breakout failed below MA10; exit remaining position."
+        suggested_stop = current_price
+        partial_note = "Exit remaining shares."
+    elif pd.notna(extended_from_ma10) and extended_from_ma10 > 15:
+        suggested_action = "MOVE STOP"
+        suggested_stop = prior_low_value if pd.notna(prior_low_value) else max(stop_loss, ma10_value)
+        action_reason = "Price is more than 15% above MA10; tighten stop to prior day low."
+        partial_note = "Consider locking gains if position is outsized."
+    elif pd.notna(current_r) and current_r >= 2:
+        suggested_action = "TAKE PARTIAL"
+        suggested_stop = max(stop_loss, ma10_value if pd.notna(ma10_value) else entry_price, entry_price)
+        action_reason = "Position is above 2R; take partial and trail the rest."
+        partial_note = "Take partial profits and trail remaining shares with MA10."
+    elif pd.notna(current_r) and current_r >= 1.5:
+        suggested_action = "TAKE PARTIAL"
+        suggested_stop = max(stop_loss, ma10_value if pd.notna(ma10_value) else entry_price, entry_price)
+        action_reason = "Position is above 1.5R; take 30-50% partial or trail by MA10."
+        partial_note = "Take 30-50% partial, or trail all by MA10 if momentum is strong."
+    elif pd.notna(current_r) and current_r >= 1:
+        suggested_action = "MOVE STOP"
+        suggested_stop = max(stop_loss, entry_price, ma10_value if pd.notna(ma10_value) else entry_price)
+        action_reason = "Position reached 1R; move stop to breakeven or MA10."
+        partial_note = "No partial required, but remove downside risk."
+
+    return {
+        "gain_pct": round(gain_pct, 2) if pd.notna(gain_pct) else np.nan,
+        "current_r": round(current_r, 2) if pd.notna(current_r) else np.nan,
+        "position_pl": round(position_pl, 2),
+        "suggested_action": suggested_action,
+        "action_reason": action_reason,
+        "suggested_stop": round(float(suggested_stop), 2) if pd.notna(suggested_stop) else np.nan,
+        "partial_note": partial_note,
+        "extended_from_ma10": round(extended_from_ma10, 2) if pd.notna(extended_from_ma10) else np.nan,
+    }
+
+
+def render_position_management(selected_ticker: str, selected_row: pd.Series, selected_data: pd.DataFrame | None, key_prefix: str) -> None:
+    """Render the active-position management calculator for the selected ticker."""
+    latest = selected_data.iloc[-1] if selected_data is not None and not selected_data.empty else None
+    prior = selected_data.iloc[-2] if selected_data is not None and len(selected_data) >= 2 else latest
+    default_current = pd.to_numeric(selected_row.get("Current Price", selected_row.get("close", np.nan)), errors="coerce")
+    if pd.isna(default_current):
+        default_current = pd.to_numeric(selected_row.get("close", 0), errors="coerce")
+
+    with st.expander("Position Management Mode", expanded=False):
+        st.caption("For active positions only. Enter your actual fill, current price, stop, and share size.")
+        input_cols = st.columns(4)
+        entry_price = input_cols[0].number_input(
+            "Entry price",
+            min_value=0.0,
+            value=float(selected_row.get("Entry Trigger", 0.0)),
+            step=0.01,
+            key=f"{key_prefix}_{selected_ticker}_pm_entry",
+        )
+        current_price = input_cols[1].number_input(
+            "Current price",
+            min_value=0.0,
+            value=float(default_current) if pd.notna(default_current) else 0.0,
+            step=0.01,
+            key=f"{key_prefix}_{selected_ticker}_pm_current",
+        )
+        stop_loss = input_cols[2].number_input(
+            "Stop loss",
+            min_value=0.0,
+            value=float(selected_row.get("Stop Loss", 0.0)),
+            step=0.01,
+            key=f"{key_prefix}_{selected_ticker}_pm_stop",
+        )
+        position_size = input_cols[3].number_input(
+            "Position size",
+            min_value=0.0,
+            value=100.0,
+            step=1.0,
+            key=f"{key_prefix}_{selected_ticker}_pm_size",
+        )
+
+        ma10 = float(latest["MA10"]) if latest is not None and pd.notna(latest.get("MA10", np.nan)) else np.nan
+        prior_day_low = float(prior["Low"]) if prior is not None and pd.notna(prior.get("Low", np.nan)) else np.nan
+        management = manage_active_position(entry_price, current_price, stop_loss, position_size, ma10, prior_day_low)
+
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Current gain %", f"{management['gain_pct']:.2f}%" if pd.notna(management["gain_pct"]) else "N/A")
+        metric_cols[1].metric("Current R", f"{management['current_r']:.2f}R" if pd.notna(management["current_r"]) else "Invalid risk")
+        metric_cols[2].metric("Suggested action", management["suggested_action"])
+        metric_cols[3].metric("Suggested stop", f"${management['suggested_stop']:.2f}" if pd.notna(management["suggested_stop"]) else "N/A")
+        metric_cols[4].metric("Open P/L", f"${management['position_pl']:,.2f}")
+
+        st.write(management["action_reason"])
+        st.write(management["partial_note"])
+        ma10_text = f"MA10: ${ma10:.2f}" if pd.notna(ma10) else "MA10: N/A"
+        prior_low_text = f"Prior day low: ${prior_day_low:.2f}" if pd.notna(prior_day_low) else "Prior day low: N/A"
+        st.caption(f"{ma10_text} | {prior_low_text}")
+
+
 def render_swing_scanner(
     title: str = "Swing Scanner",
     mode_options: List[str] | None = None,
@@ -4607,6 +4944,25 @@ def render_swing_scanner(
         st.divider()
         show_all = st.checkbox("Show all", value=False, key=f"{key_prefix}_show_all")
         show_full_diagnostics = st.checkbox("Show full diagnostics", value=False, key=f"{key_prefix}_diagnostics")
+        sector_filter = st.selectbox(
+            "Sector group",
+            [
+                "All",
+                "Technology",
+                "Semiconductors",
+                "Energy",
+                "Utilities",
+                "Healthcare",
+                "Financials",
+                "Industrials",
+                "Consumer",
+                "Real Estate",
+                "Materials",
+                "Crypto / Digital Assets",
+                "Other",
+            ],
+            key=f"{key_prefix}_sector_filter",
+        )
         only_ready_pullback = st.checkbox("Show only READY / PULLBACK", value=False, key=f"{key_prefix}_ready")
         only_trade_watchlist = st.checkbox("Show only Trade + Watchlist", value=False, key=f"{key_prefix}_trade_watch")
         hide_extended = st.checkbox("Hide EXTENDED", value=False, key=f"{key_prefix}_hide_extended")
@@ -4663,6 +5019,9 @@ def render_swing_scanner(
     required_result_columns = {
         "Trade",
         "Trade Reason",
+        "Entry Type",
+        "Sector / Industry",
+        "Sector Group",
         "RR Ratio",
         "RR Score",
         "Tightness Score",
@@ -4769,6 +5128,42 @@ def render_swing_scanner(
     if sync_error_count:
         st.error(f"Chart sync error: {sync_error_count} ticker(s) have quote/chart mismatch above 2%.")
 
+    qualified = results[
+        (results["Setup Quality Grade"].isin(["A+", "A", "B"]))
+        & (results["Action Label"] != "FAILED")
+        & (results["Setup Quality Grade"] != "Reject")
+    ].copy()
+    if not qualified.empty:
+        sector_summary = (
+            qualified.groupby("Sector Group", dropna=False)
+            .agg(
+                qualified_setups=("ticker", "count"),
+                avg_rs_score=("RS Score", "mean"),
+                avg_explosive_score=("Explosive Score", "mean"),
+                avg_final_score=("Final Score", "mean"),
+            )
+            .reset_index()
+            .sort_values(["avg_rs_score", "avg_explosive_score", "qualified_setups"], ascending=[False, False, False])
+        )
+        strongest_sector = sector_summary.iloc[0]["Sector Group"]
+        st.subheader("Sector Strength Summary")
+        st.caption(f"Strongest sector today: {strongest_sector}")
+        st.dataframe(
+            round_display_values(
+                sector_summary.rename(
+                    columns={
+                        "Sector Group": "Sector",
+                        "qualified_setups": "Qualified Setups",
+                        "avg_rs_score": "Avg RS Score",
+                        "avg_explosive_score": "Avg Explosive Score",
+                        "avg_final_score": "Avg Final Score",
+                    }
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
     with st.expander("Market and filter details", expanded=True):
         st.write("Market:", " | ".join(summary.get("market_details", [])) or "No market data yet.")
         st.write("Sector:", summary.get("sector_details", "No sector data yet."))
@@ -4792,8 +5187,10 @@ def render_swing_scanner(
             & (visible["Technical Score"] >= 4)
             & (visible["Action Label"] != "FAILED")
         ]
+    if sector_filter != "All":
+        visible = visible[visible["Sector Group"] == sector_filter]
     if only_ready_pullback:
-        visible = visible[visible["Action Label"].isin(["READY", "PULLBACK ENTRY"])]
+        visible = visible[visible["Action Label"].isin(["READY", "PULLBACK ENTRY", "MOMENTUM BREAKOUT"])]
     if only_trade_watchlist:
         visible = visible[(visible["Trade"] == "YES") | (visible["WATCHLIST FLAG"] == "YES")]
     if hide_extended:
@@ -4827,6 +5224,7 @@ def render_swing_scanner(
 
     compact_columns = [
         "ticker",
+        "Sector / Industry",
         "close",
         "VCP Status",
         "VCP Label",
@@ -4841,6 +5239,7 @@ def render_swing_scanner(
         "Setup Quality Grade",
         "Trade",
         "WATCHLIST FLAG",
+        "Entry Type",
         "Action Label",
         "Breakout Alert",
         "Decision Reason",
@@ -4867,6 +5266,9 @@ def render_swing_scanner(
     ]
     diagnostic_columns = compact_columns + [
         "% Change",
+        "Sector Group",
+        "Sector Raw",
+        "Industry Raw",
         "Premarket Price",
         "Afterhours Price",
         "Today's Volume",
@@ -4934,10 +5336,17 @@ def render_swing_scanner(
         ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
         ascending=[True, False, False, False, True, False],
     )
+    momentum_focus = focus_source[
+        focus_source["Entry Type"] == "MOMENTUM BREAKOUT"
+    ].sort_values(
+        ["trade sort", "Explosive Score", "RS Score", "Final Score", "Risk %"],
+        ascending=[True, False, False, False, True],
+    )
     watchlist_focus = focus_source[
         (focus_source["WATCHLIST FLAG"] == "YES")
         & (focus_source["Trade"] != "YES")
         & (focus_source["Resistance Breakout Mode"] != "RESISTANCE BREAKOUT WATCH")
+        & (focus_source["Entry Type"] != "MOMENTUM BREAKOUT")
     ].sort_values(
         ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
         ascending=[True, False, False, False, True, False],
@@ -4957,14 +5366,16 @@ def render_swing_scanner(
     )
 
     st.subheader("Daily Focus Summary")
-    focus_cols = st.columns(4)
+    focus_cols = st.columns(5)
     with focus_cols[0]:
         show_focus_group("Top Trade Now", trade_focus, "Decision Reason")
     with focus_cols[1]:
-        show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
+        show_focus_group("Top Momentum Breakouts", momentum_focus, "Decision Reason")
     with focus_cols[2]:
-        show_focus_group("Top Breakout Above Resistance", resistance_focus, "Decision Reason")
+        show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
     with focus_cols[3]:
+        show_focus_group("Top Breakout Above Resistance", resistance_focus, "Decision Reason")
+    with focus_cols[4]:
         show_focus_group("Rejected / Avoid", rejected_focus, "Decision Reason")
 
     st.subheader("Best Setups")
@@ -4983,6 +5394,13 @@ def render_swing_scanner(
             data=export_frame.to_csv(index=False).encode("utf-8"),
             file_name=f"{key_prefix}_vcp_scan.csv",
             mime="text/csv",
+            width="stretch",
+        )
+        st.download_button(
+            "Export scanner table PDF",
+            data=dataframe_to_simple_pdf(export_frame, f"{title} Export"),
+            file_name=f"{key_prefix}_vcp_scan.pdf",
+            mime="application/pdf",
             width="stretch",
         )
 
@@ -5018,6 +5436,7 @@ def render_swing_scanner(
         st.subheader("Trade Plan")
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
+        st.metric("Entry Type", selected_row["Entry Type"])
         st.metric("Decision", selected_row["VCP Label"], selected_row["Decision Reason"])
         st.metric("Setup Quality", selected_row["Setup Quality Grade"], selected_row["Why Selected"])
         st.metric("Explosive Score", f"{selected_row['Explosive Score']}/10", selected_row["Explosive Label"])
@@ -5029,6 +5448,7 @@ def render_swing_scanner(
         st.metric("TP Quality", f"{selected_row['TP Quality Score']}/10", f"{selected_row['Ideal TP R']:.2f}R available")
         st.metric("Targets", f"1R ${selected_row['Target 1R']:.2f}", f"2R ${selected_row['Target 2R']:.2f} / 3R ${selected_row['Target 3R']:.2f}")
         st.metric("Trail Stop", f"${selected_row['Trail Stop Level']:.2f}", selected_row["Sell Strategy"])
+        st.write(f"Sector / Industry: {selected_row['Sector / Industry']}")
         st.write(f"RS Score: {selected_row['RS Score']}/10")
         st.write(f"Sector: {selected_row['Sector Leadership']} vs {selected_row['Sector ETF']}")
         st.write(f"Volume confirmation: {selected_row['Volume Confirmation']}")
@@ -5047,6 +5467,8 @@ def render_swing_scanner(
         st.write(f"Pivot: ${selected_row['Pivot']:.2f}, distance {selected_row['Distance to Pivot %']:.2f}%")
         st.write(f"MA distance: MA10 {selected_row['MA10 Distance %']:.2f}%, MA20 {selected_row['MA20 Distance %']:.2f}%")
         st.write(selected_row["Notes"])
+
+    render_position_management(selected_ticker, selected_row, selected_data, key_prefix)
 
     st.caption(
         "For education and trade planning only. Not financial advice. Data may be delayed or inaccurate. "
