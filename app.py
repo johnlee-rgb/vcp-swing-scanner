@@ -1282,6 +1282,61 @@ def calculate_tightness(data: pd.DataFrame, vcp: VcpInfo) -> Tuple[int, str]:
     return score, label
 
 
+def calculate_explosive_score(data: pd.DataFrame, pivot: PivotInfo, higher_low_structure: bool) -> Tuple[int, str]:
+    """Score near-term breakout potential from compression, pivot pressure, and RS trend."""
+    latest = data.iloc[-1]
+    score = 0
+
+    if len(data) >= 20:
+        latest_5_vol = data["Volume"].tail(5).mean()
+        previous_5_vol = data["Volume"].iloc[-10:-5].mean()
+        latest_10_vol = data["Volume"].tail(10).mean()
+        previous_10_vol = data["Volume"].iloc[-20:-10].mean()
+        if latest_5_vol < previous_5_vol * 0.9 and latest_10_vol < previous_10_vol:
+            score += 2
+        elif latest_5_vol < previous_5_vol or latest_10_vol < previous_10_vol * 1.03:
+            score += 1
+
+    if len(data) >= 10:
+        close_band_pct = (data["Close"].tail(5).max() - data["Close"].tail(5).min()) / latest["Close"] * 100
+        range_contracting = has_tight_range(data)
+        if close_band_pct <= 3 and range_contracting:
+            score += 2
+        elif close_band_pct <= 5 or range_contracting:
+            score += 1
+
+    if higher_low_structure:
+        recent_low = data["Low"].tail(10).min()
+        prior_low = data["Low"].iloc[-25:-10].min() if len(data) >= 25 else np.nan
+        if pd.notna(prior_low) and recent_low >= prior_low * 1.03:
+            score += 2
+        else:
+            score += 1
+
+    distance = pivot.distance_pct
+    if pd.notna(distance):
+        if pivot.label == "Breakout in progress" or 0 <= distance <= 5:
+            score += 2
+        elif -3 <= distance < 0 or 5 < distance <= 10:
+            score += 1
+
+    rs_slope = latest.get("RSSlope30", np.nan)
+    if pd.notna(rs_slope):
+        if rs_slope >= 5:
+            score += 2
+        elif rs_slope >= -1:
+            score += 1
+
+    score = int(min(max(score, 0), 10))
+    if score >= 8:
+        label = "HIGH EXPLOSION POTENTIAL"
+    elif score >= 6:
+        label = "READY BUT NEED VOLUME"
+    else:
+        label = "LOW MOMENTUM"
+    return score, label
+
+
 def calculate_rs_score(data: pd.DataFrame, spy_data: pd.DataFrame | None, qqq_data: pd.DataFrame | None) -> float:
     """Score relative strength against SPY and QQQ over 1M, 3M, and 6M."""
     score = 0.0
@@ -1465,7 +1520,7 @@ def build_ai_trading_notes(row: dict) -> str:
     """Create compact rule-based notes for table, cards, and alerts."""
     return (
         f"{row['ticker']} {row['Action Label']} | {row.get('Setup Quality Grade', 'N/A')} | {row['VCP Status']} | "
-        f"Final {row['Final Score']}/100 | {row['Breakout Alert']} | "
+        f"Final {row['Final Score']}/100 | Explosive {row.get('Explosive Score', 'N/A')}/10 | {row['Breakout Alert']} | "
         f"Risk {row['Risk %']}% | Earnings {row['Earnings Risk']}"
     )
 
@@ -1711,6 +1766,7 @@ def build_scan_row(
     holding_ma20 = bool(latest["Close"] >= latest["MA20"] and latest["Low"] >= latest["MA20"] * 0.98)
     ma10_rising = is_rising(data["MA10"])
     higher_low_structure = has_higher_low_structure(data)
+    explosive_score, explosive_label = calculate_explosive_score(data, pivot, higher_low_structure)
     final_score = calculate_final_score(
         trend_score=trend_score,
         technical_score=technical_score,
@@ -1757,6 +1813,16 @@ def build_scan_row(
     if quality_grade == "Reject" and trade == "YES":
         trade = "NO"
         trade_reason = why_selected
+    if vcp.status == "NOT VCP" and rs_score < 5 and explosive_score < 6:
+        trade = "NO"
+        quality_grade = "Reject"
+        trade_reason = "Low momentum + not VCP"
+        why_selected = "Low momentum + not VCP"
+    if tightness_score < 3 and not vcp.volume_contraction:
+        trade = "NO"
+        quality_grade = "Reject"
+        trade_reason = "No compression = no breakout energy"
+        why_selected = "No compression = no breakout energy"
     if quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
@@ -1818,6 +1884,8 @@ def build_scan_row(
         "Action Label": action,
         "Tightness Score": tightness_score,
         "Tightness Label": tightness_label,
+        "Explosive Score": explosive_score,
+        "Explosive Label": explosive_label,
         "Setup Quality Grade": quality_grade,
         "RR Ratio": rr_ratio if rr_ratio is not None else "Invalid",
         "RR Score": rr_score,
@@ -1942,6 +2010,10 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["Why Selected"] = "Run a fresh scan for upgraded setup-quality explanations"
     if "volume contraction" not in ranked:
         ranked["volume contraction"] = "No"
+    if "Explosive Score" not in ranked:
+        ranked["Explosive Score"] = 0
+    if "Explosive Label" not in ranked:
+        ranked["Explosive Label"] = "LOW MOMENTUM"
     setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     breakout_priority = {
         "CONFIRMED BREAKOUT": 0,
@@ -1958,15 +2030,13 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         & sector_mask
         & (ranked["Risk %"] <= 10)
         & (ranked["volume contraction"] == "Yes")
-        & (ranked["Setup Quality Grade"].isin(["A+", "A", "B"]))
+        & (ranked["Setup Quality Grade"].isin(["A+", "A"]))
+        & (ranked["Explosive Score"] >= 7)
         & (ranked["Earnings Risk"] != "HIGH RISK")
     )
-    if candidate_mask.any():
-        ranked = ranked[candidate_mask].copy()
-    else:
-        ranked = ranked[ranked["Setup Quality Grade"].isin(["A+", "A", "B"])].copy()
-        if ranked.empty:
-            ranked = results.copy()
+    ranked = ranked[candidate_mask].copy()
+    if ranked.empty:
+        return ranked
     ranked["trade sort"] = np.where(ranked["Trade"] == "YES", 0, 1)
     ranked["watchlist sort"] = np.where(ranked["WATCHLIST FLAG"] == "YES", 0, 1)
     ranked["quality sort"] = ranked["Setup Quality Grade"].map(setup_priority).fillna(9)
@@ -1974,8 +2044,19 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
     ranked["breakout sort"] = ranked["Breakout Alert"].map(breakout_priority).fillna(9)
     ranked["earnings sort"] = np.where(ranked["Earnings Risk"] == "HIGH RISK", 1, 0)
     ranked = ranked.sort_values(
-        ["quality sort", "trade sort", "vcp sort", "breakout sort", "RS Score", "Tightness Score", "Risk %", "Final Score", "earnings sort"],
-        ascending=[True, True, True, True, False, False, True, False, True],
+        [
+            "quality sort",
+            "trade sort",
+            "vcp sort",
+            "breakout sort",
+            "Explosive Score",
+            "RS Score",
+            "Tightness Score",
+            "Risk %",
+            "Final Score",
+            "earnings sort",
+        ],
+        ascending=[True, True, True, True, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -3644,6 +3725,9 @@ def render_top_5_trades() -> None:
         return
 
     picks = select_ai_top_5(results)
+    if picks.empty:
+        st.info("No Top 5 candidates meet the stricter A/A+, Explosive Score >= 7, and Risk <= 10% rules yet.")
+        return
     cols = st.columns(5)
     for index, (_, row) in enumerate(picks.iterrows()):
         with cols[index % 5]:
@@ -3653,6 +3737,7 @@ def render_top_5_trades() -> None:
             st.write(f"Company: {row.get('Company Name', 'N/A')}")
             st.write(f"Theme: {row.get('Sector ETF', 'N/A')}")
             st.write(f"Quality: {row.get('Setup Quality Grade', 'N/A')}")
+            st.write(f"Explosive: {row.get('Explosive Score', 'N/A')}/10 - {row.get('Explosive Label', 'N/A')}")
             st.write(f"Close: {row.get('close', 'N/A')}")
             st.write(f"VCP: {row.get('VCP Status', 'N/A')}")
             st.write(f"Pivot: {row.get('Pivot', 'N/A')}")
@@ -3685,7 +3770,30 @@ def render_alerts() -> None:
 
     picks = select_ai_top_5(results)
     st.write("Today alert candidates:")
-    st.dataframe(round_display_values(picks[["ticker", "Setup Quality Grade", "Action Label", "Final Score", "Breakout Alert", "Earnings Date", "Earnings Risk", "Why Selected", "AI Trading Notes"]]), width="stretch", hide_index=True)
+    if picks.empty:
+        st.info("No alert candidates meet the stricter A/A+, Explosive Score >= 7, and Risk <= 10% Top 5 rules.")
+    else:
+        st.dataframe(
+            round_display_values(
+                picks[
+                    [
+                        "ticker",
+                        "Setup Quality Grade",
+                        "Explosive Score",
+                        "Explosive Label",
+                        "Action Label",
+                        "Final Score",
+                        "Breakout Alert",
+                        "Earnings Date",
+                        "Earnings Risk",
+                        "Why Selected",
+                        "AI Trading Notes",
+                    ]
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
 
     def send_message(message: str) -> None:
         sent_any = False
@@ -3705,6 +3813,9 @@ def render_alerts() -> None:
         send_message("TEST ALERT\n\n" + alert_message(sample))
 
     if st.button("Send Today's Top 5 Alert", type="primary"):
+        if picks.empty:
+            st.info("No Top 5 alert was sent because no candidates meet the stricter selection rules.")
+            return
         message = "\n\n---\n\n".join(alert_message(row) for _, row in picks.iterrows())
         send_message(message)
 
@@ -3813,6 +3924,8 @@ def render_swing_scanner(
         "Volume Confirmation",
         "Earnings Risk",
         "Final Score",
+        "Explosive Score",
+        "Explosive Label",
         "Setup Quality Grade",
         "Why Selected",
         "WATCHLIST FLAG",
@@ -3896,8 +4009,8 @@ def render_swing_scanner(
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
     visible["vcp sort"] = np.where(visible["VCP Status"].isin(["VALID VCP", "EARLY VCP"]), 0, 1)
     visible = visible.sort_values(
-        ["quality sort", "trade sort", "vcp sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-        ascending=[True, True, True, False, False, True, False],
+        ["quality sort", "trade sort", "vcp sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+        ascending=[True, True, True, False, False, False, True, False],
     )
 
     compact_columns = [
@@ -3905,6 +4018,8 @@ def render_swing_scanner(
         "close",
         "Final Score",
         "Setup Quality Grade",
+        "Explosive Score",
+        "Explosive Label",
         "Trade",
         "WATCHLIST FLAG",
         "Action Label",
@@ -3960,14 +4075,14 @@ def render_swing_scanner(
     focus_source["quality sort"] = focus_source["Setup Quality Grade"].map(quality_priority).fillna(9)
 
     trade_focus = focus_source[focus_source["Trade"] == "YES"].sort_values(
-        ["quality sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-        ascending=[True, False, False, True, False],
+        ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+        ascending=[True, False, False, False, True, False],
     )
     watchlist_focus = focus_source[
         (focus_source["WATCHLIST FLAG"] == "YES") & (focus_source["Trade"] != "YES")
     ].sort_values(
-        ["quality sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-        ascending=[True, False, False, True, False],
+        ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+        ascending=[True, False, False, False, True, False],
     )
     pullback_focus = focus_source[focus_source["Action Label"] == "PULLBACK ENTRY"].copy()
     if not pullback_focus.empty:
@@ -3977,8 +4092,8 @@ def render_swing_scanner(
         ]
         pullback_focus.loc[pullback_focus["Trade"] == "YES", "Pullback Reason"] = pullback_focus["Trade Reason"]
         pullback_focus = pullback_focus.sort_values(
-            ["quality sort", "trade sort", "watchlist sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-            ascending=[True, True, True, False, False, True, False],
+            ["quality sort", "trade sort", "watchlist sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+            ascending=[True, True, True, False, False, False, True, False],
         )
 
     st.subheader("Daily Focus Summary")
@@ -4016,6 +4131,7 @@ def render_swing_scanner(
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
         st.metric("Setup Quality", selected_row["Setup Quality Grade"], selected_row["Why Selected"])
+        st.metric("Explosive Score", f"{selected_row['Explosive Score']}/10", selected_row["Explosive Label"])
         st.metric("Watchlist", selected_row["WATCHLIST FLAG"], selected_row["Watchlist Reason"])
         st.metric("Final Score", f"{selected_row['Final Score']:.1f}/100")
         st.metric("Entry Trigger", f"${selected_row['Entry Trigger']:.2f}")
