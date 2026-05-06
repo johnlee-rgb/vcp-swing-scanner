@@ -1464,7 +1464,7 @@ def ai_trade_label(row: pd.Series) -> str:
 def build_ai_trading_notes(row: dict) -> str:
     """Create compact rule-based notes for table, cards, and alerts."""
     return (
-        f"{row['ticker']} {row['Action Label']} | {row['VCP Status']} | "
+        f"{row['ticker']} {row['Action Label']} | {row.get('Setup Quality Grade', 'N/A')} | {row['VCP Status']} | "
         f"Final {row['Final Score']}/100 | {row['Breakout Alert']} | "
         f"Risk {row['Risk %']}% | Earnings {row['Earnings Risk']}"
     )
@@ -1500,6 +1500,16 @@ def decide_trade(
     extended: bool,
     earnings_risk: bool,
     volume_confirmation: str,
+    vcp_status: str,
+    breakout_alert: str,
+    rs_score: float,
+    sector_leadership: str,
+    sector_score: int,
+    price_above_ma10: bool,
+    holding_ma20: bool,
+    ma10_rising: bool,
+    higher_low_structure: bool,
+    volume_contraction: bool,
 ) -> Tuple[str, str]:
     """Return the final YES/NO decision and the first practical blocker."""
     if action not in {"READY", "PULLBACK ENTRY"}:
@@ -1518,7 +1528,73 @@ def decide_trade(
         return "NO", "RR below A"
     if volume_confirmation != "YES":
         return "NO", "Volume confirmation missing"
+    true_vcp_priority = (
+        vcp_status in {"EARLY VCP", "VALID VCP"}
+        or breakout_alert in {"NEAR BREAKOUT", "CONFIRMED BREAKOUT"}
+        or (action == "PULLBACK ENTRY" and rs_score >= 6)
+    )
+    if not true_vcp_priority:
+        return "NO", "Not VCP, near breakout, or strong-RS pullback"
+    if vcp_status == "NOT VCP" and rs_score < 5:
+        return "NO", "Not VCP and weak relative strength"
+    if rs_score < 6 and not (breakout_alert == "CONFIRMED BREAKOUT" and volume_confirmation == "YES"):
+        return "NO", "RS Score below 6"
+    if not (sector_leadership == "Leader" or sector_score >= 3):
+        return "NO", "Weak sector leadership"
+    if action == "PULLBACK ENTRY":
+        valid_pullback = (
+            (price_above_ma10 or holding_ma20)
+            and ma10_rising
+            and higher_low_structure
+            and risk_pct <= 10
+            and rs_score >= 6
+            and volume_contraction
+        )
+        if not valid_pullback:
+            return "NO", "Pullback lacks MA support, RS, higher lows, or volume contraction"
+    if vcp_status == "NOT VCP" and rs_score < 5 and trend_score < 7:
+        return "NO", "Not VCP, weak RS, and trend below 7"
     return "YES", "Final score >=75, good RR, risk below 10%"
+
+
+def setup_quality_grade(
+    action: str,
+    trade: str,
+    vcp_status: str,
+    breakout_alert: str,
+    rs_score: float,
+    trend_score: int,
+    risk_pct: float,
+    extended: bool,
+    sector_leadership: str,
+    sector_score: int,
+    tightness_score: int,
+    volume_confirmation: str,
+) -> Tuple[str, str]:
+    """Grade whether a row is a true VCP/Minervini-style setup or a lower-quality lookalike."""
+    near_pivot = breakout_alert in {"NEAR BREAKOUT", "CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
+    strong_sector = sector_leadership == "Leader" or sector_score >= 3
+    strong_leader = rs_score >= 7 and trend_score >= 7 and strong_sector
+    vcp_like = vcp_status in {"VALID VCP", "EARLY VCP"}
+
+    if action in {"FAILED", "EXTENDED"} or extended or pd.isna(risk_pct) or risk_pct > 12:
+        why = "rejected because extended" if extended or action == "EXTENDED" else "rejected because failed structure or poor risk"
+        return "Reject", why
+    if vcp_status == "NOT VCP" and rs_score < 5:
+        return "C", "rejected because not VCP and RS weak"
+    if vcp_status == "NOT VCP" and rs_score < 5 and trend_score < 7:
+        return "C", "rejected because not VCP, RS weak, and trend below 7"
+    if vcp_like and strong_leader and near_pivot and risk_pct <= 8:
+        return "A+", "selected because true VCP near pivot"
+    if (vcp_like or near_pivot) and rs_score >= 6 and risk_pct <= 10:
+        if volume_confirmation != "YES":
+            return "A", "watch only because structure good but no volume confirmation"
+        return "A", "selected because valid VCP or early VCP with strong RS"
+    if action == "PULLBACK ENTRY" and rs_score >= 6 and risk_pct <= 10 and tightness_score >= 3:
+        return "B", "selected because pullback to MA10/MA20 with low risk"
+    if rs_score < 5 or vcp_status == "NOT VCP":
+        return "C", "rejected because not VCP and RS weak"
+    return "B", "watch only because structure good but no volume confirmation"
 
 
 def decide_watchlist_flag(
@@ -1631,6 +1707,10 @@ def build_scan_row(
         data, trend_score, rs_score, sector_score, earnings_info
     )
     post_earnings_label = detect_post_earnings_label(data, earnings_info)
+    price_above_ma10 = bool(latest["Close"] > latest["MA10"])
+    holding_ma20 = bool(latest["Close"] >= latest["MA20"] and latest["Low"] >= latest["MA20"] * 0.98)
+    ma10_rising = is_rising(data["MA10"])
+    higher_low_structure = has_higher_low_structure(data)
     final_score = calculate_final_score(
         trend_score=trend_score,
         technical_score=technical_score,
@@ -1649,7 +1729,37 @@ def build_scan_row(
         extended=extended,
         earnings_risk=earnings_risk,
         volume_confirmation=volume_confirmation,
+        vcp_status=vcp.status,
+        breakout_alert=breakout_alert,
+        rs_score=rs_score,
+        sector_leadership=sector_leadership,
+        sector_score=sector_score,
+        price_above_ma10=price_above_ma10,
+        holding_ma20=holding_ma20,
+        ma10_rising=ma10_rising,
+        higher_low_structure=higher_low_structure,
+        volume_contraction=vcp.volume_contraction,
     )
+    quality_grade, why_selected = setup_quality_grade(
+        action=action,
+        trade=trade,
+        vcp_status=vcp.status,
+        breakout_alert=breakout_alert,
+        rs_score=rs_score,
+        trend_score=trend_score,
+        risk_pct=risk_pct,
+        extended=extended,
+        sector_leadership=sector_leadership,
+        sector_score=sector_score,
+        tightness_score=tightness_score,
+        volume_confirmation=volume_confirmation,
+    )
+    if quality_grade == "Reject" and trade == "YES":
+        trade = "NO"
+        trade_reason = why_selected
+    if quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
+        trade = "NO"
+        trade_reason = "Not VCP and weak relative strength"
     watchlist_flag, watchlist_reason = decide_watchlist_flag(
         trade=trade,
         vcp_status=vcp.status,
@@ -1708,6 +1818,7 @@ def build_scan_row(
         "Action Label": action,
         "Tightness Score": tightness_score,
         "Tightness Label": tightness_label,
+        "Setup Quality Grade": quality_grade,
         "RR Ratio": rr_ratio if rr_ratio is not None else "Invalid",
         "RR Score": rr_score,
         "Volume Confirmation": volume_confirmation,
@@ -1725,6 +1836,7 @@ def build_scan_row(
         "Post-Earnings Label": post_earnings_label,
         "Trade": trade,
         "Trade Reason": trade_reason,
+        "Why Selected": why_selected,
         "WATCHLIST FLAG": watchlist_flag,
         "Watchlist Reason": watchlist_reason,
         "Entry Trigger": entry,
@@ -1824,19 +1936,46 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
     if results.empty:
         return pd.DataFrame()
     ranked = results.copy()
+    if "Setup Quality Grade" not in ranked:
+        ranked["Setup Quality Grade"] = "C"
+    if "Why Selected" not in ranked:
+        ranked["Why Selected"] = "Run a fresh scan for upgraded setup-quality explanations"
+    if "volume contraction" not in ranked:
+        ranked["volume contraction"] = "No"
+    setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     breakout_priority = {
         "CONFIRMED BREAKOUT": 0,
         "NEAR BREAKOUT": 1,
         "BREAKOUT IN PROGRESS": 2,
         "NO BREAKOUT": 3,
     }
+    vcp_mask = ranked["VCP Status"].isin(["VALID VCP", "EARLY VCP"])
+    strong_pullback_mask = (ranked["Action Label"] == "PULLBACK ENTRY") & (ranked["RS Score"] >= 6)
+    sector_mask = (ranked["Sector Leadership"] == "Leader") | (ranked["Sector Score"] >= 3)
+    candidate_mask = (
+        (vcp_mask | strong_pullback_mask)
+        & (ranked["RS Score"] >= 6)
+        & sector_mask
+        & (ranked["Risk %"] <= 10)
+        & (ranked["volume contraction"] == "Yes")
+        & (ranked["Setup Quality Grade"].isin(["A+", "A", "B"]))
+        & (ranked["Earnings Risk"] != "HIGH RISK")
+    )
+    if candidate_mask.any():
+        ranked = ranked[candidate_mask].copy()
+    else:
+        ranked = ranked[ranked["Setup Quality Grade"].isin(["A+", "A", "B"])].copy()
+        if ranked.empty:
+            ranked = results.copy()
     ranked["trade sort"] = np.where(ranked["Trade"] == "YES", 0, 1)
     ranked["watchlist sort"] = np.where(ranked["WATCHLIST FLAG"] == "YES", 0, 1)
+    ranked["quality sort"] = ranked["Setup Quality Grade"].map(setup_priority).fillna(9)
+    ranked["vcp sort"] = np.where(ranked["VCP Status"].isin(["VALID VCP", "EARLY VCP"]), 0, 1)
     ranked["breakout sort"] = ranked["Breakout Alert"].map(breakout_priority).fillna(9)
     ranked["earnings sort"] = np.where(ranked["Earnings Risk"] == "HIGH RISK", 1, 0)
     ranked = ranked.sort_values(
-        ["trade sort", "watchlist sort", "breakout sort", "Final Score", "RS Score", "Tightness Score", "Risk %", "earnings sort"],
-        ascending=[True, True, True, False, False, False, True, True],
+        ["quality sort", "trade sort", "vcp sort", "breakout sort", "RS Score", "Tightness Score", "Risk %", "Final Score", "earnings sort"],
+        ascending=[True, True, True, True, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -3513,6 +3652,7 @@ def render_top_5_trades() -> None:
             render_status_card(row["ticker"], label, tone, f"Final {row['Final Score']} | {row['Action Label']}")
             st.write(f"Company: {row.get('Company Name', 'N/A')}")
             st.write(f"Theme: {row.get('Sector ETF', 'N/A')}")
+            st.write(f"Quality: {row.get('Setup Quality Grade', 'N/A')}")
             st.write(f"Close: {row.get('close', 'N/A')}")
             st.write(f"VCP: {row.get('VCP Status', 'N/A')}")
             st.write(f"Pivot: {row.get('Pivot', 'N/A')}")
@@ -3521,6 +3661,7 @@ def render_top_5_trades() -> None:
             st.write(f"Risk: {row.get('Risk %', 'N/A')}%")
             st.write(f"2R / 3R: {row.get('Target 2R', 'N/A')} / {row.get('Target 3R', 'N/A')}")
             st.write(f"Earnings: {row.get('Earnings Date', 'N/A')} ({row.get('Earnings Risk', 'N/A')})")
+            st.write(row.get("Why Selected", ""))
             st.caption(row.get("AI Trading Notes", ""))
 
 
@@ -3544,7 +3685,7 @@ def render_alerts() -> None:
 
     picks = select_ai_top_5(results)
     st.write("Today alert candidates:")
-    st.dataframe(round_display_values(picks[["ticker", "Action Label", "Final Score", "Breakout Alert", "Earnings Date", "Earnings Risk", "AI Trading Notes"]]), width="stretch", hide_index=True)
+    st.dataframe(round_display_values(picks[["ticker", "Setup Quality Grade", "Action Label", "Final Score", "Breakout Alert", "Earnings Date", "Earnings Risk", "Why Selected", "AI Trading Notes"]]), width="stretch", hide_index=True)
 
     def send_message(message: str) -> None:
         sent_any = False
@@ -3625,6 +3766,10 @@ def render_swing_scanner(
         only_ready_pullback = st.checkbox("Show only READY / PULLBACK", value=False, key=f"{key_prefix}_ready")
         only_trade_watchlist = st.checkbox("Show only Trade + Watchlist", value=False, key=f"{key_prefix}_trade_watch")
         hide_extended = st.checkbox("Hide EXTENDED", value=False, key=f"{key_prefix}_hide_extended")
+        only_a_setups = st.checkbox("Show only A+ / A setups", value=False, key=f"{key_prefix}_quality_a")
+        hide_low_rs_non_vcp = st.checkbox("Hide defensive low-RS stocks", value=True, key=f"{key_prefix}_hide_low_rs")
+        only_true_vcp = st.checkbox("Show only true VCP", value=False, key=f"{key_prefix}_true_vcp")
+        only_strong_pullbacks = st.checkbox("Show only pullback entries with RS >= 6", value=False, key=f"{key_prefix}_strong_pullbacks")
         run_scan = st.button("Run Scan", type="primary", width="stretch", key=f"{key_prefix}_run")
 
     if run_scan:
@@ -3668,6 +3813,8 @@ def render_swing_scanner(
         "Volume Confirmation",
         "Earnings Risk",
         "Final Score",
+        "Setup Quality Grade",
+        "Why Selected",
         "WATCHLIST FLAG",
         "Watchlist Reason",
         "Breakout Alert",
@@ -3734,18 +3881,30 @@ def render_swing_scanner(
         visible = visible[(visible["Trade"] == "YES") | (visible["WATCHLIST FLAG"] == "YES")]
     if hide_extended:
         visible = visible[visible["Action Label"] != "EXTENDED"]
+    if only_a_setups:
+        visible = visible[visible["Setup Quality Grade"].isin(["A+", "A"])]
+    if hide_low_rs_non_vcp:
+        visible = visible[~((visible["VCP Status"] == "NOT VCP") & (visible["RS Score"] < 5))]
+    if only_true_vcp:
+        visible = visible[visible["VCP Status"].isin(["VALID VCP", "EARLY VCP"])]
+    if only_strong_pullbacks:
+        visible = visible[(visible["Action Label"] == "PULLBACK ENTRY") & (visible["RS Score"] >= 6)]
 
+    quality_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     visible["trade sort"] = np.where(visible["Trade"] == "YES", 0, 1)
     visible["watchlist sort"] = np.where(visible["WATCHLIST FLAG"] == "YES", 0, 1)
+    visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
+    visible["vcp sort"] = np.where(visible["VCP Status"].isin(["VALID VCP", "EARLY VCP"]), 0, 1)
     visible = visible.sort_values(
-        ["trade sort", "watchlist sort", "Final Score", "Tightness Score"],
-        ascending=[True, True, False, False],
+        ["quality sort", "trade sort", "vcp sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+        ascending=[True, True, True, False, False, True, False],
     )
 
     compact_columns = [
         "ticker",
         "close",
         "Final Score",
+        "Setup Quality Grade",
         "Trade",
         "WATCHLIST FLAG",
         "Action Label",
@@ -3764,6 +3923,7 @@ def render_swing_scanner(
         "Risk %",
         "Target 2R",
         "Target 3R",
+        "Why Selected",
         "AI Trading Notes",
     ]
     diagnostic_columns = compact_columns + [
@@ -3797,16 +3957,17 @@ def render_swing_scanner(
     focus_source = results.copy()
     focus_source["trade sort"] = np.where(focus_source["Trade"] == "YES", 0, 1)
     focus_source["watchlist sort"] = np.where(focus_source["WATCHLIST FLAG"] == "YES", 0, 1)
+    focus_source["quality sort"] = focus_source["Setup Quality Grade"].map(quality_priority).fillna(9)
 
     trade_focus = focus_source[focus_source["Trade"] == "YES"].sort_values(
-        ["Final Score", "Tightness Score"],
-        ascending=[False, False],
+        ["quality sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+        ascending=[True, False, False, True, False],
     )
     watchlist_focus = focus_source[
         (focus_source["WATCHLIST FLAG"] == "YES") & (focus_source["Trade"] != "YES")
     ].sort_values(
-        ["Final Score", "Tightness Score"],
-        ascending=[False, False],
+        ["quality sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+        ascending=[True, False, False, True, False],
     )
     pullback_focus = focus_source[focus_source["Action Label"] == "PULLBACK ENTRY"].copy()
     if not pullback_focus.empty:
@@ -3816,8 +3977,8 @@ def render_swing_scanner(
         ]
         pullback_focus.loc[pullback_focus["Trade"] == "YES", "Pullback Reason"] = pullback_focus["Trade Reason"]
         pullback_focus = pullback_focus.sort_values(
-            ["trade sort", "watchlist sort", "Final Score", "Tightness Score"],
-            ascending=[True, True, False, False],
+            ["quality sort", "trade sort", "watchlist sort", "RS Score", "Tightness Score", "Risk %", "Final Score"],
+            ascending=[True, True, True, False, False, True, False],
         )
 
     st.subheader("Daily Focus Summary")
@@ -3854,6 +4015,7 @@ def render_swing_scanner(
         st.subheader("Trade Plan")
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
+        st.metric("Setup Quality", selected_row["Setup Quality Grade"], selected_row["Why Selected"])
         st.metric("Watchlist", selected_row["WATCHLIST FLAG"], selected_row["Watchlist Reason"])
         st.metric("Final Score", f"{selected_row['Final Score']:.1f}/100")
         st.metric("Entry Trigger", f"${selected_row['Entry Trigger']:.2f}")
