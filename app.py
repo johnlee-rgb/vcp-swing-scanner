@@ -9,11 +9,14 @@ trend and timing separately, then produce a next-day trade plan.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, time as dt_time
 from email.message import EmailMessage
 from io import StringIO
 import re
 import smtplib
+import time
 from typing import Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -675,21 +678,153 @@ def format_large_number(value: float | int | None) -> str:
     return f"${value:,.0f}"
 
 
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def download_daily_data(tickers: Tuple[str, ...], period: str = "18mo") -> Dict[str, pd.DataFrame]:
+def format_count_number(value: float | int | None) -> str:
+    """Display share volume in compact M/B form without currency symbols."""
+    if value is None or pd.isna(value):
+        return "N/A"
+    value = float(value)
+    if abs(value) >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    return f"{value:,.0f}"
+
+
+def market_session_status(now: datetime | None = None) -> Tuple[str, str, str]:
+    """Return NY-market session status plus human-readable NY/local timestamps."""
+    ny_tz = ZoneInfo("America/New_York")
+    local_tz = ZoneInfo("Asia/Singapore")
+    ny_now = now.astimezone(ny_tz) if now is not None else datetime.now(ny_tz)
+    local_now = ny_now.astimezone(local_tz)
+
+    if ny_now.weekday() >= 5:
+        status = "MARKET CLOSED"
+    elif dt_time(4, 0) <= ny_now.time() < dt_time(9, 30):
+        status = "PREMARKET"
+    elif dt_time(9, 30) <= ny_now.time() < dt_time(16, 0):
+        status = "REGULAR HOURS"
+    elif dt_time(16, 0) <= ny_now.time() < dt_time(20, 0):
+        status = "AFTER HOURS"
+    else:
+        status = "MARKET CLOSED"
+
+    return status, ny_now.strftime("%Y-%m-%d %H:%M %Z"), local_now.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def clear_market_data_cache() -> None:
+    """Clear market-data caches so the next scan downloads fresh bars and metadata."""
+    for cached_func in (download_daily_data, download_market_caps, download_earnings_data):
+        try:
+            cached_func.clear()
+        except Exception:
+            pass
+
+
+def safe_fast_info_get(fast_info, *keys: str):
+    """Read yfinance fast_info values across object and mapping variants."""
+    for key in keys:
+        try:
+            value = getattr(fast_info, key)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+        try:
+            value = fast_info.get(key)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+    return None
+
+
+def fetch_live_quote(ticker: str, include_info: bool = False) -> dict:
+    """Fetch best-effort latest quote metadata without relying on stale OHLCV cache."""
+    quote = {
+        "current_price": np.nan,
+        "previous_close": np.nan,
+        "percent_change": np.nan,
+        "premarket_price": np.nan,
+        "afterhours_price": np.nan,
+        "day_volume": np.nan,
+        "avg_volume": np.nan,
+        "year_high": np.nan,
+        "quote_time": "N/A",
+        "quote_source": "yfinance fast_info",
+    }
+    for attempt in range(3):
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            fast_info = yf_ticker.fast_info
+            current = safe_fast_info_get(fast_info, "last_price", "lastPrice", "regular_market_price")
+            previous = safe_fast_info_get(fast_info, "previous_close", "previousClose", "regular_market_previous_close")
+            quote["current_price"] = float(current) if current is not None and pd.notna(current) else np.nan
+            quote["previous_close"] = float(previous) if previous is not None and pd.notna(previous) else np.nan
+            quote["day_volume"] = safe_fast_info_get(fast_info, "last_volume", "lastVolume", "day_volume")
+            quote["avg_volume"] = safe_fast_info_get(fast_info, "ten_day_average_volume", "three_month_average_volume")
+            quote["year_high"] = safe_fast_info_get(fast_info, "year_high", "yearHigh")
+            quote["quote_time"] = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
+
+            if include_info:
+                try:
+                    info = yf_ticker.info or {}
+                    quote["premarket_price"] = info.get("preMarketPrice", np.nan)
+                    quote["afterhours_price"] = info.get("postMarketPrice", np.nan)
+                    regular_time = info.get("regularMarketTime")
+                    if regular_time:
+                        quote["quote_time"] = datetime.fromtimestamp(
+                            int(regular_time), tz=ZoneInfo("America/New_York")
+                        ).strftime("%Y-%m-%d %H:%M %Z")
+                    quote["quote_source"] = "yfinance fast_info + info"
+                except Exception:
+                    pass
+
+            if pd.notna(quote["current_price"]) and pd.notna(quote["previous_close"]) and quote["previous_close"]:
+                quote["percent_change"] = (quote["current_price"] / quote["previous_close"] - 1) * 100
+            return quote
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))
+    quote["quote_source"] = "yfinance quote failed"
+    return quote
+
+
+def download_live_quotes(tickers: Tuple[str, ...]) -> Dict[str, dict]:
+    """Fetch current quote metadata for all scanned tickers."""
+    return {ticker: fetch_live_quote(ticker, include_info=False) for ticker in tickers}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def download_daily_data(tickers: Tuple[str, ...], period: str = "1y", force_token: str = "") -> Dict[str, pd.DataFrame]:
     """Download daily OHLCV data and return one cleaned DataFrame per ticker."""
     if not tickers:
         return {}
 
-    raw = yf.download(
-        list(tickers),
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        group_by="ticker",
-        progress=False,
-        threads=True,
-    )
+    raw = pd.DataFrame()
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            raw = yf.download(
+                list(tickers),
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                prepost=True,
+                group_by="ticker",
+                progress=False,
+                threads=True,
+            )
+            if raw is not None and not raw.empty:
+                break
+        except Exception as exc:
+            last_error = exc
+        if attempt < 2:
+            time.sleep(0.75 * (attempt + 1))
+
+    if raw is None or raw.empty:
+        if last_error:
+            st.warning(f"Market data fetch failed after 3 tries: {last_error}")
+        return {}
 
     data: Dict[str, pd.DataFrame] = {}
     for ticker in tickers:
@@ -706,6 +841,8 @@ def download_daily_data(tickers: Tuple[str, ...], period: str = "18mo") -> Dict[
         frame = frame[usable_columns].dropna(subset=["Close"])
         if not frame.empty:
             frame.index = pd.to_datetime(frame.index)
+            if frame.index.tz is not None:
+                frame.index = frame.index.tz_convert(None)
             data[ticker] = frame
 
     return data
@@ -874,6 +1011,74 @@ def period_return(data: pd.DataFrame | None, days: int) -> float:
     if pd.isna(latest) or pd.isna(prior) or prior == 0:
         return np.nan
     return float((latest / prior - 1) * 100)
+
+
+def synchronize_frame_with_quote(frame: pd.DataFrame, quote: dict, session_status: str) -> Tuple[pd.DataFrame, bool]:
+    """Apply the latest quote to the newest candle so chart and table do not drift apart."""
+    if frame.empty:
+        return frame, False
+    current_price = quote.get("current_price", np.nan)
+    if pd.isna(current_price) or current_price <= 0:
+        return frame, False
+
+    data = frame.copy()
+    latest_index = data.index[-1]
+    latest_close = float(data.iloc[-1]["Close"])
+    mismatch_pct = abs(current_price / latest_close - 1) * 100 if latest_close else 0
+    should_apply = session_status in {"PREMARKET", "REGULAR HOURS", "AFTER HOURS"} or mismatch_pct > 0.5
+    if not should_apply:
+        return data, False
+
+    data.loc[latest_index, "Close"] = float(current_price)
+    if "High" in data:
+        data.loc[latest_index, "High"] = max(float(data.loc[latest_index, "High"]), float(current_price))
+    if "Low" in data:
+        data.loc[latest_index, "Low"] = min(float(data.loc[latest_index, "Low"]), float(current_price))
+    day_volume = quote.get("day_volume", np.nan)
+    if "Volume" in data and pd.notna(day_volume) and float(day_volume) > 0:
+        data.loc[latest_index, "Volume"] = float(day_volume)
+    return data, True
+
+
+def is_data_stale(latest_index: pd.Timestamp) -> Tuple[bool, str]:
+    """Warn if the latest candle is older than one NY trading day."""
+    latest_date = pd.Timestamp(latest_index).tz_localize(None).normalize()
+    today_ny = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).tz_localize(None).normalize()
+    trading_days = len(pd.bdate_range(latest_date, today_ny)) - 1
+    if trading_days > 1:
+        return True, "Data stale - refresh required"
+    return False, "Fresh"
+
+
+def chart_sync_status(chart_close: float, quote_price: float) -> Tuple[str, float]:
+    """Compare the displayed chart close against the fetched quote."""
+    if pd.isna(chart_close) or pd.isna(quote_price) or chart_close <= 0:
+        return "N/A", np.nan
+    mismatch_pct = abs(quote_price / chart_close - 1) * 100
+    if mismatch_pct > 2:
+        return "Chart sync error", round(mismatch_pct, 2)
+    return "Synced", round(mismatch_pct, 2)
+
+
+def classify_current_setup_status(data: pd.DataFrame, pivot: PivotInfo, extended: bool, breakout_alert: str) -> str:
+    """Summarize the current chart state from the latest synchronized candle."""
+    latest = data.iloc[-1]
+    previous = data.iloc[-2] if len(data) >= 2 else latest
+    if latest["Close"] < latest["MA50"] or latest["Close"] < latest["Low10"]:
+        return "FAILED BREAKOUT"
+    if extended:
+        return "EXTENDED"
+    if breakout_alert == "CONFIRMED BREAKOUT":
+        return "ACTIVE BREAKOUT"
+    if breakout_alert in {"NEAR BREAKOUT", "BREAKOUT IN PROGRESS"}:
+        return "EARLY BREAKOUT"
+    if abs(latest["Close"] - latest["MA10"]) / latest["Close"] <= 0.03 and latest["Close"] >= latest["MA10"]:
+        return "PULLBACK TO MA10"
+    if abs(latest["Close"] - latest["MA20"]) / latest["Close"] <= 0.04 and latest["Close"] >= latest["MA20"]:
+        return "PULLBACK TO MA20"
+    if latest["Close"] <= pivot.pivot and latest["Close"] >= previous["Low"]:
+        return "BASE BUILDING"
+    return "BASE BUILDING"
 
 
 def calculate_market_score(market_data: Dict[str, pd.DataFrame]) -> Tuple[int, str, List[str]]:
@@ -1408,6 +1613,91 @@ def calculate_ideal_tp_plan(
     return round(float(ideal_tp), 2), reason, sell_strategy, round(float(trail_stop), 2), int(min(max(tp_score, 0), 10)), ideal_r
 
 
+def resistance_breakout_plan(data: pd.DataFrame, nearest_resistance: float) -> Tuple[float, float, float, float, float, float]:
+    """Build an alternate plan for A/A+ setups that need to clear overhead resistance first."""
+    latest = data.iloc[-1]
+    atr = float(latest["ATR14"]) if pd.notna(latest["ATR14"]) else float(latest["Close"]) * 0.03
+    entry = round(float(nearest_resistance) * 1.003, 2)
+    support = min(float(latest["MA10"]), float(latest["Low10"]))
+    stop = round(max(support - 0.25 * atr, 0.01), 2)
+    risk = max(entry - stop, 0.01)
+    target_1r = round(entry + risk, 2)
+    target_2r = round(entry + 2 * risk, 2)
+    target_3r = round(entry + 3 * risk, 2)
+    return entry, stop, target_1r, target_2r, target_3r, round(risk / entry * 100, 2)
+
+
+def classify_vcp_label(
+    vcp_status: str,
+    action: str,
+    current_setup_status: str,
+    resistance_breakout_mode: str,
+) -> str:
+    """Provide a clear human-readable VCP/pattern label while preserving raw VCP Status."""
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        return "RESISTANCE BREAKOUT WATCH"
+    if action == "EXTENDED" or current_setup_status == "EXTENDED":
+        return "EXTENDED"
+    if action == "FAILED" or current_setup_status == "FAILED BREAKOUT":
+        return "FAILED"
+    if vcp_status in {"VALID VCP", "EARLY VCP"}:
+        return vcp_status
+    if action == "PULLBACK ENTRY":
+        return "PULLBACK SETUP"
+    if action == "WATCH" or current_setup_status == "BASE BUILDING":
+        return "BASE BUILDING"
+    return "NOT VCP"
+
+
+def build_decision_reason(
+    trade: str,
+    watchlist_flag: str,
+    trade_reason: str,
+    watchlist_reason: str,
+    setup_grade: str,
+    vcp_label: str,
+    rs_score: float,
+    risk_pct: float,
+    ideal_r: float,
+    resistance_breakout_mode: str,
+    ideal_tp_reason: str,
+) -> str:
+    """Explain the decision in one direct sentence."""
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        return "WATCH: resistance blocks 1R; needs clean breakout above resistance before swing entry"
+    if trade == "YES":
+        risk_text = "risk <= 8%" if pd.notna(risk_pct) and risk_pct <= 8 else "borderline risk"
+        return f"YES: {setup_grade} setup, {vcp_label.lower()}, RS {rs_score:g}, {risk_text}, TP {ideal_r:g}R"
+    if "resistance before 1R" in ideal_tp_reason.lower() or "reward too limited" in trade_reason.lower():
+        return "NO: resistance before 1R"
+    if "extended" in trade_reason.lower():
+        return "NO: extended"
+    if "risk" in trade_reason.lower():
+        return "NO: risk too high"
+    if watchlist_flag == "YES":
+        return f"WATCH: {watchlist_reason}"
+    return f"NO: {trade_reason}"
+
+
+def clean_why_selected(
+    why_selected: str,
+    trade: str,
+    trade_reason: str,
+    watchlist_flag: str,
+    vcp_status: str,
+    resistance_breakout_mode: str,
+) -> str:
+    """Avoid contradictory selected/rejected wording when Trade is NO."""
+    selected_text = why_selected.lower().startswith("selected because")
+    if trade == "YES" or not selected_text:
+        return why_selected
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        return "Watchlist only: needs clean breakout above resistance before swing entry"
+    if watchlist_flag == "YES" and vcp_status in {"VALID VCP", "EARLY VCP"}:
+        return "Watchlist only: valid/early VCP but no clean entry yet"
+    return f"Not selected yet: {trade_reason}"
+
+
 def calculate_rr_score(entry: float, stop: float, target_2r: float) -> Tuple[float | None, str]:
     """Classify risk/reward quality from the planned entry, stop, and 2R target."""
     risk = entry - stop
@@ -1920,6 +2210,9 @@ def build_scan_row(
     data: pd.DataFrame,
     market_cap: float | None,
     earnings_info: dict,
+    quote_info: dict,
+    sync_info: dict,
+    scan_timestamps: dict,
     market_score: int,
     sector_score: int,
     benchmark_data: Dict[str, pd.DataFrame],
@@ -1942,6 +2235,7 @@ def build_scan_row(
     earnings_label, earnings_risk = classify_earnings_risk(earnings_info)
     volume_confirmation, volume_note = calculate_volume_confirmation(data, action, pivot)
     breakout_alert = detect_breakout_alert(data, pivot, volume_confirmation)
+    current_setup_status = classify_current_setup_status(data, pivot, extended, breakout_alert)
     earnings_setup_score, earnings_setup_label, earnings_strategy = calculate_earnings_setup(
         data, trend_score, rs_score, sector_score, earnings_info
     )
@@ -2012,6 +2306,20 @@ def build_scan_row(
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
     nearest_resistance = detect_nearest_resistance(data, entry)
+    resistance_blocks_1r = nearest_resistance > entry and nearest_resistance < target_1r
+    resistance_distance_pct = (nearest_resistance - float(latest["Close"])) / float(latest["Close"]) * 100
+    resistance_breakout_mode = (
+        "RESISTANCE BREAKOUT WATCH"
+        if (
+            quality_grade in {"A+", "A"}
+            and explosive_score >= 8
+            and rs_score >= 6
+            and resistance_blocks_1r
+            and -1 <= resistance_distance_pct <= 5
+        )
+        else "NO"
+    )
+    rb_entry, rb_stop, rb_1r, rb_2r, rb_3r, rb_risk_pct = resistance_breakout_plan(data, nearest_resistance)
     ideal_tp, ideal_tp_reason, sell_strategy, trail_stop, tp_quality_score, ideal_r = calculate_ideal_tp_plan(
         entry=entry,
         stop=stop,
@@ -2037,6 +2345,15 @@ def build_scan_row(
     if trade == "YES" and risk_pct > 10 and not aggressive_mode:
         trade = "NO"
         trade_reason = "Risk too high"
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        trade = "NO"
+        trade_reason = "Needs breakout above resistance"
+        ideal_tp = rb_2r
+        ideal_tp_reason = "Needs clean breakout above resistance before swing entry"
+        sell_strategy = "WATCH / SCALP ONLY"
+        trail_stop = rb_stop
+        ideal_r = round((ideal_tp - rb_entry) / max(rb_entry - rb_stop, 0.01), 2)
+        tp_quality_score = max(tp_quality_score, 6)
     if trade == "YES" and ideal_r < 1.8:
         trade = "NO"
         trade_reason = "Reward too limited before resistance"
@@ -2067,7 +2384,47 @@ def build_scan_row(
             ideal_tp_reason = f"{ideal_tp_reason}; watchlist only"
     elif trade == "NO" and quality_grade == "Reject":
         sell_strategy = "AVOID / NO TRADE"
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
+        watchlist_flag = "YES"
+        watchlist_reason = "Needs clean breakout above resistance before swing entry"
+        sell_strategy = "WATCH / SCALP ONLY"
+    vcp_label = classify_vcp_label(vcp.status, action, current_setup_status, resistance_breakout_mode)
+    why_selected = clean_why_selected(
+        why_selected=why_selected,
+        trade=trade,
+        trade_reason=trade_reason,
+        watchlist_flag=watchlist_flag,
+        vcp_status=vcp.status,
+        resistance_breakout_mode=resistance_breakout_mode,
+    )
+    decision_reason = build_decision_reason(
+        trade=trade,
+        watchlist_flag=watchlist_flag,
+        trade_reason=trade_reason,
+        watchlist_reason=watchlist_reason,
+        setup_grade=quality_grade,
+        vcp_label=vcp_label,
+        rs_score=rs_score,
+        risk_pct=risk_pct,
+        ideal_r=ideal_r,
+        resistance_breakout_mode=resistance_breakout_mode,
+        ideal_tp_reason=ideal_tp_reason,
+    )
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
+    latest_candle = pd.Timestamp(data.index[-1])
+    data_stale, stale_warning = is_data_stale(latest_candle)
+    quote_price = quote_info.get("current_price", np.nan)
+    sync_warning, sync_mismatch_pct = chart_sync_status(float(latest["Close"]), quote_price)
+    rel_volume = (
+        float(latest["Volume"]) / float(latest["AvgVol20"])
+        if pd.notna(latest.get("AvgVol20", np.nan)) and float(latest["AvgVol20"]) > 0
+        else np.nan
+    )
+    distance_from_high = (
+        (float(latest["Close"]) / float(latest["High52W"]) - 1) * 100
+        if pd.notna(latest.get("High52W", np.nan)) and float(latest["High52W"]) > 0
+        else np.nan
+    )
 
     notes = "; ".join(
         [
@@ -2077,6 +2434,8 @@ def build_scan_row(
             f"Sector {sector_etf}: {sector_leadership}",
             f"Earnings: {earnings_label}",
             f"TP: {ideal_tp_reason}",
+            stale_warning,
+            sync_warning,
             *trend_notes[:2],
             *technical_notes[:3],
             invalidation,
@@ -2086,6 +2445,14 @@ def build_scan_row(
     row = {
         "ticker": ticker,
         "close": round(float(latest["Close"]), 2),
+        "Current Price": round(float(quote_price), 2) if pd.notna(quote_price) else round(float(latest["Close"]), 2),
+        "% Change": round(float(quote_info.get("percent_change", np.nan)), 2) if pd.notna(quote_info.get("percent_change", np.nan)) else "N/A",
+        "Premarket Price": round(float(quote_info.get("premarket_price", np.nan)), 2) if pd.notna(quote_info.get("premarket_price", np.nan)) else "N/A",
+        "Afterhours Price": round(float(quote_info.get("afterhours_price", np.nan)), 2) if pd.notna(quote_info.get("afterhours_price", np.nan)) else "N/A",
+        "Today's Volume": format_count_number(latest.get("Volume")),
+        "Relative Volume": round(rel_volume, 2) if pd.notna(rel_volume) else "N/A",
+        "52-week high": round(float(latest["High52W"]), 2) if pd.notna(latest.get("High52W", np.nan)) else "N/A",
+        "Distance From High %": round(distance_from_high, 2) if pd.notna(distance_from_high) else "N/A",
         "market cap": format_large_number(market_cap),
         "market cap raw": market_cap,
         "avg dollar volume": format_large_number(latest.get("AvgDollarVol50")),
@@ -2101,10 +2468,12 @@ def build_scan_row(
         "Market Score": market_score,
         "Final Score": final_score,
         "VCP Status": vcp.status,
+        "VCP Label": vcp_label,
         "Contractions": contraction_text,
         "contraction count": vcp.count,
         "final contraction %": vcp.final_pct,
         "volume contraction": "Yes" if vcp.volume_contraction else "No",
+        "Volume Dry-Up": "Yes" if vcp.volume_contraction else "No",
         "Pivot": pivot.pivot,
         "Distance to Pivot %": pivot.distance_pct,
         "Action Label": action,
@@ -2117,6 +2486,7 @@ def build_scan_row(
         "RR Score": rr_score,
         "Volume Confirmation": volume_confirmation,
         "Breakout Alert": breakout_alert,
+        "Current Setup Status": current_setup_status,
         "Earnings Date": earnings_info.get("next_date") or "N/A",
         "Days to Earnings": earnings_info.get("days_to_earnings") if earnings_info.get("days_to_earnings") is not None else "N/A",
         "Earnings Risk": earnings_label,
@@ -2130,6 +2500,7 @@ def build_scan_row(
         "Post-Earnings Label": post_earnings_label,
         "Trade": trade,
         "Trade Reason": trade_reason,
+        "Decision Reason": decision_reason,
         "Why Selected": why_selected,
         "WATCHLIST FLAG": watchlist_flag,
         "Watchlist Reason": watchlist_reason,
@@ -2141,6 +2512,15 @@ def build_scan_row(
         "Target 2R": target_2r,
         "Target 3R": target_3r,
         "Nearest Resistance": nearest_resistance,
+        "Resistance Blocked": "YES" if resistance_blocks_1r else "NO",
+        "Resistance Breakout Mode": resistance_breakout_mode,
+        "Breakout Above Resistance Trigger": rb_entry,
+        "Resistance Breakout Entry": rb_entry,
+        "Resistance Breakout Stop": rb_stop,
+        "Resistance Breakout 1R": rb_1r,
+        "Resistance Breakout 2R": rb_2r,
+        "Resistance Breakout 3R": rb_3r,
+        "Resistance Breakout Risk %": rb_risk_pct,
         "Ideal TP": ideal_tp,
         "Ideal TP Reason": ideal_tp_reason,
         "Sell Strategy": sell_strategy,
@@ -2149,6 +2529,19 @@ def build_scan_row(
         "Ideal TP R": ideal_r,
         "MA10 Distance %": ma10_distance,
         "MA20 Distance %": ma20_distance,
+        "Last Updated": scan_timestamps.get("market_timestamp", "N/A"),
+        "Local Last Updated": scan_timestamps.get("local_timestamp", "N/A"),
+        "Market Session": scan_timestamps.get("session_status", "N/A"),
+        "Latest Candle Date": latest_candle.strftime("%Y-%m-%d"),
+        "Dataframe Last Index": str(data.index[-1]),
+        "Fetched Rows": int(len(data)),
+        "Quote Source": quote_info.get("quote_source", "N/A"),
+        "Quote Time": quote_info.get("quote_time", "N/A"),
+        "Quote Applied To Candle": "YES" if sync_info.get(ticker, False) else "NO",
+        "Data Stale": "YES" if data_stale else "NO",
+        "Data Warning": stale_warning,
+        "Chart Sync": sync_warning,
+        "Chart/Quote Mismatch %": sync_mismatch_pct if pd.notna(sync_mismatch_pct) else "N/A",
         "Notes": notes,
         "Company Name": "N/A",
         "_pivot": pivot,
@@ -2189,6 +2582,13 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Target 2R",
         "Target 3R",
         "Nearest Resistance",
+        "Breakout Above Resistance Trigger",
+        "Resistance Breakout Entry",
+        "Resistance Breakout Stop",
+        "Resistance Breakout 1R",
+        "Resistance Breakout 2R",
+        "Resistance Breakout 3R",
+        "Resistance Breakout Risk %",
         "Ideal TP",
         "Trail Stop Level",
         "Ideal TP R",
@@ -2216,8 +2616,14 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
     summary["Reason"] = summary[reason_column]
     columns = [
         "ticker",
+        "VCP Status",
+        "VCP Label",
+        "Setup Quality Grade",
         "Action Label",
+        "Breakout Alert",
         "Final Score",
+        "RS Score",
+        "Explosive Score",
         "Pivot",
         "Distance to Pivot %",
         "Entry Trigger",
@@ -2226,6 +2632,7 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "RR Score",
         "Ideal TP",
         "TP Quality Score",
+        "Decision Reason",
         "Reason",
     ]
     return round_display_values(summary[columns])
@@ -2317,6 +2724,8 @@ def alert_message(row: pd.Series) -> str:
     return (
         f"Ticker: {row.get('ticker', 'N/A')}\n"
         f"Action: {row.get('Action Label', 'N/A')}\n"
+        f"VCP Status: {row.get('VCP Status', 'N/A')}\n"
+        f"Decision Reason: {row.get('Decision Reason', 'N/A')}\n"
         f"Final Score: {row.get('Final Score', 'N/A')}\n"
         f"Pivot: {row.get('Pivot', 'N/A')}\n"
         f"Entry Trigger: {row.get('Entry Trigger', 'N/A')}\n"
@@ -2425,12 +2834,35 @@ def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
         ("2R", row["Target 2R"], "#16a34a"),
         ("3R", row["Target 3R"], "#15803d"),
         ("Resistance", row.get("Nearest Resistance", np.nan), "#9333ea"),
+        ("Resistance BO", row.get("Breakout Above Resistance Trigger", np.nan), "#7c3aed"),
         ("Ideal TP", row.get("Ideal TP", np.nan), "#0f766e"),
         ("Trail", row.get("Trail Stop Level", np.nan), "#ea580c"),
     ]
     for label, value, color in level_specs:
         if pd.notna(value):
             figure.add_hline(y=value, line_dash="dash", line_color=color, annotation_text=label)
+    resistance = row.get("Nearest Resistance", np.nan)
+    if pd.notna(resistance):
+        figure.add_hrect(
+            y0=float(resistance) * 0.995,
+            y1=float(resistance) * 1.005,
+            fillcolor="#9333ea",
+            opacity=0.08,
+            line_width=0,
+            annotation_text="Resistance zone",
+            annotation_position="top left",
+        )
+
+    earnings_date = row.get("Earnings Date", "N/A")
+    if earnings_date != "N/A":
+        parsed_earnings = pd.to_datetime(earnings_date, errors="coerce")
+        if pd.notna(parsed_earnings) and chart_data.index.min() <= parsed_earnings <= chart_data.index.max():
+            figure.add_vline(
+                x=parsed_earnings,
+                line_dash="dot",
+                line_color="#be123c",
+                annotation_text="Earnings",
+            )
 
     vcp: VcpInfo = row["_vcp"]
     for point in vcp.label_points:
@@ -2469,10 +2901,20 @@ def scan_universe(
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], dict]:
     """Download, filter, score, and return scanner results."""
     tickers = tickers[:500]
+    session_status, market_timestamp, local_timestamp = market_session_status()
+    force_token = datetime.now(ZoneInfo("America/New_York")).isoformat()
     is_hk_scan = any(ticker.endswith(".HK") for ticker in tickers) or "HK" in mode
     context_tickers = ALL_CONTEXT_TICKERS if is_hk_scan else MARKET_TICKERS
     all_tickers = tuple(sorted(set(tickers + context_tickers)))
-    raw_data = download_daily_data(all_tickers, period="18mo")
+    raw_data = download_daily_data(all_tickers, period="1y", force_token=force_token)
+    quote_data = download_live_quotes(all_tickers)
+    quote_applied: Dict[str, bool] = {}
+    synchronized_raw: Dict[str, pd.DataFrame] = {}
+    for symbol, frame in raw_data.items():
+        synchronized, applied = synchronize_frame_with_quote(frame, quote_data.get(symbol, {}), session_status)
+        synchronized_raw[symbol] = synchronized
+        quote_applied[symbol] = applied
+    raw_data = synchronized_raw
 
     spy_raw = raw_data.get("^HSI") if is_hk_scan and raw_data.get("^HSI") is not None else raw_data.get("SPY")
     indicator_data = {ticker: add_indicators(frame, spy_raw) for ticker, frame in raw_data.items()}
@@ -2487,6 +2929,11 @@ def scan_universe(
     sector_score, sector_details = calculate_sector_score(mode, market_data)
     market_caps = download_market_caps(tuple(tickers))
     earnings_data = download_earnings_data(tuple(tickers))
+    scan_timestamps = {
+        "market_timestamp": market_timestamp,
+        "local_timestamp": local_timestamp,
+        "session_status": session_status,
+    }
 
     rows: List[dict] = []
     rejected: List[str] = []
@@ -2514,6 +2961,9 @@ def scan_universe(
                     data=data,
                     market_cap=market_cap,
                     earnings_info=earnings_data.get(ticker, {}),
+                    quote_info=quote_data.get(ticker, {}),
+                    sync_info=quote_applied,
+                    scan_timestamps=scan_timestamps,
                     market_score=market_score,
                     sector_score=sector_score,
                     benchmark_data=market_data,
@@ -2530,6 +2980,9 @@ def scan_universe(
         "market_score": market_score,
         "market_status": market_status,
         "market_details": market_details,
+        "market_timestamp": market_timestamp,
+        "local_timestamp": local_timestamp,
+        "session_status": session_status,
         "sector_score": sector_score,
         "sector_details": sector_details,
         "rejected": rejected,
@@ -3998,9 +4451,10 @@ def render_top_5_trades() -> None:
             st.write(f"Company: {row.get('Company Name', 'N/A')}")
             st.write(f"Theme: {row.get('Sector ETF', 'N/A')}")
             st.write(f"Quality: {row.get('Setup Quality Grade', 'N/A')}")
+            st.write(f"VCP: {row.get('VCP Status', 'N/A')} | {row.get('Contractions', 'N/A')}")
+            st.write(f"RS/Trend/Tech: {row.get('RS Score', 'N/A')} / {row.get('Trend Score', 'N/A')} / {row.get('Technical Score', 'N/A')}")
             st.write(f"Explosive: {row.get('Explosive Score', 'N/A')}/10 - {row.get('Explosive Label', 'N/A')}")
             st.write(f"Close: {row.get('close', 'N/A')}")
-            st.write(f"VCP: {row.get('VCP Status', 'N/A')}")
             st.write(f"Pivot: {row.get('Pivot', 'N/A')}")
             st.write(f"Entry: {row.get('Entry Trigger', 'N/A')}")
             st.write(f"Stop: {row.get('Stop Loss', 'N/A')}")
@@ -4009,7 +4463,7 @@ def render_top_5_trades() -> None:
             st.write(f"1R / 2R / 3R: {row.get('Target 1R', 'N/A')} / {row.get('Target 2R', 'N/A')} / {row.get('Target 3R', 'N/A')}")
             st.write(f"Sell: {row.get('Sell Strategy', 'N/A')}")
             st.write(f"Earnings: {row.get('Earnings Date', 'N/A')} ({row.get('Earnings Risk', 'N/A')})")
-            st.write(row.get("Why Selected", ""))
+            st.write(row.get("Decision Reason", row.get("Why Selected", "")))
             st.caption(row.get("AI Trading Notes", ""))
 
 
@@ -4041,6 +4495,14 @@ def render_alerts() -> None:
                 picks[
                     [
                         "ticker",
+                        "VCP Status",
+                        "Contractions",
+                        "Volume Dry-Up",
+                        "RS Score",
+                        "Final Score",
+                        "Trend Score",
+                        "Technical Score",
+                        "Tightness Score",
                         "Setup Quality Grade",
                         "Explosive Score",
                         "Explosive Label",
@@ -4048,11 +4510,10 @@ def render_alerts() -> None:
                         "Ideal TP",
                         "Ideal TP Reason",
                         "Action Label",
-                        "Final Score",
                         "Breakout Alert",
                         "Earnings Date",
                         "Earnings Risk",
-                        "Why Selected",
+                        "Decision Reason",
                         "AI Trading Notes",
                     ]
                 ]
@@ -4151,16 +4612,30 @@ def render_swing_scanner(
         hide_extended = st.checkbox("Hide EXTENDED", value=False, key=f"{key_prefix}_hide_extended")
         only_a_setups = st.checkbox("Show only A+ / A setups", value=False, key=f"{key_prefix}_quality_a")
         hide_low_rs_non_vcp = st.checkbox("Hide defensive low-RS stocks", value=True, key=f"{key_prefix}_hide_low_rs")
-        only_true_vcp = st.checkbox("Show only true VCP", value=False, key=f"{key_prefix}_true_vcp")
+        only_true_vcp = st.checkbox("Show VCP only", value=False, key=f"{key_prefix}_true_vcp")
+        only_early_vcp = st.checkbox("Show Early VCP only", value=False, key=f"{key_prefix}_early_vcp")
+        only_watchlist = st.checkbox("Show Watchlist only", value=False, key=f"{key_prefix}_watchlist_only")
+        hide_resistance_blocked = st.checkbox("Hide Resistance Blocked", value=False, key=f"{key_prefix}_hide_resistance_blocked")
+        hide_reject = st.checkbox("Hide Reject", value=False, key=f"{key_prefix}_hide_reject")
         only_strong_pullbacks = st.checkbox("Show only pullback entries with RS >= 6", value=False, key=f"{key_prefix}_strong_pullbacks")
+        auto_refresh = st.checkbox("Auto refresh every 60 sec", value=False, key=f"{key_prefix}_auto_refresh")
         run_scan = st.button("Run Scan", type="primary", width="stretch", key=f"{key_prefix}_run")
+        force_refresh = st.button("Force Refresh Market Data", width="stretch", key=f"{key_prefix}_force_refresh")
 
-    if run_scan:
+    if auto_refresh:
+        st.components.v1.html("<script>setTimeout(() => window.parent.location.reload(), 60000);</script>", height=0)
+
+    should_run_scan = run_scan or force_refresh or (
+        auto_refresh and f"{key_prefix}_results" in st.session_state and st.session_state.get(f"{key_prefix}_last_scan_mode") == scan_mode
+    )
+
+    if should_run_scan:
         if not tickers:
             st.info("Choose a preset universe or enter custom tickers.")
             return
 
         with st.spinner("Downloading daily data and preparing trade plans..."):
+            clear_market_data_cache()
             results, indicator_data, summary = scan_universe(
                 tickers=tickers,
                 mode=scan_mode,
@@ -4200,7 +4675,12 @@ def render_swing_scanner(
         "Explosive Score",
         "Explosive Label",
         "Setup Quality Grade",
+        "VCP Status",
+        "VCP Label",
+        "Contractions",
+        "Volume Dry-Up",
         "Why Selected",
+        "Decision Reason",
         "WATCHLIST FLAG",
         "Watchlist Reason",
         "Breakout Alert",
@@ -4216,6 +4696,37 @@ def render_swing_scanner(
         "TP Quality Score",
         "Ideal TP R",
         "Risk Note",
+        "Resistance Blocked",
+        "Resistance Breakout Mode",
+        "Breakout Above Resistance Trigger",
+        "Resistance Breakout Entry",
+        "Resistance Breakout Stop",
+        "Resistance Breakout 1R",
+        "Resistance Breakout 2R",
+        "Resistance Breakout 3R",
+        "Resistance Breakout Risk %",
+        "Current Price",
+        "% Change",
+        "Premarket Price",
+        "Afterhours Price",
+        "Today's Volume",
+        "Relative Volume",
+        "52-week high",
+        "Distance From High %",
+        "Current Setup Status",
+        "Last Updated",
+        "Local Last Updated",
+        "Market Session",
+        "Latest Candle Date",
+        "Dataframe Last Index",
+        "Fetched Rows",
+        "Quote Source",
+        "Quote Time",
+        "Quote Applied To Candle",
+        "Data Stale",
+        "Data Warning",
+        "Chart Sync",
+        "Chart/Quote Mismatch %",
         "AI Trading Notes",
     }
 
@@ -4227,6 +4738,9 @@ def render_swing_scanner(
     market_score = summary.get("market_score", 0)
     market_status = summary.get("market_status", "N/A")
     sector_score = summary.get("sector_score", 0)
+    session_status = summary.get("session_status", "N/A")
+    market_timestamp = summary.get("market_timestamp", "N/A")
+    local_timestamp = summary.get("local_timestamp", "N/A")
 
     metric_cols = st.columns(5)
     metric_cols[0].metric("Market Status", market_status)
@@ -4246,6 +4760,14 @@ def render_swing_scanner(
     high_earnings_count = int((results["Earnings Risk"] == "HIGH RISK").sum())
     if high_earnings_count:
         st.warning(f"Earnings risk active: {high_earnings_count} stocks report within 7 days.")
+    extended_note = "Premarket data included" if session_status == "PREMARKET" else "Afterhours data included" if session_status == "AFTER HOURS" else session_status
+    st.caption(f"Last updated: {market_timestamp} | Local: {local_timestamp} | Session: {session_status} | {extended_note}")
+    stale_count = int((results["Data Stale"] == "YES").sum()) if "Data Stale" in results else 0
+    sync_error_count = int((results["Chart Sync"] == "Chart sync error").sum()) if "Chart Sync" in results else 0
+    if stale_count:
+        st.warning(f"Data stale - refresh required: {stale_count} ticker(s) have latest candles older than one trading day.")
+    if sync_error_count:
+        st.error(f"Chart sync error: {sync_error_count} ticker(s) have quote/chart mismatch above 2%.")
 
     with st.expander("Market and filter details", expanded=True):
         st.write("Market:", " | ".join(summary.get("market_details", [])) or "No market data yet.")
@@ -4282,6 +4804,14 @@ def render_swing_scanner(
         visible = visible[~((visible["VCP Status"] == "NOT VCP") & (visible["RS Score"] < 5))]
     if only_true_vcp:
         visible = visible[visible["VCP Status"].isin(["VALID VCP", "EARLY VCP"])]
+    if only_early_vcp:
+        visible = visible[visible["VCP Status"] == "EARLY VCP"]
+    if only_watchlist:
+        visible = visible[visible["WATCHLIST FLAG"] == "YES"]
+    if hide_resistance_blocked:
+        visible = visible[visible["Resistance Blocked"] != "YES"]
+    if hide_reject:
+        visible = visible[visible["Setup Quality Grade"] != "Reject"]
     if only_strong_pullbacks:
         visible = visible[(visible["Action Label"] == "PULLBACK ENTRY") & (visible["RS Score"] >= 6)]
 
@@ -4298,12 +4828,24 @@ def render_swing_scanner(
     compact_columns = [
         "ticker",
         "close",
-        "Setup Quality Grade",
+        "VCP Status",
+        "VCP Label",
+        "Contractions",
+        "Volume Dry-Up",
+        "RS Score",
+        "Final Score",
+        "Trend Score",
+        "Technical Score",
+        "Tightness Score",
         "Explosive Score",
+        "Setup Quality Grade",
         "Trade",
         "WATCHLIST FLAG",
         "Action Label",
         "Breakout Alert",
+        "Decision Reason",
+        "Current Price",
+        "Current Setup Status",
         "Entry Trigger",
         "Stop Loss",
         "Risk %",
@@ -4311,25 +4853,38 @@ def render_swing_scanner(
         "Target 2R",
         "Target 3R",
         "Nearest Resistance",
+        "Resistance Blocked",
+        "Resistance Breakout Mode",
+        "Breakout Above Resistance Trigger",
         "Ideal TP",
         "Ideal TP Reason",
         "Sell Strategy",
         "Trail Stop Level",
         "TP Quality Score",
+        "Data Warning",
+        "Chart Sync",
         "Why Selected",
     ]
     diagnostic_columns = compact_columns + [
-        "Final Score",
+        "% Change",
+        "Premarket Price",
+        "Afterhours Price",
+        "Today's Volume",
+        "Relative Volume",
+        "52-week high",
+        "Distance From High %",
         "Explosive Label",
         "Earnings Date",
         "Earnings Risk",
         "Earnings Setup Score",
-        "Trend Score",
-        "Technical Score",
-        "RS Score",
-        "Tightness Score",
         "RR Score",
         "Pivot",
+        "Resistance Breakout Entry",
+        "Resistance Breakout Stop",
+        "Resistance Breakout 1R",
+        "Resistance Breakout 2R",
+        "Resistance Breakout 3R",
+        "Resistance Breakout Risk %",
         "Ideal TP R",
         "Risk Note",
         "AI Trading Notes",
@@ -4340,8 +4895,7 @@ def render_swing_scanner(
         "Sector ETF",
         "Sector Leadership",
         "Market Score",
-        "VCP Status",
-        "Contractions",
+        "volume contraction",
         "Distance to Pivot %",
         "Tightness Label",
         "RR Ratio",
@@ -4356,6 +4910,17 @@ def render_swing_scanner(
         "Earnings Trend",
         "Earnings Strategy",
         "Post-Earnings Label",
+        "Last Updated",
+        "Local Last Updated",
+        "Market Session",
+        "Latest Candle Date",
+        "Dataframe Last Index",
+        "Fetched Rows",
+        "Quote Source",
+        "Quote Time",
+        "Quote Applied To Candle",
+        "Data Stale",
+        "Chart/Quote Mismatch %",
         "Notes",
     ]
     display_columns = diagnostic_columns if show_full_diagnostics else compact_columns
@@ -4370,31 +4935,37 @@ def render_swing_scanner(
         ascending=[True, False, False, False, True, False],
     )
     watchlist_focus = focus_source[
-        (focus_source["WATCHLIST FLAG"] == "YES") & (focus_source["Trade"] != "YES")
+        (focus_source["WATCHLIST FLAG"] == "YES")
+        & (focus_source["Trade"] != "YES")
+        & (focus_source["Resistance Breakout Mode"] != "RESISTANCE BREAKOUT WATCH")
     ].sort_values(
         ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
         ascending=[True, False, False, False, True, False],
     )
-    pullback_focus = focus_source[focus_source["Action Label"] == "PULLBACK ENTRY"].copy()
-    if not pullback_focus.empty:
-        pullback_focus["Pullback Reason"] = pullback_focus["Trade Reason"]
-        pullback_focus.loc[pullback_focus["WATCHLIST FLAG"] == "YES", "Pullback Reason"] = pullback_focus[
-            "Watchlist Reason"
-        ]
-        pullback_focus.loc[pullback_focus["Trade"] == "YES", "Pullback Reason"] = pullback_focus["Trade Reason"]
-        pullback_focus = pullback_focus.sort_values(
-            ["quality sort", "trade sort", "watchlist sort", "Explosive Score", "RS Score", "Tightness Score", "Risk %", "Final Score"],
-            ascending=[True, True, True, False, False, False, True, False],
-        )
+    resistance_focus = focus_source[
+        focus_source["Resistance Breakout Mode"] == "RESISTANCE BREAKOUT WATCH"
+    ].sort_values(
+        ["quality sort", "Explosive Score", "RS Score", "Tightness Score", "Resistance Breakout Risk %", "Final Score"],
+        ascending=[True, False, False, False, True, False],
+    )
+    rejected_focus = focus_source[
+        (focus_source["Setup Quality Grade"] == "Reject")
+        | (focus_source["Action Label"].isin(["FAILED", "EXTENDED"]))
+    ].sort_values(
+        ["quality sort", "Risk %", "Final Score"],
+        ascending=[True, True, False],
+    )
 
     st.subheader("Daily Focus Summary")
-    focus_cols = st.columns(3)
+    focus_cols = st.columns(4)
     with focus_cols[0]:
-        show_focus_group("Trade YES", trade_focus, "Trade Reason")
+        show_focus_group("Top Trade Now", trade_focus, "Decision Reason")
     with focus_cols[1]:
-        show_focus_group("Watchlist Setups", watchlist_focus, "Watchlist Reason")
+        show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
     with focus_cols[2]:
-        show_focus_group("Best Pullback Candidates", pullback_focus, "Pullback Reason")
+        show_focus_group("Top Breakout Above Resistance", resistance_focus, "Decision Reason")
+    with focus_cols[3]:
+        show_focus_group("Rejected / Avoid", rejected_focus, "Decision Reason")
 
     st.subheader("Best Setups")
     if visible.empty:
@@ -4406,11 +4977,37 @@ def render_swing_scanner(
             width="stretch",
             hide_index=True,
         )
+        export_frame = round_display_values(visible[display_columns])
+        st.download_button(
+            "Export scanner table CSV",
+            data=export_frame.to_csv(index=False).encode("utf-8"),
+            file_name=f"{key_prefix}_vcp_scan.csv",
+            mime="text/csv",
+            width="stretch",
+        )
 
     selectable = visible if not visible.empty else results
     selected_ticker = st.selectbox("Review ticker", selectable["ticker"].tolist(), key=f"{key_prefix}_review")
     selected_row = results[results["ticker"] == selected_ticker].iloc[0]
     selected_data = indicator_data.get(selected_ticker)
+
+    st.subheader("Live Quote & Data Sync")
+    live_cols = st.columns(6)
+    live_cols[0].metric("Current Price", f"${float(selected_row['Current Price']):.2f}" if pd.to_numeric(selected_row["Current Price"], errors="coerce") == pd.to_numeric(selected_row["Current Price"], errors="coerce") else "N/A", selected_row["% Change"])
+    live_cols[1].metric("Premarket", selected_row["Premarket Price"])
+    live_cols[2].metric("Afterhours", selected_row["Afterhours Price"])
+    live_cols[3].metric("52W High", selected_row["52-week high"], f"{selected_row['Distance From High %']}%")
+    live_cols[4].metric("Volume", selected_row["Today's Volume"], f"RelVol {selected_row['Relative Volume']}")
+    live_cols[5].metric("Setup Status", selected_row["Current Setup Status"])
+    st.caption(
+        f"Latest candle: {selected_row['Latest Candle Date']} | Dataframe last index: {selected_row['Dataframe Last Index']} | "
+        f"Rows: {selected_row['Fetched Rows']} | Quote source: {selected_row['Quote Source']} | Quote time: {selected_row['Quote Time']} | "
+        f"Quote applied to candle: {selected_row['Quote Applied To Candle']}"
+    )
+    if selected_row["Data Stale"] == "YES":
+        st.warning("Data stale - refresh required")
+    if selected_row["Chart Sync"] == "Chart sync error":
+        st.error(f"Chart sync error: latest quote and chart close differ by {selected_row['Chart/Quote Mismatch %']}%.")
 
     chart_col, plan_col = st.columns([2, 1])
     with chart_col:
@@ -4421,6 +5018,7 @@ def render_swing_scanner(
         st.subheader("Trade Plan")
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
+        st.metric("Decision", selected_row["VCP Label"], selected_row["Decision Reason"])
         st.metric("Setup Quality", selected_row["Setup Quality Grade"], selected_row["Why Selected"])
         st.metric("Explosive Score", f"{selected_row['Explosive Score']}/10", selected_row["Explosive Label"])
         st.metric("Watchlist", selected_row["WATCHLIST FLAG"], selected_row["Watchlist Reason"])
@@ -4437,6 +5035,13 @@ def render_swing_scanner(
         st.write(f"Earnings: {selected_row['Earnings Risk']}")
         st.write(f"RR: {selected_row['RR Ratio']} ({selected_row['RR Score']})")
         st.write(f"Nearest resistance: ${selected_row['Nearest Resistance']:.2f}")
+        if selected_row["Resistance Breakout Mode"] == "RESISTANCE BREAKOUT WATCH":
+            st.write(
+                f"Resistance breakout trigger: ${selected_row['Breakout Above Resistance Trigger']:.2f}; "
+                f"new stop ${selected_row['Resistance Breakout Stop']:.2f}; "
+                f"new 1R/2R/3R ${selected_row['Resistance Breakout 1R']:.2f}/"
+                f"${selected_row['Resistance Breakout 2R']:.2f}/${selected_row['Resistance Breakout 3R']:.2f}"
+            )
         st.write(f"Tightness: {selected_row['Tightness Score']}/5, {selected_row['Tightness Label']}")
         st.write(f"VCP: {selected_row['VCP Status']} ({selected_row['Contractions']})")
         st.write(f"Pivot: ${selected_row['Pivot']:.2f}, distance {selected_row['Distance to Pivot %']:.2f}%")
