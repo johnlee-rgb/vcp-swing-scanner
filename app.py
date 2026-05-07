@@ -2082,7 +2082,7 @@ def determine_signal_state(
             "EXTENDED DO NOT CHASE",
             "NO",
             "NO",
-            "EXTENDED DO NOT CHASE: risk is above 10%.",
+            "EXTENDED DO NOT CHASE: risk is above 12%.",
             "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
         )
     if pd.notna(rsi) and rsi > 85 and not exceptional_volume:
@@ -2092,6 +2092,34 @@ def determine_signal_state(
             "NO",
             "EXTENDED DO NOT CHASE: RSI is stretched without exceptional volume.",
             "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+        )
+
+    earnings_block_candidate = (
+        earnings_risk_label == "HIGH RISK"
+        and setup_a
+        and final_score >= 85
+        and rs_buy_ok
+        and explosive_score >= 7
+        and structure_valid
+        and (breakout_state or near_pivot or near_resistance or action == "PULLBACK ENTRY")
+    )
+    if earnings_block_candidate:
+        return (
+            "WATCH",
+            "NO",
+            "YES",
+            "WATCH: strong setup but earnings risk high.",
+            "WATCH: strong setup but earnings risk high.",
+        )
+
+    borderline_risk = pd.notna(risk_pct) and 10 < risk_pct <= 12
+    if borderline_risk and structure_valid and setup_grade != "Reject":
+        return (
+            "WATCH",
+            "NO",
+            "YES",
+            "WATCH: risk slightly above preferred 10% limit.",
+            "WATCH: risk slightly above preferred 10% limit.",
         )
 
     momentum_base = (
@@ -2430,6 +2458,59 @@ def calculate_breakout_quality_score(
         score -= 1
     if stage_label in {"LATE STAGE 2", "STAGE 3 RISK", "STAGE 4"}:
         score -= 1
+    return int(min(max(score, 0), 10))
+
+
+def calculate_eod_breakout_quality_score(
+    pivot: PivotInfo,
+    rs_score: float,
+    tightness_score: int,
+    volume_dry_up: bool,
+    stage_label: str,
+    risk_pct: float,
+    setup_grade: str,
+) -> int:
+    """Score EOD breakout quality without requiring intraday RVOL."""
+    score = 0
+    distance = pivot.distance_pct
+    if pd.notna(distance):
+        if pivot.label == "Breakout in progress" or -3 <= distance <= 3:
+            score += 2
+        elif 3 < distance <= 5:
+            score += 1
+
+    if score_at_least(rs_score, 8):
+        score += 2
+    elif score_at_least(rs_score, 6):
+        score += 1
+
+    if tightness_score >= 4:
+        score += 2
+    elif tightness_score >= 3:
+        score += 1
+    if volume_dry_up:
+        score += 1
+
+    if stage_label in {"EARLY STAGE 2", "MID STAGE 2"}:
+        score += 1
+    elif stage_label in {"STAGE 3 RISK", "STAGE 4"}:
+        score -= 2
+
+    if pd.notna(risk_pct):
+        if risk_pct <= 8:
+            score += 1
+        elif risk_pct > 10:
+            score -= 1
+
+    if setup_grade == "A+":
+        score += 2
+    elif setup_grade == "A":
+        score += 1
+    elif setup_grade == "C":
+        score -= 1
+    elif setup_grade == "Reject":
+        score -= 2
+
     return int(min(max(score, 0), 10))
 
 
@@ -3077,6 +3158,16 @@ def build_scan_row(
     if (not momentum_breakout_candidate) and quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
+    if not live_mode:
+        breakout_quality_score = calculate_eod_breakout_quality_score(
+            pivot=pivot,
+            rs_score=rs_score,
+            tightness_score=tightness_score,
+            volume_dry_up=vcp.volume_contraction,
+            stage_label=stage_label,
+            risk_pct=risk_pct,
+            setup_grade=quality_grade,
+        )
     live_breakout_status = (
         detect_live_breakout_status(
             latest=latest,
