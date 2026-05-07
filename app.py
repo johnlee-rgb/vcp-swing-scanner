@@ -2865,6 +2865,290 @@ def calculate_final_score(
     return round(min(max(score, 0), 100), 1)
 
 
+INSTITUTIONAL_LEADER_TICKERS = {
+    "NVDA", "AVGO", "TSM", "ASML", "AMD", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "GOOG",
+    "DELL", "SMCI", "ANET", "ARM", "LRCX", "KLAC", "AMAT", "PANW", "CRWD", "NOW", "TSLA",
+}
+STRONG_MIDCAP_LEADER_TICKERS = {"VRT", "APP", "PLTR", "NET", "DDOG", "SNOW", "COIN", "HOOD", "GEV", "VST", "CEG"}
+CYCLICAL_SECTOR_GROUPS = {"Energy", "Materials"}
+DEFENSIVE_SECTOR_GROUPS = {"Healthcare", "Utilities", "Consumer", "Real Estate"}
+LEADING_THEME_GROUPS = {
+    "AI / Semis",
+    "Power / Utilities",
+    "Nuclear / Uranium",
+    "Energy",
+    "Financials",
+    "Industrials",
+    "Crypto",
+    "Semiconductors",
+    "Technology",
+}
+
+
+def calculate_institutional_quality_score(
+    *,
+    ticker: str,
+    sector_info: dict,
+    sector_leadership: str,
+    sector_score: int,
+    latest: pd.Series,
+    rs_score: float,
+    trend_score: int,
+    stage_label: str,
+    volume_confirmation: str,
+    ma10_distance: float,
+    rsi: float,
+) -> int:
+    """Score whether institutions are likely to support the setup, without extra API calls."""
+    symbol = ticker.upper()
+    sector_group = sector_info.get("sector_group", "Other")
+    theme_group = sector_info.get("theme_group", sector_group)
+    industry_text = f"{sector_info.get('sector', '')} {sector_info.get('industry', '')} {theme_group}".lower()
+    score = 0
+
+    if theme_group in LEADING_THEME_GROUPS or sector_group in {"Semiconductors", "Technology", "Energy", "Financials", "Industrials"}:
+        score += 2
+    elif sector_leadership == "Leader" or sector_score >= 2:
+        score += 1
+
+    if symbol in INSTITUTIONAL_LEADER_TICKERS:
+        score += 2
+    elif symbol in STRONG_MIDCAP_LEADER_TICKERS or (score_at_least(rs_score, 7) and trend_score >= 7):
+        score += 1
+
+    avg_dollar_volume = latest.get("AvgDollarVol50", np.nan)
+    if pd.notna(avg_dollar_volume) and avg_dollar_volume >= 500_000_000:
+        score += 2
+    elif pd.notna(avg_dollar_volume) and avg_dollar_volume >= 50_000_000:
+        score += 1
+
+    catalyst_terms = ("ai", "data center", "semiconductor", "cloud", "cyber", "nuclear", "power", "bitcoin", "crypto")
+    if any(term in industry_text for term in catalyst_terms) or symbol in INSTITUTIONAL_LEADER_TICKERS:
+        score += 2
+    elif trend_score >= 6 and score_at_least(rs_score, 6):
+        score += 1
+
+    if theme_group in LEADING_THEME_GROUPS or sector_leadership == "Leader":
+        score += 2
+    elif sector_score >= 2:
+        score += 1
+
+    if sector_group in CYCLICAL_SECTOR_GROUPS and sector_leadership != "Leader" and sector_score < 3:
+        score -= 2
+    if stage_label in {"LATE STAGE 2", "STAGE 3 RISK"}:
+        score -= 2
+    if pd.notna(rsi) and rsi > 85 and pd.notna(ma10_distance) and ma10_distance > 8:
+        score -= 2
+    if volume_confirmation != "YES" and latest.get("Close", np.nan) > latest.get("MA10", np.inf):
+        score -= 1
+    if sector_group in DEFENSIVE_SECTOR_GROUPS and theme_group not in LEADING_THEME_GROUPS and sector_leadership != "Leader":
+        score -= 1
+
+    return int(min(max(score, 0), 10))
+
+
+def leader_quality_label(
+    *,
+    ticker: str,
+    sector_info: dict,
+    rs_score: float,
+    trend_score: int,
+    sector_leadership: str,
+    sector_score: int,
+    institutional_quality_score: int,
+) -> str:
+    """Classify market leadership context separately from chart quality."""
+    symbol = ticker.upper()
+    sector_group = sector_info.get("sector_group", "Other")
+    theme_group = sector_info.get("theme_group", sector_group)
+    strong_rs_trend = score_at_least(rs_score, 7) and trend_score >= 7
+    if symbol in INSTITUTIONAL_LEADER_TICKERS and strong_rs_trend and institutional_quality_score >= 7:
+        return "INSTITUTIONAL LEADER"
+    if (sector_leadership == "Leader" or sector_score >= 3 or sector_group == "Semiconductors") and strong_rs_trend:
+        return "SECTOR LEADER"
+    if score_at_least(rs_score, 8) and trend_score >= 6:
+        return "MOMENTUM LEADER"
+    if sector_group in CYCLICAL_SECTOR_GROUPS or theme_group in {"Energy", "Materials"}:
+        return "CYCLICAL BREAKOUT"
+    if sector_group in DEFENSIVE_SECTOR_GROUPS:
+        return "DEFENSIVE WATCH"
+    return "LAGGARD / AVOID" if not score_at_least(rs_score, 5) else "MOMENTUM LEADER"
+
+
+def adjusted_final_score(final_score: float, institutional_quality_score: int, sector_score: int, market_score: int) -> float:
+    """Blend chart score with institutional and market context for ranking."""
+    score = float(final_score) * 0.70 + institutional_quality_score * 3 + sector_score * 2 + market_score
+    return round(min(max(score, 0), 100), 1)
+
+
+def hard_reject_check(
+    *,
+    latest: pd.Series,
+    trend_score: int,
+    risk_pct: float,
+    action: str,
+    current_setup_status: str,
+    breakout_alert: str,
+    volume_confirmation: str,
+    earnings_risk_label: str,
+) -> Tuple[bool, str]:
+    """Only reject when there is a real structural or risk failure."""
+    if pd.isna(risk_pct):
+        return True, "REJECT: invalid risk calculation."
+    if risk_pct > 15:
+        return True, "REJECT: risk above 15%."
+    if latest.get("Close", np.nan) < latest.get("MA50", np.nan):
+        return True, "REJECT: price below MA50; structure broken."
+    if action == "FAILED" or current_setup_status == "FAILED BREAKOUT":
+        return True, "REJECT: failed breakout / broken structure."
+    if trend_score < 3 and latest.get("Close", np.nan) < latest.get("MA150", np.nan):
+        return True, "REJECT: trend template failed."
+    if breakout_alert == "FAILED BREAKOUT" and volume_confirmation == "YES":
+        return True, "REJECT: failed breakout on heavy volume."
+    if earnings_risk_label == "HIGH RISK":
+        return True, "REJECT: earnings risk high for a new entry."
+    avg_dollar_volume = latest.get("AvgDollarVol50", np.nan)
+    if pd.notna(avg_dollar_volume) and avg_dollar_volume < 20_000_000:
+        return True, "REJECT: liquidity too low."
+    return False, ""
+
+
+def institutional_decision_reason(
+    *,
+    signal_state: str,
+    ticker: str,
+    leader_label: str,
+    setup_type: str,
+    sector_group: str,
+    breakout_alert: str,
+    rs_score: float,
+    risk_pct: float,
+    volume_confirmation: str,
+    institutional_quality_score: int,
+) -> str:
+    """Generate a specific final decision reason without generic false rejection wording."""
+    if signal_state == "BUY NOW":
+        if leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}:
+            return f"BUY NOW: institutional {sector_group.lower()} leader, breakout confirmed, strong RS, risk controlled."
+        if leader_label == "CYCLICAL BREAKOUT":
+            return "BUY NOW: strong technical breakout, but cyclical sector; monitor RSI and volume."
+        return "BUY NOW: strong setup, breakout confirmed, RS strong, risk controlled."
+    if setup_type == "MOMENTUM BREAKOUT EXCEPTION":
+        prefix = "BUY ON BREAKOUT" if signal_state == "BUY ON BREAKOUT" else "WATCH"
+        return f"{prefix}: high RS leader, not pure VCP but valid momentum setup."
+    if signal_state == "BUY ON BREAKOUT":
+        return "BUY ON BREAKOUT: near pivot, wait for volume confirmation."
+    if signal_state == "WATCH":
+        return "WATCH: good institutional/technical context, wait for clean trigger."
+    if signal_state == "WAIT PULLBACK":
+        return "WAIT PULLBACK: setup is strong but entry is stretched; wait for MA10/MA20 support."
+    if signal_state == "EXTENDED DO NOT CHASE":
+        return "EXTENDED: wait for pullback, do not chase."
+    return "REJECT: actual hard reject condition triggered."
+
+
+def apply_institutional_decision_layer(
+    *,
+    signal_state: str,
+    trade: str,
+    watchlist_flag: str,
+    quality_grade: str,
+    decision_reason: str,
+    setup_type: str,
+    vcp_status: str,
+    final_score: float,
+    adjusted_score: float,
+    institutional_quality_score: int,
+    rs_score: float,
+    risk_pct: float,
+    breakout_quality_score: int,
+    breakout_alert: str,
+    volume_confirmation: str,
+    hard_reject: bool,
+    hard_reject_reason: str,
+    momentum_breakout_candidate: bool,
+    ma10_distance: float,
+    rsi: float,
+    leader_label: str,
+) -> Tuple[str, str, str, str, str]:
+    """Apply final hierarchy so generic reject cannot overwrite high-quality setups."""
+    protected = (
+        (score_at_least(rs_score, 8) and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 10)
+        or vcp_status in {"VALID VCP", "EARLY VCP"}
+        or setup_type == "MOMENTUM BREAKOUT EXCEPTION"
+        or momentum_breakout_candidate
+    )
+    if hard_reject:
+        return "REJECT", "NO", "NO", "Reject", hard_reject_reason
+
+    if signal_state == "REJECT" and protected:
+        if breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}:
+            signal_state = "BUY ON BREAKOUT"
+        else:
+            signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        if quality_grade == "Reject":
+            quality_grade = "A" if setup_type == "MOMENTUM BREAKOUT EXCEPTION" or vcp_status in {"VALID VCP", "EARLY VCP"} else "B"
+
+    if signal_state == "BUY NOW":
+        buy_now_ok = (
+            pd.notna(risk_pct)
+            and risk_pct <= 10
+            and score_at_least(rs_score, 7)
+            and final_score >= 85
+            and adjusted_score >= 85
+            and breakout_quality_score >= 6
+        )
+        if setup_type == "MOMENTUM BREAKOUT EXCEPTION" or momentum_breakout_candidate:
+            buy_now_ok = (
+                buy_now_ok
+                and score_at_least(rs_score, 8)
+                and final_score >= 90
+                and institutional_quality_score >= 6
+                and breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
+                and pd.notna(ma10_distance)
+                and ma10_distance <= 12
+            )
+        if not buy_now_ok:
+            signal_state = "BUY ON BREAKOUT" if breakout_alert in {"NEAR BREAKOUT", "CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"} else "WATCH"
+            trade = "NO"
+            watchlist_flag = "YES"
+
+    if signal_state == "BUY NOW":
+        trade = "YES"
+        watchlist_flag = "NO"
+    elif signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
+        trade = "NO"
+        watchlist_flag = "YES"
+    elif signal_state == "EXTENDED DO NOT CHASE":
+        trade = "NO"
+        watchlist_flag = "NO"
+
+    if pd.notna(rsi) and rsi > 85 and leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"} and volume_confirmation == "YES" and signal_state == "EXTENDED DO NOT CHASE":
+        signal_state = "WAIT PULLBACK"
+        trade = "NO"
+        watchlist_flag = "YES"
+
+    return signal_state, trade, watchlist_flag, quality_grade, decision_reason
+
+
+def decision_engine_regression_checks() -> None:
+    """Document the final hierarchy invariants for future tests."""
+    assert not hard_reject_check(
+        latest=pd.Series({"Close": 100, "MA50": 90, "MA150": 80, "AvgDollarVol50": 100_000_000}),
+        trend_score=7,
+        risk_pct=9,
+        action="READY",
+        current_setup_status="ACTIVE BREAKOUT",
+        breakout_alert="CONFIRMED BREAKOUT",
+        volume_confirmation="YES",
+        earnings_risk_label="LOW RISK",
+    )[0]
+    adjusted = adjusted_final_score(90, 8, 3, 3)
+    assert adjusted >= 85
+
+
 def decide_trade(
     action: str,
     technical_score: int,
@@ -3115,6 +3399,29 @@ def build_scan_row(
         rvol, intraday_volume_ratio, rvol_label = np.nan, np.nan, "EOD only"
     stage_label = detect_stage_analysis(data)
     institutional_action = detect_institutional_action(data)
+    institutional_quality_score = calculate_institutional_quality_score(
+        ticker=ticker,
+        sector_info=sector_info,
+        sector_leadership=sector_leadership,
+        sector_score=sector_score,
+        latest=latest,
+        rs_score=rs_score,
+        trend_score=trend_score,
+        stage_label=stage_label,
+        volume_confirmation=volume_confirmation,
+        ma10_distance=ma10_distance,
+        rsi=float(latest["RSI14"]),
+    )
+    leader_label = leader_quality_label(
+        ticker=ticker,
+        sector_info=sector_info,
+        rs_score=rs_score,
+        trend_score=trend_score,
+        sector_leadership=sector_leadership,
+        sector_score=sector_score,
+        institutional_quality_score=institutional_quality_score,
+    )
+    adjusted_score = adjusted_final_score(final_score, institutional_quality_score, sector_score, market_score)
     breakout_quality_score = calculate_breakout_quality_score(
         data=data,
         pivot=pivot,
@@ -3390,6 +3697,60 @@ def build_scan_row(
     if signal_state == "BUY NOW" and setup_type == "MOMENTUM BREAKOUT EXCEPTION":
         sell_strategy = "HOLD TO 3R IF VOLUME HOLDS" if explosive_score >= 9 else "PARTIAL AT 2R, TRAIL REST"
 
+    hard_reject, hard_reject_reason = hard_reject_check(
+        latest=latest,
+        trend_score=trend_score,
+        risk_pct=risk_pct,
+        action=action,
+        current_setup_status=current_setup_status,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
+        earnings_risk_label=earnings_label,
+    )
+    signal_state, trade, watchlist_flag, quality_grade, decision_reason = apply_institutional_decision_layer(
+        signal_state=signal_state,
+        trade=trade,
+        watchlist_flag=watchlist_flag,
+        quality_grade=quality_grade,
+        decision_reason=decision_reason,
+        setup_type=setup_type,
+        vcp_status=vcp.status,
+        final_score=final_score,
+        adjusted_score=adjusted_score,
+        institutional_quality_score=institutional_quality_score,
+        rs_score=rs_score,
+        risk_pct=risk_pct,
+        breakout_quality_score=breakout_quality_score,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
+        hard_reject=hard_reject,
+        hard_reject_reason=hard_reject_reason,
+        momentum_breakout_candidate=momentum_breakout_candidate,
+        ma10_distance=ma10_distance,
+        rsi=float(latest["RSI14"]),
+        leader_label=leader_label,
+    )
+    decision_reason = hard_reject_reason if hard_reject else institutional_decision_reason(
+        signal_state=signal_state,
+        ticker=ticker,
+        leader_label=leader_label,
+        setup_type=setup_type,
+        sector_group=sector_info.get("sector_group", "Other"),
+        breakout_alert=breakout_alert,
+        rs_score=rs_score,
+        risk_pct=risk_pct,
+        volume_confirmation=volume_confirmation,
+        institutional_quality_score=institutional_quality_score,
+    )
+    trade_reason = decision_reason
+    watchlist_reason = decision_reason if watchlist_flag == "YES" else "Already Trade YES" if trade == "YES" else decision_reason
+    if signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
+        sell_strategy = "WAIT FOR ENTRY"
+    elif signal_state == "REJECT":
+        sell_strategy = "AVOID / NO TRADE"
+    elif signal_state == "BUY NOW" and setup_type == "MOMENTUM BREAKOUT EXCEPTION":
+        sell_strategy = "HOLD TO 3R IF VOLUME HOLDS" if explosive_score >= 9 else "PARTIAL AT 2R, TRAIL REST"
+
     vcp_label = classify_vcp_label(vcp.status, action, current_setup_status, resistance_breakout_mode)
     if setup_type == "MOMENTUM BREAKOUT EXCEPTION":
         vcp_label = "Momentum Breakout Candidate"
@@ -3419,12 +3780,13 @@ def build_scan_row(
         resistance_breakout_mode=resistance_breakout_mode,
         pivot=pivot,
     )
-    if signal_state == "BUY ON BREAKOUT":
+    if watch_type == "MOMENTUM WATCH" or setup_type == "MOMENTUM BREAKOUT EXCEPTION":
+        prefix = "BUY ON BREAKOUT" if signal_state == "BUY ON BREAKOUT" else "WATCH"
+        decision_reason = f"{prefix}: high RS leader, not pure VCP but valid momentum setup"
+    elif signal_state == "BUY ON BREAKOUT":
         decision_reason = "BUY ON BREAKOUT: near pivot, wait for volume confirmation"
     elif signal_state == "WATCH" and watch_type in {"PULLBACK TO MA10", "PULLBACK TO MA20"}:
         decision_reason = "WATCH - Pullback: wait for MA10/MA20 support confirmation"
-    elif signal_state == "WATCH" and watch_type == "MOMENTUM WATCH":
-        decision_reason = "WATCH - Momentum: high RS leader, wait for clean breakout"
     elif signal_state == "EXTENDED DO NOT CHASE":
         decision_reason = "EXTENDED: wait for pullback, do not chase"
 
@@ -3499,6 +3861,9 @@ def build_scan_row(
         "Market Score": market_score,
         "Market Environment": market_environment,
         "Final Score": final_score,
+        "Adjusted Final Score": adjusted_score,
+        "Institutional Quality Score": institutional_quality_score,
+        "Leader Quality Label": leader_label,
         "Breakout Quality Score": breakout_quality_score,
         "Stage Analysis": stage_label,
         "Institutional Action": institutional_action,
@@ -3804,6 +4169,12 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["Ideal TP R"] = 0
     if "Breakout Quality Score" not in ranked:
         ranked["Breakout Quality Score"] = 0
+    if "Adjusted Final Score" not in ranked:
+        ranked["Adjusted Final Score"] = ranked.get("Final Score", 0)
+    if "Institutional Quality Score" not in ranked:
+        ranked["Institutional Quality Score"] = 0
+    if "Leader Quality Label" not in ranked:
+        ranked["Leader Quality Label"] = "LAGGARD / AVOID"
     if "RVOL" not in ranked:
         ranked["RVOL"] = 0
     ranked["RS Sort"] = pd.to_numeric(ranked.get("RS Score Raw", ranked.get("RS Score")), errors="coerce")
@@ -3848,6 +4219,8 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "trade sort",
             "vcp sort",
             "breakout sort",
+            "Adjusted Final Score",
+            "Institutional Quality Score",
             "Breakout Quality Score",
             "RVOL Sort",
             "Explosive Score",
@@ -3859,7 +4232,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Final Score",
             "earnings sort",
         ],
-        ascending=[True, True, True, True, False, False, False, False, False, False, False, True, False, True],
+        ascending=[True, True, True, True, False, False, False, False, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -6071,6 +6444,9 @@ def render_swing_scanner(
         "Volume Confirmation",
         "Earnings Risk",
         "Final Score",
+        "Adjusted Final Score",
+        "Institutional Quality Score",
+        "Leader Quality Label",
         "Explosive Score",
         "Explosive Label",
         "Setup Quality Grade",
@@ -6330,19 +6706,30 @@ def render_swing_scanner(
     quality_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
+    visible["sector leadership sort"] = visible["Sector Leadership"].map({"Leader": 0, "Average": 1, "Laggard": 2}).fillna(3)
     visible = visible.sort_values(
-        ["signal sort", "quality sort", "Breakout Quality Score", "Final Score", "RVOL Sort", "RS Sort", "Risk %"],
-        ascending=[True, True, False, False, False, False, True],
+        [
+            "signal sort",
+            "Adjusted Final Score",
+            "Institutional Quality Score",
+            "RS Sort",
+            "Breakout Quality Score",
+            "Risk %",
+            "sector leadership sort",
+        ],
+        ascending=[True, False, False, False, False, True, True],
     )
 
     compact_columns = [
         "ticker",
         "Sector / Industry",
+        "Leader Quality Label",
         "Setup Type",
         "Signal State",
-        "Watch Type",
         "Trade",
         "Final Score",
+        "Adjusted Final Score",
+        "Institutional Quality Score",
         "Breakout Quality Score",
         "RS Score",
         "Risk %",
@@ -6359,6 +6746,7 @@ def render_swing_scanner(
         "Theme Group",
         "Sector Raw",
         "Industry Raw",
+        "Watch Type",
         "VCP Label",
         "Contractions",
         "Volume Dry-Up",
@@ -6458,34 +6846,34 @@ def render_swing_scanner(
     focus_source["quality sort"] = focus_source["Setup Quality Grade"].map(quality_priority).fillna(9)
 
     buy_now_focus = focus_source[focus_source["Signal State"] == "BUY NOW"].sort_values(
-        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, False, True],
     )
     buy_breakout_focus = focus_source[focus_source["Signal State"] == "BUY ON BREAKOUT"].sort_values(
-        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, False, True],
     )
     watchlist_focus = focus_source[
         (focus_source["Signal State"] == "WATCH")
         & (focus_source["Setup Type"] != "MOMENTUM BREAKOUT EXCEPTION")
         & (focus_source["Setup Type"] != "RESISTANCE BREAKOUT WATCH")
     ].sort_values(
-        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, False, True],
     )
     momentum_focus = focus_source[
         focus_source["Setup Type"] == "MOMENTUM BREAKOUT EXCEPTION"
     ].sort_values(
-        ["signal sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["signal sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, False, True],
     )
     pullback_focus = focus_source[focus_source["Setup Type"].isin(["PULLBACK TO MA10", "PULLBACK TO MA20"])].sort_values(
-        ["signal sort", "quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, True, False, False, False, True],
+        ["signal sort", "quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, True, False, False, False, False, False, True],
     )
     extended_focus = focus_source[focus_source["Signal State"] == "EXTENDED DO NOT CHASE"].sort_values(
-        ["quality sort", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, False, True],
     )
     resistance_focus = focus_source[
         focus_source["Setup Type"] == "RESISTANCE BREAKOUT WATCH"
@@ -6498,8 +6886,8 @@ def render_swing_scanner(
         | (focus_source["Setup Quality Grade"] == "Reject")
         | (focus_source["Action Label"] == "FAILED")
     ].sort_values(
-        ["quality sort", "Risk %", "Final Score"],
-        ascending=[True, True, False],
+        ["quality sort", "Risk %", "Adjusted Final Score", "Final Score"],
+        ascending=[True, True, False, False],
     )
 
     st.subheader("Daily Focus Summary")
