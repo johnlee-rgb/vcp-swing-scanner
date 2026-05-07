@@ -2075,7 +2075,7 @@ def determine_signal_state(
             "NO",
             "NO",
             "EXTENDED DO NOT CHASE: price too far above MA10.",
-            "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+            "EXTENDED: wait for pullback, do not chase.",
         )
     if risk_too_high:
         return (
@@ -2083,7 +2083,7 @@ def determine_signal_state(
             "NO",
             "NO",
             "EXTENDED DO NOT CHASE: risk is above 12%.",
-            "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+            "EXTENDED: wait for pullback, do not chase.",
         )
     if pd.notna(rsi) and rsi > 85 and not exceptional_volume:
         return (
@@ -2091,7 +2091,7 @@ def determine_signal_state(
             "NO",
             "NO",
             "EXTENDED DO NOT CHASE: RSI is stretched without exceptional volume.",
-            "EXTENDED DO NOT CHASE: price too far above MA10 or risk too high.",
+            "EXTENDED: wait for pullback, do not chase.",
         )
 
     earnings_block_candidate = (
@@ -2151,8 +2151,8 @@ def determine_signal_state(
             "BUY ON BREAKOUT",
             "NO",
             "YES",
-            "BUY ON BREAKOUT: high RS momentum setup, waiting for volume confirmation.",
-            "BUY ON BREAKOUT: high RS momentum setup, waiting for volume confirmation.",
+            "BUY ON BREAKOUT: high RS momentum setup, wait for clean breakout with volume.",
+            "BUY ON BREAKOUT: high RS momentum setup, wait for clean breakout with volume.",
         )
 
     common_buy = (
@@ -2204,8 +2204,8 @@ def determine_signal_state(
             "BUY ON BREAKOUT",
             "NO",
             "YES",
-            "BUY ON BREAKOUT: wait for price to break pivot/resistance with volume.",
-            "BUY ON BREAKOUT: strong setup but needs volume confirmation.",
+            "BUY ON BREAKOUT: near pivot, wait for volume confirmation.",
+            "BUY ON BREAKOUT: near pivot, wait for volume confirmation.",
         )
 
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
@@ -2213,16 +2213,16 @@ def determine_signal_state(
             "WATCH",
             "NO",
             "YES",
-            "WATCH: resistance blocks clean entry; needs breakout above resistance.",
-            "WATCH: good structure but no clean trigger yet.",
+            "WATCH: resistance blocks clean entry; wait for breakout above resistance.",
+            "WATCH: good setup, wait for trigger.",
         )
     if action == "EXTENDED":
         return (
             "WAIT PULLBACK",
             "NO",
             "YES",
-            "WAIT PULLBACK: extended from MA10, wait for MA10/MA20 support.",
-            "WAIT PULLBACK: extended from MA10, wait for MA10/MA20 support.",
+            "WATCH - Pullback: wait for MA10/MA20 support confirmation.",
+            "WATCH - Pullback: wait for MA10/MA20 support confirmation.",
         )
     watchlist_quality = (
         structure_valid
@@ -2239,7 +2239,7 @@ def determine_signal_state(
             "NO",
             "YES",
             "WATCH: good setup, wait for trigger.",
-            "WATCH: good structure but no clean trigger yet.",
+            "WATCH: good setup, wait for trigger.",
         )
     return (
         "REJECT",
@@ -2467,8 +2467,11 @@ def calculate_eod_breakout_quality_score(
     tightness_score: int,
     volume_dry_up: bool,
     stage_label: str,
+    institutional_action: str,
     risk_pct: float,
     setup_grade: str,
+    vcp_status: str,
+    setup_type: str,
 ) -> int:
     """Score EOD breakout quality without requiring intraday RVOL."""
     score = 0
@@ -2491,10 +2494,20 @@ def calculate_eod_breakout_quality_score(
     if volume_dry_up:
         score += 1
 
+    if vcp_status == "VALID VCP" or setup_type == "TRUE VCP":
+        score += 2
+    elif vcp_status == "EARLY VCP" or setup_type in {"EARLY VCP", "BASE BUILDING", "PULLBACK TO MA10", "PULLBACK TO MA20"}:
+        score += 1
+
     if stage_label in {"EARLY STAGE 2", "MID STAGE 2"}:
         score += 1
     elif stage_label in {"STAGE 3 RISK", "STAGE 4"}:
         score -= 2
+
+    if institutional_action in {"ACCUMULATION", "SUPPORTING ACTION"}:
+        score += 1
+    elif institutional_action == "DISTRIBUTION":
+        score -= 1
 
     if pd.notna(risk_pct):
         if risk_pct <= 8:
@@ -2512,6 +2525,37 @@ def calculate_eod_breakout_quality_score(
         score -= 2
 
     return int(min(max(score, 0), 10))
+
+
+def determine_watch_type(
+    *,
+    signal_state: str,
+    setup_type: str,
+    action: str,
+    breakout_alert: str,
+    volume_confirmation: str,
+    earnings_risk_label: str,
+    resistance_breakout_mode: str,
+    pivot: PivotInfo,
+) -> str:
+    """Classify why a non-BUY-NOW setup belongs on the watchlist."""
+    if signal_state == "BUY NOW":
+        return "NONE"
+    if earnings_risk_label == "HIGH RISK" and signal_state in {"WATCH", "BUY ON BREAKOUT"}:
+        return "EARNINGS RISK WATCH"
+    if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH" or setup_type == "RESISTANCE BREAKOUT WATCH":
+        return "RESISTANCE BREAKOUT WATCH"
+    if setup_type == "MOMENTUM BREAKOUT EXCEPTION" or action == "MOMENTUM BREAKOUT":
+        return "MOMENTUM WATCH"
+    if setup_type == "PULLBACK TO MA10":
+        return "PULLBACK TO MA10"
+    if setup_type == "PULLBACK TO MA20" or signal_state == "WAIT PULLBACK":
+        return "PULLBACK TO MA20"
+    if signal_state == "BUY ON BREAKOUT" and volume_confirmation != "YES":
+        return "WAIT VOLUME"
+    if breakout_alert == "NEAR BREAKOUT" or (pd.notna(pivot.distance_pct) and -1 <= pivot.distance_pct <= 5):
+        return "NEAR PIVOT"
+    return "NONE"
 
 
 def earnings_intelligence_label(earnings_label: str, post_earnings_label: str) -> str:
@@ -3159,14 +3203,25 @@ def build_scan_row(
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
     if not live_mode:
+        provisional_setup_type = classify_setup_type(
+            vcp_status=vcp.status,
+            action=action,
+            current_setup_status=current_setup_status,
+            resistance_breakout_mode="NO",
+            momentum_breakout_candidate=momentum_breakout_candidate,
+            latest=latest,
+        )
         breakout_quality_score = calculate_eod_breakout_quality_score(
             pivot=pivot,
             rs_score=rs_score,
             tightness_score=tightness_score,
             volume_dry_up=vcp.volume_contraction,
             stage_label=stage_label,
+            institutional_action=institutional_action,
             risk_pct=risk_pct,
             setup_grade=quality_grade,
+            vcp_status=vcp.status,
+            setup_type=provisional_setup_type,
         )
     live_breakout_status = (
         detect_live_breakout_status(
@@ -3353,6 +3408,26 @@ def build_scan_row(
         entry_type = "EXTENDED DO NOT CHASE"
     else:
         entry_type = "NO TRADE"
+
+    watch_type = determine_watch_type(
+        signal_state=signal_state,
+        setup_type=setup_type,
+        action=action,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
+        earnings_risk_label=earnings_label,
+        resistance_breakout_mode=resistance_breakout_mode,
+        pivot=pivot,
+    )
+    if signal_state == "BUY ON BREAKOUT":
+        decision_reason = "BUY ON BREAKOUT: near pivot, wait for volume confirmation"
+    elif signal_state == "WATCH" and watch_type in {"PULLBACK TO MA10", "PULLBACK TO MA20"}:
+        decision_reason = "WATCH - Pullback: wait for MA10/MA20 support confirmation"
+    elif signal_state == "WATCH" and watch_type == "MOMENTUM WATCH":
+        decision_reason = "WATCH - Momentum: high RS leader, wait for clean breakout"
+    elif signal_state == "EXTENDED DO NOT CHASE":
+        decision_reason = "EXTENDED: wait for pullback, do not chase"
+
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
     latest_candle = pd.Timestamp(data.index[-1])
     data_stale, stale_warning = is_data_stale(latest_candle)
@@ -3431,6 +3506,7 @@ def build_scan_row(
         "VCP Label": vcp_label,
         "Setup Type": setup_type,
         "Signal State": signal_state,
+        "Watch Type": watch_type,
         "Contractions": contraction_text,
         "contraction count": vcp.count,
         "final contraction %": vcp.final_pct,
@@ -5860,12 +5936,20 @@ def render_swing_scanner(
 
     with st.sidebar:
         st.header(f"{title} Controls")
+        default_market = "HK" if "HK" in title else "US"
+        market_options = ["US", "HK", "Combined"]
+        market_choice = st.selectbox(
+            "Market",
+            market_options,
+            index=market_options.index(default_market),
+            key=f"{key_prefix}_market_choice",
+        )
         scanner_mode_kind = st.selectbox(
             "Scanner Mode",
             ["EOD Swing Scanner", "Live Breakout Scanner"],
             index=0,
             key=f"{key_prefix}_scanner_mode_kind",
-            help="EOD is the fast default for nightly planning. Live Breakout adds quote/RVOL checks only when explicitly run.",
+            help="EOD is the fast default for nightly planning. Live Breakout is optional and only runs when selected.",
         )
         scan_depth = st.selectbox(
             "Scan Depth",
@@ -5873,78 +5957,57 @@ def render_swing_scanner(
             index=0,
             key=f"{key_prefix}_scan_depth",
         )
-        scan_mode = st.selectbox("Scan Mode", mode_options, index=default_index, key=f"{key_prefix}_scan_mode")
         custom_tickers = st.text_area(
-            "Custom tickers",
-            value="AAPL, MSFT, NVDA, AMD, META, TSLA",
+            "Custom Tickers",
+            value="",
             height=120,
-            disabled=scan_mode != "Custom Input",
             key=f"{key_prefix}_custom_tickers",
+            help="Optional. If filled, these tickers replace the selected market universe.",
         )
 
-        preset_tickers = PRESET_UNIVERSES.get(scan_mode, [])
-        if scan_mode == "US Pro Market Scan":
+        if market_choice == "US":
+            scan_mode = "US Pro Market Scan"
             preset_tickers = US_PRO_UNIVERSE
-        elif scan_mode == "HK Pro Market Scan":
+        elif market_choice == "HK":
+            scan_mode = "HK Pro Market Scan"
             preset_tickers = HK_PRO_UNIVERSE
-        elif scan_mode == "Combined US + HK Scan":
+        else:
+            scan_mode = "Combined US + HK Scan"
             preset_tickers = COMBINED_PRO_UNIVERSE
-        tickers = normalize_tickers(custom_tickers) if scan_mode == "Custom Input" else preset_tickers
 
+        tickers = normalize_tickers(custom_tickers) if custom_tickers.strip() else preset_tickers
         max_tickers = 50 if scan_depth.startswith("Quick") else 150 if scan_depth.startswith("Normal") else 500
         live_mode = scanner_mode_kind == "Live Breakout Scanner"
-        st.caption(f"{len(tickers)} tickers selected. This run will scan up to {max_tickers} symbols.")
-        is_hk_mode = "HK" in scan_mode
-        min_price_default = 1.0 if is_hk_mode else 10.0
-        min_price = st.number_input("Minimum price", min_value=0.0, value=min_price_default, step=1.0, key=f"{key_prefix}_min_price")
-        min_market_cap_b = st.number_input("Minimum market cap ($B)", min_value=0.0, value=5.0, step=0.5, key=f"{key_prefix}_min_cap")
-        min_dollar_volume_m = st.number_input("Minimum avg turnover / dollar volume ($M)", min_value=0.0, value=20.0, step=5.0, key=f"{key_prefix}_min_dv")
-        include_small_caps = st.checkbox("Include small caps", value=False, key=f"{key_prefix}_small_caps") if is_hk_mode else False
-        aggressive_mode = st.checkbox(
-            "Aggressive Mode: allow risk above 10%",
-            value=False,
-            key=f"{key_prefix}_aggressive_mode",
-            help="Default keeps Trade = NO when Risk % is above 10. Top 5 still requires Risk % <= 10.",
-        )
+        is_hk_mode = market_choice == "HK"
+        min_price = 1.0 if is_hk_mode else 10.0
+        min_market_cap_b = 5.0
+        min_dollar_volume_m = 20.0
+        include_small_caps = False
+        aggressive_mode = False
+        show_all = False
+        sector_filter = "All"
+        only_ready_pullback = False
+        only_trade_watchlist = False
+        hide_extended = False
+        only_a_setups = False
+        hide_low_rs_non_vcp = True
+        only_true_vcp = False
+        only_early_vcp = False
+        only_watchlist = False
+        hide_resistance_blocked = False
+        hide_reject = False
+        only_strong_pullbacks = False
+        auto_refresh = False
+        show_position_management = False
 
-        st.divider()
-        show_all = st.checkbox("Show all", value=False, key=f"{key_prefix}_show_all")
-        show_full_diagnostics = st.checkbox("Show full diagnostics", value=False, key=f"{key_prefix}_diagnostics")
-        sector_filter = st.selectbox(
-            "Sector group",
-            [
-                "All",
-                "Technology",
-                "Semiconductors",
-                "Energy",
-                "Utilities",
-                "Healthcare",
-                "Financials",
-                "Industrials",
-                "Consumer",
-                "Real Estate",
-                "Materials",
-                "Crypto / Digital Assets",
-                "Other",
-            ],
-            key=f"{key_prefix}_sector_filter",
-        )
-        only_ready_pullback = st.checkbox("Show only READY / PULLBACK", value=False, key=f"{key_prefix}_ready")
-        only_trade_watchlist = st.checkbox("Show only Trade + Watchlist", value=False, key=f"{key_prefix}_trade_watch")
-        hide_extended = st.checkbox("Hide EXTENDED", value=False, key=f"{key_prefix}_hide_extended")
-        only_a_setups = st.checkbox("Show only A+ / A setups", value=False, key=f"{key_prefix}_quality_a")
-        hide_low_rs_non_vcp = st.checkbox("Hide defensive low-RS stocks", value=True, key=f"{key_prefix}_hide_low_rs")
-        only_true_vcp = st.checkbox("Show VCP only", value=False, key=f"{key_prefix}_true_vcp")
-        only_early_vcp = st.checkbox("Show Early VCP only", value=False, key=f"{key_prefix}_early_vcp")
-        only_watchlist = st.checkbox("Show Watchlist only", value=False, key=f"{key_prefix}_watchlist_only")
-        hide_resistance_blocked = st.checkbox("Hide Resistance Blocked", value=False, key=f"{key_prefix}_hide_resistance_blocked")
-        hide_reject = st.checkbox("Hide Reject", value=False, key=f"{key_prefix}_hide_reject")
-        only_strong_pullbacks = st.checkbox("Show only pullback entries with RS >= 6", value=False, key=f"{key_prefix}_strong_pullbacks")
-        auto_refresh = st.checkbox("Auto refresh every 60 sec", value=False, key=f"{key_prefix}_auto_refresh")
-        show_position_management = st.checkbox("Show Position Management", value=False, key=f"{key_prefix}_show_pm")
-        run_scan = st.button("Run EOD Scan", type="primary", width="stretch", key=f"{key_prefix}_run")
-        run_live_scan = st.button("Run Live Scan", width="stretch", key=f"{key_prefix}_run_live", disabled=not live_mode)
-        force_refresh = st.button("Force Refresh Market Data", width="stretch", key=f"{key_prefix}_force_refresh")
+        st.caption(f"{len(tickers)} tickers selected. This run will scan up to {max_tickers} symbols.")
+        run_label = "Run Live Scan" if live_mode else "Run EOD Scan"
+        run_scan = st.button(run_label, type="primary", width="stretch", key=f"{key_prefix}_run")
+        run_live_scan = bool(live_mode and run_scan)
+        force_refresh = False
+
+    show_full_diagnostics = st.checkbox("Show full diagnostics", value=False, key=f"{key_prefix}_diagnostics")
+    show_avoid_list = st.checkbox("Show Avoid List", value=False, key=f"{key_prefix}_show_avoid")
 
     if auto_refresh:
         st.components.v1.html("<script>setTimeout(() => window.parent.location.reload(), 60000);</script>", height=0)
@@ -6013,6 +6076,7 @@ def render_swing_scanner(
         "Setup Quality Grade",
         "Setup Type",
         "Signal State",
+        "Watch Type",
         "VCP Status",
         "VCP Label",
         "Contractions",
@@ -6103,6 +6167,13 @@ def render_swing_scanner(
     metric_cols[3].metric("Follow Through Day", "YES" if summary.get("follow_through_day", False) else "NO")
     metric_cols[4].metric("Stocks Passed", len(results))
     metric_cols[5].metric("Mode", st.session_state.get(f"{key_prefix}_last_scanner_mode_kind", "EOD Swing Scanner"))
+
+    state_summary_cols = st.columns(5)
+    state_summary_cols[0].metric("BUY NOW", int((results["Signal State"] == "BUY NOW").sum()))
+    state_summary_cols[1].metric("BUY ON BREAKOUT", int((results["Signal State"] == "BUY ON BREAKOUT").sum()))
+    state_summary_cols[2].metric("WATCH", int((results["Signal State"] == "WATCH").sum()))
+    state_summary_cols[3].metric("EXTENDED", int((results["Signal State"] == "EXTENDED DO NOT CHASE").sum()))
+    state_summary_cols[4].metric("REJECT", int((results["Signal State"] == "REJECT").sum()))
 
     dashboard_cols = st.columns(7)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
@@ -6222,7 +6293,6 @@ def render_swing_scanner(
         visible = visible[
             (visible["Trend Score"] >= 4)
             & (visible["Technical Score"] >= 4)
-            & (~visible["Signal State"].isin(["REJECT"]))
         ]
     if sector_filter != "All":
         visible = visible[visible["Sector Group"] == sector_filter]
@@ -6270,28 +6340,19 @@ def render_swing_scanner(
         "Sector / Industry",
         "Setup Type",
         "Signal State",
+        "Watch Type",
         "Trade",
         "Final Score",
         "Breakout Quality Score",
         "RS Score",
-        "RVOL",
         "Risk %",
-        "Ideal TP",
-        "Decision Reason",
         "close",
-        "VCP Status",
-        "Setup Quality Grade",
-        "WATCHLIST FLAG",
-        "Live Breakout Status",
-        "Stage Analysis",
-        "Institutional Action",
-        "Earnings Intelligence",
         "Pivot",
         "Entry Trigger",
         "Stop Loss",
+        "Ideal TP",
+        "Decision Reason",
     ]
-    if not summary.get("live_mode", False):
-        compact_columns = [column for column in compact_columns if column not in {"RVOL", "Live Breakout Status"}]
     diagnostic_columns = compact_columns + [
         "% Change",
         "Sector Group",
@@ -6455,38 +6516,57 @@ def render_swing_scanner(
         show_focus_group("Top Momentum Breakout Exceptions", momentum_focus, "Decision Reason")
     show_focus_group("Top Pullback Setups", pullback_focus, "Decision Reason")
 
-    st.subheader("Best Setups")
-    if visible.empty:
-        st.info("No rows match the current display filters.")
+    st.subheader("Action View")
+    actionable_states = ["BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"]
+    avoid_states = ["EXTENDED DO NOT CHASE", "REJECT"]
+    action_view = visible[visible["Signal State"].isin(actionable_states)].copy()
+    avoid_view = visible[visible["Signal State"].isin(avoid_states)].copy()
+
+    if action_view.empty:
+        st.info("No actionable setups match the current display filters.")
     else:
-        table_display = round_display_values(visible[display_columns])
-        styled_table = table_display.style.apply(style_scan_table, axis=1)
-        if "RVOL" in table_display.columns:
-            styled_table = styled_table.map(style_rvol_cell, subset=["RVOL"])
-        st.dataframe(
-            styled_table,
-            width="stretch",
-            hide_index=True,
-        )
-        export_frame = round_display_values(visible[display_columns])
-        if show_full_diagnostics:
-            with st.expander("Full diagnostics", expanded=False):
-                st.dataframe(round_display_values(visible[diagnostic_columns]), width="stretch", hide_index=True)
-            export_frame = round_display_values(visible[export_columns])
-        st.download_button(
-            "Export scanner table CSV",
-            data=export_frame.to_csv(index=False).encode("utf-8"),
-            file_name=f"{key_prefix}_vcp_scan.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        st.download_button(
-            "Export scanner table PDF",
-            data=dataframe_to_simple_pdf(export_frame, f"{title} Export"),
-            file_name=f"{key_prefix}_vcp_scan.pdf",
-            mime="application/pdf",
-            width="stretch",
-        )
+        for state, expanded in [
+            ("BUY NOW", True),
+            ("BUY ON BREAKOUT", True),
+            ("WATCH", True),
+            ("WAIT PULLBACK", False),
+        ]:
+            group = action_view[action_view["Signal State"] == state]
+            if group.empty:
+                continue
+            with st.expander(f"{state} ({len(group)})", expanded=expanded):
+                table_display = round_display_values(group[display_columns])
+                styled_table = table_display.style.apply(style_scan_table, axis=1)
+                st.dataframe(styled_table, width="stretch", hide_index=True)
+
+    if show_avoid_list and not avoid_view.empty:
+        with st.expander(f"Avoid List - EXTENDED / REJECT ({len(avoid_view)})", expanded=False):
+            table_display = round_display_values(avoid_view[display_columns])
+            styled_table = table_display.style.apply(style_scan_table, axis=1)
+            st.dataframe(styled_table, width="stretch", hide_index=True)
+    elif not show_avoid_list and not avoid_view.empty:
+        st.caption(f"{len(avoid_view)} EXTENDED / REJECT rows hidden. Enable Show Avoid List to review them.")
+
+    export_source = visible
+    export_frame = round_display_values(export_source[display_columns])
+    if show_full_diagnostics:
+        with st.expander("Full diagnostics", expanded=False):
+            st.dataframe(round_display_values(export_source[diagnostic_columns]), width="stretch", hide_index=True)
+        export_frame = round_display_values(export_source[export_columns])
+    st.download_button(
+        "Export scanner table CSV",
+        data=export_frame.to_csv(index=False).encode("utf-8"),
+        file_name=f"{key_prefix}_vcp_scan.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+    st.download_button(
+        "Export scanner table PDF",
+        data=dataframe_to_simple_pdf(export_frame, f"{title} Export"),
+        file_name=f"{key_prefix}_vcp_scan.pdf",
+        mime="application/pdf",
+        width="stretch",
+    )
 
     selectable = visible if not visible.empty else results
     selected_ticker = st.selectbox("Review ticker", selectable["ticker"].tolist(), key=f"{key_prefix}_review")
