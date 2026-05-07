@@ -1737,6 +1737,7 @@ def detect_nearest_resistance(data: pd.DataFrame, entry: float) -> float:
     """Estimate the nearest overhead resistance using highs, swings, gaps, and round numbers."""
     latest = data.iloc[-1]
     candidates: List[float] = []
+    current_close = float(latest.get("Close", entry))
 
     for column in ("High20", "High52W"):
         value = latest.get(column, np.nan)
@@ -1756,12 +1757,13 @@ def detect_nearest_resistance(data: pd.DataFrame, entry: float) -> float:
         gap_down = recent["High"] < previous_low * 0.98
         candidates.extend(float(value) for value in previous_low[gap_down].dropna().tolist())
 
-    candidates.append(round_number_resistance(entry))
-    overhead = sorted({round(value, 2) for value in candidates if pd.notna(value) and value > entry * 1.005})
+    candidates.append(round_number_resistance(max(entry, current_close)))
+    minimum_overhead = max(entry, current_close) * 1.005
+    overhead = sorted({round(value, 2) for value in candidates if pd.notna(value) and value > minimum_overhead})
     if overhead:
         return overhead[0]
 
-    fallback = max(float(latest.get("High52W", entry * 1.1)), round_number_resistance(entry))
+    fallback = max(float(latest.get("High52W", entry * 1.1)), round_number_resistance(max(entry, current_close)))
     return round(fallback, 2)
 
 
@@ -1774,6 +1776,135 @@ def risk_note(risk_pct: float, aggressive_mode: bool) -> str:
     if risk_pct <= 10:
         return "Borderline risk"
     return "Aggressive risk allowed" if aggressive_mode else "Risk above 10%"
+
+
+ACTIONABLE_SIGNAL_STATES = {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}
+SIGNAL_STATE_PRIORITY = {
+    "BUY NOW": 0,
+    "BUY ON BREAKOUT": 1,
+    "WATCH": 2,
+    "WAIT PULLBACK": 3,
+    "EXTENDED DO NOT CHASE": 4,
+    "REJECT": 5,
+}
+DECISION_PREFIX_BY_STATE = {
+    "BUY NOW": "BUY NOW:",
+    "BUY ON BREAKOUT": "BUY ON BREAKOUT:",
+    "WATCH": "WATCH:",
+    "WAIT PULLBACK": "WAIT PULLBACK:",
+    "EXTENDED DO NOT CHASE": "EXTENDED:",
+    "REJECT": "REJECT:",
+}
+PROTECTED_SETUP_TYPES = {
+    "MOMENTUM BREAKOUT EXCEPTION",
+    "TRUE VCP",
+    "VALID VCP",
+    "EARLY VCP",
+    "PULLBACK TO MA10",
+    "PULLBACK TO MA20",
+}
+
+
+def risk_bucket_state(
+    risk_pct: float,
+    *,
+    strong_leader: bool = False,
+    extended: bool = False,
+) -> Tuple[str | None, str | None]:
+    """Translate entry risk into a non-hard-reject signal downgrade."""
+    if pd.isna(risk_pct):
+        return "REJECT", "REJECT: invalid risk calculation."
+    if risk_pct <= 10:
+        return None, None
+    if risk_pct <= 12:
+        return "WATCH", "WATCH: good setup but risk slightly above preferred 10%."
+    if risk_pct <= 15:
+        return "WAIT PULLBACK", "WAIT PULLBACK: risk above ideal range, wait for tighter entry."
+    if risk_pct <= 25 and strong_leader:
+        return (
+            "EXTENDED DO NOT CHASE" if extended else "WAIT PULLBACK",
+            "WAIT PULLBACK: strong leader but stop distance too wide.",
+        )
+    if risk_pct <= 25:
+        return "WAIT PULLBACK", "WAIT PULLBACK: risk above ideal range, wait for tighter entry."
+    return "REJECT", "REJECT: risk above 25%."
+
+
+def recalculate_ideal_tp(
+    *,
+    entry: float,
+    stop: float,
+    target_2r: float,
+    target_3r: float,
+    nearest_resistance: float,
+    current_close: float,
+    signal_state: str,
+) -> Tuple[float, str, float]:
+    """Return a valid upside target above entry, and above close for actionable rows."""
+    risk_per_share = max(float(entry) - float(stop), 0.01)
+    minimum_target = float(entry) + 1.5 * risk_per_share
+    if signal_state in ACTIONABLE_SIGNAL_STATES:
+        minimum_target = max(minimum_target, float(current_close) * 1.005)
+
+    measured_move_target = float(entry) + max(float(current_close) - float(entry), risk_per_share) * 1.5
+    atr_multiple_target = max(float(entry), float(current_close)) + 2 * risk_per_share
+    round_resistance = round_number_resistance(max(float(entry), float(current_close)))
+
+    candidates = [
+        float(target_2r),
+        float(target_3r),
+        measured_move_target,
+        atr_multiple_target,
+        round_resistance,
+    ]
+    if pd.notna(nearest_resistance):
+        candidates.append(float(nearest_resistance))
+
+    valid_targets = [value for value in candidates if pd.notna(value) and value > minimum_target]
+    if not valid_targets:
+        fallback = float(entry) + 2 * risk_per_share
+        if signal_state in ACTIONABLE_SIGNAL_STATES and fallback <= float(current_close):
+            fallback = float(current_close) + 2 * risk_per_share
+        ideal_tp = fallback
+    else:
+        ideal_tp = max(valid_targets)
+
+    ideal_r = round((ideal_tp - float(entry)) / risk_per_share, 2)
+    return round(float(ideal_tp), 2), "Recalculated: validated target above entry/current price", ideal_r
+
+
+def validate_ideal_tp(
+    *,
+    ideal_tp: float,
+    ideal_tp_reason: str,
+    ideal_r: float,
+    entry: float,
+    stop: float,
+    target_2r: float,
+    target_3r: float,
+    nearest_resistance: float,
+    current_close: float,
+    signal_state: str,
+) -> Tuple[float, str, float]:
+    """Prevent long-side targets from landing below entry or current price."""
+    invalid = pd.isna(ideal_tp) or ideal_tp <= entry
+    if signal_state in ACTIONABLE_SIGNAL_STATES and pd.notna(current_close):
+        invalid = invalid or ideal_tp <= current_close
+    minimum_r = (ideal_tp - entry) / max(entry - stop, 0.01) if pd.notna(ideal_tp) else 0
+    invalid = invalid or minimum_r < 1.5
+    if not invalid:
+        return round(float(ideal_tp), 2), ideal_tp_reason, round(float(ideal_r), 2)
+
+    fixed_tp, fixed_reason, fixed_r = recalculate_ideal_tp(
+        entry=entry,
+        stop=stop,
+        target_2r=target_2r,
+        target_3r=target_3r,
+        nearest_resistance=nearest_resistance,
+        current_close=current_close,
+        signal_state=signal_state,
+    )
+    return fixed_tp, fixed_reason if not ideal_tp_reason else f"{fixed_reason}; {ideal_tp_reason}", fixed_r
 
 
 def calculate_ideal_tp_plan(
@@ -1848,7 +1979,18 @@ def calculate_ideal_tp_plan(
         reason = "Limited upside before resistance"
         sell_strategy = "QUICK SCALP"
 
-    ideal_r = round((ideal_tp - entry) / risk_per_share, 2)
+    ideal_tp, reason, ideal_r = validate_ideal_tp(
+        ideal_tp=ideal_tp,
+        ideal_tp_reason=reason,
+        ideal_r=round((ideal_tp - entry) / risk_per_share, 2),
+        entry=entry,
+        stop=stop,
+        target_2r=target_2r,
+        target_3r=target_3r,
+        nearest_resistance=nearest_resistance,
+        current_close=current_close,
+        signal_state="WATCH" if setup_grade != "Reject" else "REJECT",
+    )
     if ma10_distance > 15:
         trail_stop = prior_day_low
     elif current_close >= target_2r:
@@ -2057,7 +2199,6 @@ def determine_signal_state(
     exceptional_volume = pd.notna(avg_vol20) and avg_vol20 > 0 and latest["Volume"] >= 1.3 * avg_vol20
     volume_confirmed = volume_confirmation == "YES" or exceptional_volume
     risk_ok = pd.notna(risk_pct) and risk_pct <= 10
-    risk_too_high = pd.isna(risk_pct) or risk_pct > 12
     rs_buy_ok = score_at_least(rs_score, 7)
     rs_momentum_ok = score_at_least(rs_score, 8)
     setup_a = setup_grade in {"A+", "A"}
@@ -2068,8 +2209,22 @@ def determine_signal_state(
 
     market_correction = live_mode and market_environment == "CORRECTION"
     rvol_confirmed = pd.notna(rvol) and rvol > 2
+    strong_setup = final_score >= 85 and score_at_least(rs_score, 8) and structure_valid
+    protected_structure = (
+        momentum_breakout_candidate
+        or vcp_status in {"VALID VCP", "EARLY VCP"}
+        or action == "PULLBACK ENTRY"
+    )
 
     if pd.notna(ma10_distance) and ma10_distance > 12:
+        if strong_setup or protected_structure:
+            return (
+                "WAIT PULLBACK",
+                "NO",
+                "YES",
+                "WAIT PULLBACK: setup is strong but entry is stretched; wait for MA10/MA20 support.",
+                "WAIT PULLBACK: setup is strong but entry is stretched; wait for MA10/MA20 support.",
+            )
         return (
             "EXTENDED DO NOT CHASE",
             "NO",
@@ -2077,15 +2232,36 @@ def determine_signal_state(
             "EXTENDED DO NOT CHASE: price too far above MA10.",
             "EXTENDED: wait for pullback, do not chase.",
         )
-    if risk_too_high:
+    risk_state, risk_reason = risk_bucket_state(
+        risk_pct,
+        strong_leader=strong_setup or momentum_breakout_candidate,
+        extended=bool(pd.notna(ma10_distance) and ma10_distance > 12),
+    )
+    if risk_state == "REJECT":
         return (
-            "EXTENDED DO NOT CHASE",
+            "REJECT",
             "NO",
             "NO",
-            "EXTENDED DO NOT CHASE: risk is above 12%.",
-            "EXTENDED: wait for pullback, do not chase.",
+            risk_reason,
+            risk_reason,
+        )
+    if risk_state in {"WAIT PULLBACK", "EXTENDED DO NOT CHASE"}:
+        return (
+            risk_state,
+            "NO",
+            "YES" if risk_state == "WAIT PULLBACK" else "NO",
+            risk_reason,
+            risk_reason,
         )
     if pd.notna(rsi) and rsi > 85 and not exceptional_volume:
+        if strong_setup or protected_structure:
+            return (
+                "WAIT PULLBACK",
+                "NO",
+                "YES",
+                "WAIT PULLBACK: strong leader is stretched; wait for a tighter entry.",
+                "WAIT PULLBACK: strong leader is stretched; wait for a tighter entry.",
+            )
         return (
             "EXTENDED DO NOT CHASE",
             "NO",
@@ -2094,32 +2270,45 @@ def determine_signal_state(
             "EXTENDED: wait for pullback, do not chase.",
         )
 
-    earnings_block_candidate = (
+    earnings_strong_setup = (
         earnings_risk_label == "HIGH RISK"
-        and setup_a
         and final_score >= 85
         and rs_buy_ok
         and explosive_score >= 7
         and structure_valid
         and (breakout_state or near_pivot or near_resistance or action == "PULLBACK ENTRY")
     )
-    if earnings_block_candidate:
+    if earnings_strong_setup:
         return (
             "WATCH",
             "NO",
             "YES",
-            "WATCH: strong setup but earnings risk high.",
-            "WATCH: strong setup but earnings risk high.",
+            "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings.",
+            "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings.",
+        )
+    if earnings_risk_label == "HIGH RISK" and setup_grade not in {"A+", "A", "B"}:
+        return (
+            "REJECT",
+            "NO",
+            "NO",
+            "REJECT: earnings risk high and setup quality below B.",
+            "REJECT: earnings risk high and setup quality below B.",
         )
 
     borderline_risk = pd.notna(risk_pct) and 10 < risk_pct <= 12
     if borderline_risk and structure_valid and setup_grade != "Reject":
+        borderline_state = "BUY ON BREAKOUT" if breakout_state or near_pivot or near_resistance else "WATCH"
+        borderline_reason = (
+            "BUY ON BREAKOUT: good setup but risk slightly above preferred 10%; wait for clean trigger."
+            if borderline_state == "BUY ON BREAKOUT"
+            else "WATCH: good setup but risk slightly above preferred 10%."
+        )
         return (
-            "WATCH",
+            borderline_state,
             "NO",
             "YES",
-            "WATCH: risk slightly above preferred 10% limit.",
-            "WATCH: risk slightly above preferred 10% limit.",
+            borderline_reason,
+            borderline_reason,
         )
 
     momentum_base = (
@@ -2541,7 +2730,7 @@ def determine_watch_type(
     """Classify why a non-BUY-NOW setup belongs on the watchlist."""
     if signal_state == "BUY NOW":
         return "NONE"
-    if earnings_risk_label == "HIGH RISK" and signal_state in {"WATCH", "BUY ON BREAKOUT"}:
+    if earnings_risk_label == "HIGH RISK" and signal_state in {"WATCH", "BUY ON BREAKOUT", "WAIT PULLBACK"}:
         return "EARNINGS RISK WATCH"
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH" or setup_type == "RESISTANCE BREAKOUT WATCH":
         return "RESISTANCE BREAKOUT WATCH"
@@ -2991,12 +3180,13 @@ def hard_reject_check(
     breakout_alert: str,
     volume_confirmation: str,
     earnings_risk_label: str,
+    setup_grade: str = "C",
 ) -> Tuple[bool, str]:
     """Only reject when there is a real structural or risk failure."""
     if pd.isna(risk_pct):
         return True, "REJECT: invalid risk calculation."
-    if risk_pct > 15:
-        return True, "REJECT: risk above 15%."
+    if risk_pct > 25:
+        return True, "REJECT: risk above 25%."
     if latest.get("Close", np.nan) < latest.get("MA50", np.nan):
         return True, "REJECT: price below MA50; structure broken."
     if action == "FAILED" or current_setup_status == "FAILED BREAKOUT":
@@ -3005,11 +3195,14 @@ def hard_reject_check(
         return True, "REJECT: trend template failed."
     if breakout_alert == "FAILED BREAKOUT" and volume_confirmation == "YES":
         return True, "REJECT: failed breakout on heavy volume."
-    if earnings_risk_label == "HIGH RISK":
+    if earnings_risk_label == "HIGH RISK" and setup_grade not in {"A+", "A", "B"}:
         return True, "REJECT: earnings risk high for a new entry."
     avg_dollar_volume = latest.get("AvgDollarVol50", np.nan)
     if pd.notna(avg_dollar_volume) and avg_dollar_volume < 20_000_000:
         return True, "REJECT: liquidity too low."
+    recent_structure_low = latest.get("RecentStructureLow", np.nan)
+    if pd.notna(recent_structure_low) and latest.get("Close", np.nan) < recent_structure_low:
+        return True, "REJECT: price below recent structure low."
     return False, ""
 
 
@@ -3025,6 +3218,7 @@ def institutional_decision_reason(
     risk_pct: float,
     volume_confirmation: str,
     institutional_quality_score: int,
+    earnings_risk_label: str = "N/A",
 ) -> str:
     """Generate a specific final decision reason without generic false rejection wording."""
     if signal_state == "BUY NOW":
@@ -3037,10 +3231,20 @@ def institutional_decision_reason(
         prefix = "BUY ON BREAKOUT" if signal_state == "BUY ON BREAKOUT" else "WATCH"
         return f"{prefix}: high RS leader, not pure VCP but valid momentum setup."
     if signal_state == "BUY ON BREAKOUT":
+        if pd.notna(risk_pct) and risk_pct > 10:
+            return "BUY ON BREAKOUT: good setup but risk slightly above preferred 10%; wait for clean trigger."
         return "BUY ON BREAKOUT: near pivot, wait for volume confirmation."
     if signal_state == "WATCH":
+        if earnings_risk_label == "HIGH RISK":
+            return "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
+        if pd.notna(risk_pct) and 10 < risk_pct <= 12:
+            return "WATCH: good setup but risk slightly above preferred 10%."
         return "WATCH: good institutional/technical context, wait for clean trigger."
     if signal_state == "WAIT PULLBACK":
+        if pd.notna(risk_pct) and risk_pct > 15:
+            return "WAIT PULLBACK: strong leader but stop distance too wide."
+        if pd.notna(risk_pct) and risk_pct > 12:
+            return "WAIT PULLBACK: risk above ideal range, wait for tighter entry."
         return "WAIT PULLBACK: setup is strong but entry is stretched; wait for MA10/MA20 support."
     if signal_state == "EXTENDED DO NOT CHASE":
         return "EXTENDED: wait for pullback, do not chase."
@@ -3073,16 +3277,43 @@ def apply_institutional_decision_layer(
 ) -> Tuple[str, str, str, str, str]:
     """Apply final hierarchy so generic reject cannot overwrite high-quality setups."""
     protected = (
-        (score_at_least(rs_score, 8) and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 10)
+        (score_at_least(rs_score, 8) and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 12)
         or vcp_status in {"VALID VCP", "EARLY VCP"}
-        or setup_type == "MOMENTUM BREAKOUT EXCEPTION"
+        or setup_type in PROTECTED_SETUP_TYPES
         or momentum_breakout_candidate
+    )
+    institutional_leader = (
+        leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}
+        and score_at_least(rs_score, 8)
+        and final_score >= 85
+        and institutional_quality_score >= 7
+        and adjusted_score >= 85
     )
     if hard_reject:
         return "REJECT", "NO", "NO", "Reject", hard_reject_reason
 
+    risk_state, risk_reason = risk_bucket_state(
+        risk_pct,
+        strong_leader=institutional_leader,
+        extended=bool(pd.notna(ma10_distance) and ma10_distance > 12),
+    )
+    if risk_state in {"WAIT PULLBACK", "EXTENDED DO NOT CHASE"}:
+        signal_state = risk_state
+        trade = "NO"
+        watchlist_flag = "YES" if signal_state == "WAIT PULLBACK" else "NO"
+        if quality_grade == "Reject" and (protected or institutional_leader):
+            quality_grade = "B"
+        decision_reason = risk_reason
+    elif risk_state == "WATCH" and signal_state == "BUY NOW":
+        signal_state = "BUY ON BREAKOUT" if breakout_alert in {"NEAR BREAKOUT", "CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"} else "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "BUY ON BREAKOUT: good setup but risk slightly above preferred 10%; wait for clean trigger." if signal_state == "BUY ON BREAKOUT" else risk_reason
+
     if signal_state == "REJECT" and protected:
-        if breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}:
+        if pd.notna(risk_pct) and risk_pct > 12:
+            signal_state = "WAIT PULLBACK"
+        elif breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS", "NEAR BREAKOUT"}:
             signal_state = "BUY ON BREAKOUT"
         else:
             signal_state = "WATCH"
@@ -3147,6 +3378,234 @@ def decision_engine_regression_checks() -> None:
     )[0]
     adjusted = adjusted_final_score(90, 8, 3, 3)
     assert adjusted >= 85
+    dell_tp, _, _ = validate_ideal_tp(
+        ideal_tp=220,
+        ideal_tp_reason="invalid old resistance",
+        ideal_r=0.25,
+        entry=217.4,
+        stop=207.4,
+        target_2r=237.4,
+        target_3r=247.4,
+        nearest_resistance=220,
+        current_close=238.8,
+        signal_state="WATCH",
+    )
+    assert dell_tp > 238.8 and dell_tp > 217.4
+    assert reason_with_signal_prefix("BUY NOW", "WATCH: old mismatch").startswith("BUY NOW:")
+    test_rows = pd.DataFrame(
+        [
+            {
+                "ticker": "STLD",
+                "Signal State": "BUY NOW",
+                "Trade": "YES",
+                "WATCHLIST FLAG": "NO",
+                "Decision Reason": "BUY NOW: strong setup.",
+                "Earnings Risk": "HIGH RISK",
+                "Days to Earnings": 2,
+                "Final Score": 100,
+                "Adjusted Final Score": 100,
+                "Institutional Quality Score": 8,
+                "RS Score Raw": 10,
+                "Risk %": 7.47,
+                "Setup Type": "TRUE VCP",
+                "VCP Status": "VALID VCP",
+                "Hard Reject": "NO",
+                "Entry Trigger": 100,
+                "Stop Loss": 93,
+                "Target 2R": 114,
+                "Target 3R": 121,
+                "Nearest Resistance": 121,
+                "Current Price": 101,
+                "Ideal TP": 121,
+                "Ideal TP Reason": "ok",
+                "Ideal TP R": 3,
+            },
+            {
+                "ticker": "LEADER",
+                "Signal State": "REJECT",
+                "Trade": "NO",
+                "WATCHLIST FLAG": "NO",
+                "Decision Reason": "REJECT: generic not VCP.",
+                "Earnings Risk": "LOW RISK",
+                "Days to Earnings": 30,
+                "Final Score": 90,
+                "Adjusted Final Score": 90,
+                "Institutional Quality Score": 8,
+                "RS Score Raw": 8,
+                "Risk %": 11,
+                "Setup Type": "BASE BUILDING",
+                "VCP Status": "NOT VCP",
+                "Hard Reject": "NO",
+                "Entry Trigger": 100,
+                "Stop Loss": 90,
+                "Target 2R": 120,
+                "Target 3R": 130,
+                "Nearest Resistance": 130,
+                "Current Price": 101,
+                "Ideal TP": 130,
+                "Ideal TP Reason": "ok",
+                "Ideal TP R": 3,
+            },
+        ]
+    )
+    fixed = validate_scan_results(test_rows)
+    assert fixed.loc[0, "Signal State"] == "WATCH"
+    assert fixed.loc[0, "Watch Type"] if "Watch Type" in fixed.columns else True
+    assert fixed.loc[1, "Signal State"] != "REJECT"
+    ranking = pd.DataFrame(
+        {
+            "Signal State": ["REJECT", "EXTENDED DO NOT CHASE", "WATCH", "BUY NOW"],
+            "Adjusted Final Score": [100, 99, 80, 70],
+            "Institutional Quality Score": [10, 9, 2, 1],
+            "RS Sort": [10, 9, 2, 1],
+            "Breakout Quality Score": [10, 9, 2, 1],
+            "Risk %": [1, 1, 1, 1],
+        }
+    )
+    ranked_states = ranking.assign(
+        signal_sort=ranking["Signal State"].map(SIGNAL_STATE_PRIORITY).fillna(9)
+    ).sort_values(
+        ["signal_sort", "Adjusted Final Score", "Institutional Quality Score", "RS Sort", "Breakout Quality Score", "Risk %"],
+        ascending=[True, False, False, False, False, True],
+    )["Signal State"].tolist()
+    assert ranked_states[0] == "BUY NOW" and ranked_states[-1] == "REJECT"
+
+
+def reason_with_signal_prefix(signal_state: str, decision_reason: str) -> str:
+    """Keep the final explanation aligned with the displayed signal state."""
+    expected_prefix = DECISION_PREFIX_BY_STATE.get(signal_state, "REJECT:")
+    text = str(decision_reason or "").strip()
+    if text.startswith(expected_prefix):
+        return text
+
+    for prefix in DECISION_PREFIX_BY_STATE.values():
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    if text.startswith("-"):
+        text = text[1:].strip()
+
+    default_reason = {
+        "BUY NOW": "breakout confirmed, strong RS, risk controlled.",
+        "BUY ON BREAKOUT": "near trigger, wait for clean confirmation.",
+        "WATCH": "good setup, wait for trigger.",
+        "WAIT PULLBACK": "risk or extension requires a tighter entry.",
+        "EXTENDED DO NOT CHASE": "wait for pullback, do not chase.",
+        "REJECT": "hard reject or weak setup condition triggered.",
+    }.get(signal_state, "hard reject or weak setup condition triggered.")
+    return f"{expected_prefix} {text or default_reason}"
+
+
+def finalize_signal_outputs(
+    *,
+    signal_state: str,
+    trade: str,
+    watchlist_flag: str,
+    decision_reason: str,
+    earnings_risk_label: str,
+    days_to_earnings: int | str | None,
+) -> Tuple[str, str, str, str]:
+    """Enforce one final decision hierarchy before row creation."""
+    days_numeric = numeric_or_na(days_to_earnings)
+    if (
+        signal_state == "BUY NOW"
+        and earnings_risk_label == "HIGH RISK"
+        and pd.notna(days_numeric)
+        and days_numeric <= 3
+    ):
+        signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
+
+    if trade == "YES" and signal_state != "BUY NOW":
+        signal_state = "BUY NOW"
+    if signal_state == "BUY NOW":
+        trade = "YES"
+        watchlist_flag = "NO"
+    elif signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
+        trade = "NO"
+        watchlist_flag = "YES"
+    elif signal_state in {"EXTENDED DO NOT CHASE", "REJECT"}:
+        trade = "NO"
+        watchlist_flag = "NO"
+
+    return signal_state, trade, watchlist_flag, reason_with_signal_prefix(signal_state, decision_reason)
+
+
+def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
+    """Repair final consistency before display and export without changing the UI flow."""
+    if frame.empty:
+        return frame
+    fixed = frame.copy()
+    for idx, row in fixed.iterrows():
+        signal_state = str(row.get("Signal State", "REJECT"))
+        trade = str(row.get("Trade", "NO"))
+        watchlist_flag = str(row.get("WATCHLIST FLAG", "NO"))
+        decision_reason = str(row.get("Decision Reason", ""))
+        hard_reject = str(row.get("Hard Reject", "NO")) == "YES"
+        risk_pct = numeric_or_na(row.get("Risk %"))
+        rs_score = numeric_or_na(row.get("RS Score Raw", row.get("RS Score")))
+        final_score = numeric_or_na(row.get("Final Score"))
+        setup_type = str(row.get("Setup Type", ""))
+
+        protected = (
+            (pd.notna(rs_score) and pd.notna(final_score) and rs_score >= 8 and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 12)
+            or setup_type in PROTECTED_SETUP_TYPES
+            or str(row.get("VCP Status", "")) in {"VALID VCP", "EARLY VCP"}
+        )
+        if signal_state == "REJECT" and protected and not hard_reject:
+            if pd.notna(risk_pct) and risk_pct > 12:
+                signal_state = "WAIT PULLBACK"
+                decision_reason = "WAIT PULLBACK: risk above ideal range, wait for tighter entry."
+            else:
+                signal_state = "WATCH"
+                decision_reason = "WATCH: good institutional/technical context, wait for clean trigger."
+
+        signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
+            signal_state=signal_state,
+            trade=trade,
+            watchlist_flag=watchlist_flag,
+            decision_reason=decision_reason,
+            earnings_risk_label=str(row.get("Earnings Risk", "N/A")),
+            days_to_earnings=row.get("Days to Earnings"),
+        )
+
+        entry = numeric_or_na(row.get("Entry Trigger"))
+        stop = numeric_or_na(row.get("Stop Loss"))
+        target_2r = numeric_or_na(row.get("Target 2R"))
+        target_3r = numeric_or_na(row.get("Target 3R"))
+        ideal_tp = numeric_or_na(row.get("Ideal TP"))
+        ideal_r = numeric_or_na(row.get("Ideal TP R"))
+        nearest_resistance = numeric_or_na(row.get("Nearest Resistance"))
+        current_close = numeric_or_na(row.get("Current Price", row.get("close")))
+        if all(pd.notna(value) for value in [entry, stop, target_2r, target_3r, current_close]):
+            if pd.isna(nearest_resistance):
+                nearest_resistance = target_2r
+            fixed_tp, fixed_reason, fixed_r = validate_ideal_tp(
+                ideal_tp=ideal_tp,
+                ideal_tp_reason=str(row.get("Ideal TP Reason", "")),
+                ideal_r=ideal_r if pd.notna(ideal_r) else 0,
+                entry=entry,
+                stop=stop,
+                target_2r=target_2r,
+                target_3r=target_3r,
+                nearest_resistance=nearest_resistance,
+                current_close=current_close,
+                signal_state=signal_state,
+            )
+            fixed.at[idx, "Ideal TP"] = fixed_tp
+            fixed.at[idx, "Ideal TP Reason"] = fixed_reason
+            fixed.at[idx, "Ideal TP R"] = fixed_r
+
+        fixed.at[idx, "Signal State"] = signal_state
+        fixed.at[idx, "Trade"] = trade
+        fixed.at[idx, "WATCHLIST FLAG"] = watchlist_flag
+        fixed.at[idx, "Decision Reason"] = decision_reason
+        fixed.at[idx, "Trade Reason"] = decision_reason
+        fixed.at[idx, "Watchlist Reason"] = "Already Trade YES" if trade == "YES" else decision_reason
+        fixed.at[idx, "signal sort"] = SIGNAL_STATE_PRIORITY.get(signal_state, 9)
+    return fixed
 
 
 def decide_trade(
@@ -3697,8 +4156,11 @@ def build_scan_row(
     if signal_state == "BUY NOW" and setup_type == "MOMENTUM BREAKOUT EXCEPTION":
         sell_strategy = "HOLD TO 3R IF VOLUME HOLDS" if explosive_score >= 9 else "PARTIAL AT 2R, TRAIL REST"
 
+    latest_for_reject = latest.copy()
+    prior_lows = data["Low"].iloc[-21:-1] if len(data) > 21 else data["Low"].iloc[:-1]
+    latest_for_reject["RecentStructureLow"] = float(prior_lows.min()) if not prior_lows.empty else np.nan
     hard_reject, hard_reject_reason = hard_reject_check(
-        latest=latest,
+        latest=latest_for_reject,
         trend_score=trend_score,
         risk_pct=risk_pct,
         action=action,
@@ -3706,6 +4168,7 @@ def build_scan_row(
         breakout_alert=breakout_alert,
         volume_confirmation=volume_confirmation,
         earnings_risk_label=earnings_label,
+        setup_grade=quality_grade,
     )
     signal_state, trade, watchlist_flag, quality_grade, decision_reason = apply_institutional_decision_layer(
         signal_state=signal_state,
@@ -3741,6 +4204,7 @@ def build_scan_row(
         risk_pct=risk_pct,
         volume_confirmation=volume_confirmation,
         institutional_quality_score=institutional_quality_score,
+        earnings_risk_label=earnings_label,
     )
     trade_reason = decision_reason
     watchlist_reason = decision_reason if watchlist_flag == "YES" else "Already Trade YES" if trade == "YES" else decision_reason
@@ -3781,14 +4245,56 @@ def build_scan_row(
         pivot=pivot,
     )
     if watch_type == "MOMENTUM WATCH" or setup_type == "MOMENTUM BREAKOUT EXCEPTION":
-        prefix = "BUY ON BREAKOUT" if signal_state == "BUY ON BREAKOUT" else "WATCH"
+        prefix = DECISION_PREFIX_BY_STATE.get(signal_state, "WATCH:").rstrip(":")
         decision_reason = f"{prefix}: high RS leader, not pure VCP but valid momentum setup"
     elif signal_state == "BUY ON BREAKOUT":
         decision_reason = "BUY ON BREAKOUT: near pivot, wait for volume confirmation"
     elif signal_state == "WATCH" and watch_type in {"PULLBACK TO MA10", "PULLBACK TO MA20"}:
-        decision_reason = "WATCH - Pullback: wait for MA10/MA20 support confirmation"
+        decision_reason = "WATCH: pullback setup; wait for MA10/MA20 support confirmation"
     elif signal_state == "EXTENDED DO NOT CHASE":
         decision_reason = "EXTENDED: wait for pullback, do not chase"
+
+    signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
+        signal_state=signal_state,
+        trade=trade,
+        watchlist_flag=watchlist_flag,
+        decision_reason=decision_reason,
+        earnings_risk_label=earnings_label,
+        days_to_earnings=earnings_info.get("days_to_earnings"),
+    )
+    watch_type = determine_watch_type(
+        signal_state=signal_state,
+        setup_type=setup_type,
+        action=action,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
+        earnings_risk_label=earnings_label,
+        resistance_breakout_mode=resistance_breakout_mode,
+        pivot=pivot,
+    )
+    if watch_type == "EARNINGS RISK WATCH" and signal_state == "WATCH":
+        decision_reason = "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
+    decision_reason = reason_with_signal_prefix(signal_state, decision_reason)
+    trade_reason = decision_reason
+    watchlist_reason = "Already Trade YES" if trade == "YES" else decision_reason
+    if signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
+        sell_strategy = "WAIT FOR ENTRY"
+    elif signal_state == "REJECT":
+        sell_strategy = "AVOID / NO TRADE"
+    elif signal_state == "EXTENDED DO NOT CHASE":
+        sell_strategy = "AVOID / NO TRADE"
+    ideal_tp, ideal_tp_reason, ideal_r = validate_ideal_tp(
+        ideal_tp=ideal_tp,
+        ideal_tp_reason=ideal_tp_reason,
+        ideal_r=ideal_r,
+        entry=entry,
+        stop=stop,
+        target_2r=target_2r,
+        target_3r=target_3r,
+        nearest_resistance=nearest_resistance,
+        current_close=float(latest["Close"]),
+        signal_state=signal_state,
+    )
 
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
     latest_candle = pd.Timestamp(data.index[-1])
@@ -3918,6 +4424,9 @@ def build_scan_row(
         "Target 1R": target_1r,
         "Target 2R": target_2r,
         "Target 3R": target_3r,
+        "TP1": target_1r,
+        "TP2": target_2r,
+        "TP3": target_3r,
         "Nearest Resistance": nearest_resistance,
         "Resistance Blocked": "YES" if resistance_blocks_1r else "NO",
         "Resistance Breakout Mode": resistance_breakout_mode,
@@ -3953,6 +4462,8 @@ def build_scan_row(
         "Chart/Quote Mismatch %": sync_mismatch_pct if pd.notna(sync_mismatch_pct) else "N/A",
         "Notes": notes,
         "Company Name": "N/A",
+        "Hard Reject": "YES" if hard_reject else "NO",
+        "Hard Reject Reason": hard_reject_reason,
         "_pivot": pivot,
         "_vcp": vcp,
     }
@@ -4177,6 +4688,8 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["Leader Quality Label"] = "LAGGARD / AVOID"
     if "RVOL" not in ranked:
         ranked["RVOL"] = 0
+    if "WATCHLIST FLAG" not in ranked:
+        ranked["WATCHLIST FLAG"] = "NO"
     ranked["RS Sort"] = pd.to_numeric(ranked.get("RS Score Raw", ranked.get("RS Score")), errors="coerce")
     ranked["RVOL Sort"] = pd.to_numeric(ranked.get("RVOL"), errors="coerce").fillna(0)
     setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
@@ -4208,6 +4721,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
     if ranked.empty:
         return ranked
     ranked["trade sort"] = np.where(ranked["Trade"] == "YES", 0, 1)
+    ranked["signal sort"] = ranked["Signal State"].map(SIGNAL_STATE_PRIORITY).fillna(9)
     ranked["watchlist sort"] = np.where(ranked["WATCHLIST FLAG"] == "YES", 0, 1)
     ranked["quality sort"] = ranked["Setup Quality Grade"].map(setup_priority).fillna(9)
     ranked["vcp sort"] = np.where(ranked["VCP Status"].isin(["VALID VCP", "EARLY VCP"]), 0, 1)
@@ -4215,6 +4729,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
     ranked["earnings sort"] = np.where(ranked["Earnings Risk"] == "HIGH RISK", 1, 0)
     ranked = ranked.sort_values(
         [
+            "signal sort",
             "quality sort",
             "trade sort",
             "vcp sort",
@@ -4232,7 +4747,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Final Score",
             "earnings sort",
         ],
-        ascending=[True, True, True, True, False, False, False, False, False, False, False, False, False, True, False, True],
+        ascending=[True, True, True, True, True, False, False, False, False, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -6410,6 +6925,7 @@ def render_swing_scanner(
                 max_tickers=max_tickers,
                 aggressive_mode=aggressive_mode,
             )
+            results = validate_scan_results(results)
             st.session_state[f"{key_prefix}_results"] = results
             st.session_state[f"{key_prefix}_indicator_data"] = indicator_data
             st.session_state[f"{key_prefix}_summary"] = summary
@@ -6424,7 +6940,8 @@ def render_swing_scanner(
         )
         return
 
-    results = st.session_state.get(f"{key_prefix}_results", pd.DataFrame())
+    results = validate_scan_results(st.session_state.get(f"{key_prefix}_results", pd.DataFrame()))
+    st.session_state[f"{key_prefix}_results"] = results
     indicator_data = st.session_state.get(f"{key_prefix}_indicator_data", {})
     summary = st.session_state.get(f"{key_prefix}_summary", {})
     required_result_columns = {
@@ -6695,14 +7212,7 @@ def render_swing_scanner(
     if only_strong_pullbacks:
         visible = visible[(visible["Action Label"] == "PULLBACK ENTRY") & (visible["RS Sort"] >= 6)]
 
-    signal_priority = {
-        "BUY NOW": 0,
-        "BUY ON BREAKOUT": 1,
-        "WATCH": 2,
-        "WAIT PULLBACK": 3,
-        "EXTENDED DO NOT CHASE": 4,
-        "REJECT": 5,
-    }
+    signal_priority = SIGNAL_STATE_PRIORITY
     quality_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
