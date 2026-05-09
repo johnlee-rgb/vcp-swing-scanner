@@ -1936,8 +1936,10 @@ def calculate_trader_tp_plan(
     institutional_quality_score: int,
     rs_score: float,
     sector_score: int,
-    market_environment: str,
-    extended: bool,
+    sector_leadership_status: str = "NEUTRAL SECTOR",
+    market_environment: str = "",
+    extended: bool = False,
+    volatility_controlled: bool = True,
 ) -> Tuple[float, float, float, float, str, str, float]:
     """Build trader-style TP1/TP2/TP3 where TP2 is usually the swing plan."""
     risk_per_share = max(float(entry) - float(stop), 0.01)
@@ -1962,11 +1964,12 @@ def calculate_trader_tp_plan(
     tp2 = min(tp2_valid, key=lambda value: abs(value - target_25r)) if tp2_valid else target_2r
 
     runner_allowed = (
-        institutional_quality_score >= 8
-        and score_at_least(rs_score, 8)
-        and sector_score >= 7
+        institutional_quality_score >= 9
+        and score_at_least(rs_score, 9)
+        and sector_leadership_status == "LEADING SECTOR"
         and market_environment == "CONFIRMED UPTREND"
         and not extended
+        and volatility_controlled
     )
     tp3_base = max(target_3r, tp2 + 0.5 * risk_per_share, recent_high * 1.08 if pd.notna(recent_high) else target_3r)
     tp3 = tp3_base if runner_allowed else max(target_3r, tp2 + 0.5 * risk_per_share)
@@ -2842,7 +2845,9 @@ def calculate_breakout_quality_score(
     if extended or (pd.notna(ma10_distance) and ma10_distance > 12):
         score -= 2
     if wide_candle:
-        score -= 1
+        score -= 2
+    if close_position < 0.5:
+        score -= 2
     if upper_wick_pct >= 0.4:
         score -= 2
     if pd.notna(rvol) and rvol < 1:
@@ -2885,12 +2890,17 @@ def calculate_eod_breakout_quality_score(
             score += 1
         if upper_wick_pct >= 0.4:
             score -= 2
+        if close_position < 0.5:
+            score -= 2
         if pd.notna(avg_vol20) and pivot.label == "Breakout in progress" and latest["Volume"] < avg_vol20:
             score -= 2
         if pd.notna(avg_vol20) and pivot.label == "Breakout in progress" and latest["Volume"] > avg_vol20 * 1.25:
             score += 2
         ma10_distance = (latest["Close"] - latest["MA10"]) / latest["MA10"] * 100 if latest["MA10"] else np.nan
         if pd.notna(latest.get("RSI14", np.nan)) and latest["RSI14"] > 85 and pd.notna(ma10_distance) and ma10_distance > 8:
+            score -= 2
+        avg_range20 = data["RangePct"].tail(20).mean() if isinstance(data, pd.DataFrame) and len(data) >= 20 else np.nan
+        if pd.notna(avg_range20) and latest.get("RangePct", np.nan) > avg_range20 * 1.8:
             score -= 2
     distance = pivot.distance_pct
     if pd.notna(distance):
@@ -3494,21 +3504,33 @@ def calculate_entry_quality_score(
     if breakout_alert in {"NEAR BREAKOUT", "CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"} or setup_type in {"PULLBACK TO MA10", "PULLBACK TO MA20", "HEALTHY PULLBACK WATCH"}:
         score += 1
 
+    daily_range = max(float(latest.get("High", close)) - float(latest.get("Low", close)), 0.01)
+    upper_wick_pct = (float(latest.get("High", close)) - max(float(latest.get("Open", close)), close)) / daily_range
     wide_loose = bool(latest.get("RangePct", np.nan) > 6)
-    if pd.notna(ma10_distance) and ma10_distance > 12:
-        score -= 2
-    if pd.notna(risk_pct) and risk_pct > 15:
-        score -= 3
-    elif pd.notna(risk_pct) and risk_pct > 12:
-        score -= 2
+    if pd.notna(ma10_distance):
+        if ma10_distance > 18:
+            score -= 2
+        elif ma10_distance > 12:
+            score -= 1
+        elif ma10_distance > 8:
+            score -= 0.5
+    if pd.notna(risk_pct):
+        if risk_pct > 20:
+            score -= 4
+        elif risk_pct > 15:
+            score -= 3
+        elif risk_pct > 12:
+            score -= 2
+        elif risk_pct > 10:
+            score -= 1
     if pd.notna(distance) and (distance < -8 or distance > 10):
-        score -= 2
-    if pd.notna(rsi) and rsi > 85 and pd.notna(ma10_distance) and ma10_distance > 8:
+        score -= 1
+    if pd.notna(rsi) and rsi > 85 and pd.notna(ma10_distance) and ma10_distance > 10 and upper_wick_pct >= 0.35:
         score -= 2
     if wide_loose:
-        score -= 2
+        score -= 1
     if stage_label in {"LATE STAGE 2", "STAGE 3 RISK"}:
-        score -= 2
+        score -= 1
 
     score = int(min(max(score, 0), 10))
     if score >= 8:
@@ -3565,6 +3587,7 @@ def calculate_professional_score(
     tp_type: str,
     signal_state: str,
     hard_reject: bool,
+    price_above_ma20: bool = False,
 ) -> float:
     """Weighted professional score that avoids high quality alone inflating to 100."""
     institutional_component = institutional_quality_score
@@ -3604,6 +3627,13 @@ def calculate_professional_score(
         score = min(score, 59)
     if leader_label == "LAGGARD / AVOID":
         score = min(score, 75)
+    if (
+        not hard_reject
+        and institutional_quality_score >= 8
+        and score_at_least(rs_score, 8)
+        and price_above_ma20
+    ):
+        score = max(score, 68)
     return round(min(max(score, 0), 100), 1)
 
 
@@ -3620,15 +3650,21 @@ def determine_trade_tier(
     setup_type: str,
     hard_reject: bool,
     extended: bool,
+    institutional_quality_score: int = 0,
+    price_above_ma20: bool = False,
 ) -> Tuple[str, str]:
     """Convert score quality into a trading tier without over-rejecting leaders."""
-    structure_broken = hard_reject or leader_label == "LAGGARD / AVOID" or signal_state == "REJECT"
-    strong_leader = leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER", "MOMENTUM LEADER"} or sector_leadership_status in {"LEADING SECTOR", "IMPROVING SECTOR"}
-    if hard_reject or (structure_broken and not strong_leader):
-        return "Tier 4 - Avoid / Reject", "TIER 4: avoid; structure broken or risk too high."
+    failed_setup = setup_type in {"FAILED", "FAILED BREAKOUT"} or signal_state == "REJECT"
+    strong_leader = (
+        leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER", "MOMENTUM LEADER"}
+        or sector_leadership_status in {"LEADING SECTOR", "IMPROVING SECTOR"}
+        or (institutional_quality_score >= 8 and score_at_least(rs_score, 8) and price_above_ma20)
+    )
+    if hard_reject:
+        return "Tier 4 - Avoid / Reject", "TIER 4: avoid; hard reject condition triggered."
     if (
-        adjusted_score >= 90
-        and entry_quality_score >= 8
+        professional_score >= 88
+        and entry_quality_score >= 7
         and pd.notna(risk_pct)
         and risk_pct <= 10
         and score_at_least(rs_score, 7)
@@ -3636,11 +3672,17 @@ def determine_trade_tier(
         and not extended
     ):
         return "Tier 1 - Immediate Action", "TIER 1: institutional leader with clean entry near pivot, risk controlled."
-    if strong_leader and adjusted_score >= 75 and 5 <= entry_quality_score <= 7 and (pd.isna(risk_pct) or risk_pct <= 15) and setup_type != "FAILED":
+    if strong_leader and professional_score >= 72 and not failed_setup:
+        if extended:
+            return "Tier 2 - High Quality, Wait Better Entry", "TIER 2: strong institutional leader but too far from pivot/MA10; wait for reset."
         return "Tier 2 - High Quality, Wait Better Entry", "TIER 2: strong leader but entry timing not ideal; wait for MA10/MA20 pullback."
-    if professional_score >= 60 and setup_type != "FAILED":
+    if strong_leader and professional_score >= 68 and not hard_reject:
+        return "Tier 2 - High Quality, Wait Better Entry", "TIER 2: strong leader but entry timing not ideal; wait for MA10/MA20 pullback."
+    if professional_score >= 60 and not hard_reject:
         return "Tier 3 - Leadership Watchlist", "TIER 3: leadership watchlist; setup not ready."
-    return "Tier 4 - Avoid / Reject", "TIER 4: avoid; structure broken or risk too high."
+    if not hard_reject and not failed_setup:
+        return "Tier 3 - Leadership Watchlist", "TIER 3: leadership watchlist; setup not ready."
+    return "Tier 4 - Avoid / Reject", "TIER 4: avoid; hard reject condition triggered."
 
 
 def hard_reject_check(
@@ -4079,6 +4121,7 @@ def finalize_signal_outputs(
     decision_reason: str,
     earnings_risk_label: str,
     days_to_earnings: int | str | None,
+    trade_tier: str = "",
 ) -> Tuple[str, str, str, str]:
     """Enforce one final decision hierarchy before row creation."""
     days_numeric = numeric_or_na(days_to_earnings)
@@ -4093,11 +4136,16 @@ def finalize_signal_outputs(
         watchlist_flag = "YES"
         decision_reason = "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
 
-    if trade == "YES" and signal_state != "BUY NOW":
+    if trade == "YES" and signal_state != "BUY NOW" and trade_tier in {"", "Tier 1 - Immediate Action"}:
         signal_state = "BUY NOW"
     if signal_state == "BUY NOW":
-        trade = "YES"
-        watchlist_flag = "NO"
+        if trade_tier and trade_tier != "Tier 1 - Immediate Action":
+            signal_state = "WATCH"
+            trade = "NO"
+            watchlist_flag = "YES"
+        else:
+            trade = "YES"
+            watchlist_flag = "NO"
     elif signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
         trade = "NO"
         watchlist_flag = "YES"
@@ -4149,6 +4197,14 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             professional_score = numeric_or_na(row.get("Adjusted Final Score"))
         if pd.isna(professional_score):
             professional_score = 0
+        strong_leader_floor = (
+            pd.notna(institutional_quality)
+            and institutional_quality >= 8
+            and pd.notna(rs_score)
+            and rs_score >= 8
+            and price_above_ma20
+            and not hard_reject
+        )
         if entry_quality < 6:
             professional_score = min(professional_score, 86)
         if pd.notna(risk_pct) and risk_pct > 15:
@@ -4158,15 +4214,21 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         if hard_reject:
             professional_score = min(professional_score, 59)
             trade_tier = "Tier 4 - Avoid / Reject"
-        elif trade_tier not in TRADE_TIER_PRIORITY:
-            if professional_score >= 88 and entry_quality >= 8 and signal_state in {"BUY NOW", "BUY ON BREAKOUT"}:
+        if strong_leader_floor:
+            professional_score = max(professional_score, 68)
+        if not hard_reject and trade_tier not in TRADE_TIER_PRIORITY:
+            if professional_score >= 88 and entry_quality >= 7 and pd.notna(risk_pct) and risk_pct <= 10 and signal_state in {"BUY NOW", "BUY ON BREAKOUT"}:
                 trade_tier = "Tier 1 - Immediate Action"
-            elif professional_score >= 75 and entry_quality >= 5:
+            elif professional_score >= 72:
                 trade_tier = "Tier 2 - High Quality, Wait Better Entry"
             elif professional_score >= 60:
                 trade_tier = "Tier 3 - Leadership Watchlist"
+            elif strong_leader_floor:
+                trade_tier = "Tier 3 - Leadership Watchlist"
             else:
                 trade_tier = "Tier 4 - Avoid / Reject"
+        if not hard_reject and signal_state in {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
+            trade_tier = "Tier 2 - High Quality, Wait Better Entry" if strong_leader_floor or professional_score >= 68 else "Tier 3 - Leadership Watchlist"
 
         if trade_tier == "Tier 1 - Immediate Action":
             if signal_state == "BUY NOW":
@@ -4192,7 +4254,13 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             signal_state = "REJECT"
             trade = "NO"
             watchlist_flag = "NO"
-            decision_reason = "TIER 4: avoid; structure broken or risk too high."
+            decision_reason = "TIER 4: avoid; hard reject condition triggered."
+        elif trade_tier == "Tier 4 - Avoid / Reject" and not hard_reject:
+            trade_tier = "Tier 3 - Leadership Watchlist"
+            signal_state = "WATCH" if signal_state == "REJECT" else signal_state
+            trade = "NO"
+            watchlist_flag = "YES"
+            decision_reason = "TIER 3: leadership watchlist; setup not ready."
 
         signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
             signal_state=signal_state,
@@ -4201,6 +4269,7 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             decision_reason=decision_reason,
             earnings_risk_label=str(row.get("Earnings Risk", "N/A")),
             days_to_earnings=row.get("Days to Earnings"),
+            trade_tier=trade_tier,
         )
 
         entry = numeric_or_na(row.get("Entry Trigger"))
@@ -4238,7 +4307,14 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             fixed.at[idx, "Ideal TP"] = fixed_tp
             fixed.at[idx, "Ideal TP Reason"] = fixed_reason
             fixed.at[idx, "Ideal TP R"] = fixed_r
-            fixed.at[idx, "TP Type"] = "RUNNER TP" if fixed_tp > entry * 1.35 else row.get("TP Type", "PRACTICAL SWING TP") or "PRACTICAL SWING TP"
+            current_tp_type = row.get("TP Type", "PRACTICAL SWING TP") or "PRACTICAL SWING TP"
+            fixed.at[idx, "TP Type"] = (
+                "RUNNER TP"
+                if fixed_tp > entry * 1.35 and current_tp_type == "RUNNER TP"
+                else "TOO FAR / USE TRAILING STOP"
+                if fixed_tp > entry * 1.35
+                else current_tp_type
+            )
 
         fixed.at[idx, "Signal State"] = signal_state
         fixed.at[idx, "Trade"] = trade
@@ -4721,6 +4797,12 @@ def build_scan_row(
         earnings_risk_label=earnings_label,
     )
     sector_context_score = min(10, sector_score * 2 + (2 if sector_leadership_status == "LEADING SECTOR" else 1 if sector_leadership_status == "IMPROVING SECTOR" else 0))
+    avg_range20_for_tp = data["RangePct"].tail(20).mean() if len(data) >= 20 else np.nan
+    volatility_controlled_for_tp = (
+        pd.isna(avg_range20_for_tp)
+        or pd.isna(latest.get("RangePct", np.nan))
+        or float(latest.get("RangePct", 0)) <= float(avg_range20_for_tp) * 1.3
+    )
     practical_tp1, practical_tp2, practical_tp3, ideal_tp, tp_type, practical_tp_reason, ideal_r = calculate_trader_tp_plan(
         entry=entry,
         stop=stop,
@@ -4730,8 +4812,10 @@ def build_scan_row(
         institutional_quality_score=institutional_quality_score,
         rs_score=rs_score,
         sector_score=sector_context_score,
+        sector_leadership_status=sector_leadership_status,
         market_environment=market_environment,
         extended=extended,
+        volatility_controlled=volatility_controlled_for_tp,
     )
     ideal_tp_reason = practical_tp_reason
     risk_quality_note = risk_note(risk_pct, aggressive_mode)
@@ -5057,6 +5141,7 @@ def build_scan_row(
         tp_type=tp_type,
         signal_state=signal_state,
         hard_reject=hard_reject,
+        price_above_ma20=bool(float(latest["Close"]) >= float(latest["MA20"])),
     )
     trade_tier, tier_reason = determine_trade_tier(
         professional_score=professional_score,
@@ -5070,6 +5155,8 @@ def build_scan_row(
         setup_type=setup_type,
         hard_reject=hard_reject,
         extended=extended,
+        institutional_quality_score=institutional_quality_score,
+        price_above_ma20=bool(float(latest["Close"]) >= float(latest["MA20"])),
     )
     if trade_tier == "Tier 1 - Immediate Action":
         if signal_state == "BUY NOW":
@@ -5081,10 +5168,12 @@ def build_scan_row(
             watchlist_flag = "YES"
         decision_reason = tier_reason
     elif trade_tier == "Tier 2 - High Quality, Wait Better Entry":
-        if signal_state == "BUY NOW" or entry_quality_score < 8 or (pd.notna(risk_pct) and risk_pct > 10):
+        if extended:
+            signal_state = "EXTENDED DO NOT CHASE"
+        elif signal_state == "BUY NOW" or entry_quality_score < 8 or (pd.notna(risk_pct) and risk_pct > 10):
             signal_state = "WAIT PULLBACK" if (pd.notna(risk_pct) and risk_pct > 12) or extended else "WATCH"
         trade = "NO"
-        watchlist_flag = "YES"
+        watchlist_flag = "NO" if signal_state == "EXTENDED DO NOT CHASE" else "YES"
         decision_reason = tier_reason
     elif trade_tier == "Tier 3 - Leadership Watchlist":
         if signal_state in {"BUY NOW", "BUY ON BREAKOUT"}:
@@ -5105,10 +5194,11 @@ def build_scan_row(
         signal_state=signal_state,
         trade=trade,
         watchlist_flag=watchlist_flag,
-        decision_reason=decision_reason,
-        earnings_risk_label=earnings_label,
-        days_to_earnings=earnings_info.get("days_to_earnings"),
-    )
+            decision_reason=decision_reason,
+            earnings_risk_label=earnings_label,
+            days_to_earnings=earnings_info.get("days_to_earnings"),
+            trade_tier=trade_tier,
+        )
     if PRACTICAL_TP_NOTE not in decision_reason and signal_state in ACTIONABLE_SIGNAL_STATES:
         decision_reason = f"{decision_reason} {PRACTICAL_TP_NOTE}"
     professional_score = calculate_professional_score(
@@ -5127,6 +5217,7 @@ def build_scan_row(
         tp_type=tp_type,
         signal_state=signal_state,
         hard_reject=hard_reject,
+        price_above_ma20=bool(float(latest["Close"]) >= float(latest["MA20"])),
     )
     watch_type = determine_watch_type(
         signal_state=signal_state,
@@ -5301,6 +5392,8 @@ def build_scan_row(
         "Trail Stop Level": trail_stop,
         "TP Quality Score": tp_quality_score,
         "Ideal TP R": ideal_r,
+        "MA10": round(float(latest["MA10"]), 2),
+        "MA20": round(float(latest["MA20"]), 2),
         "MA10 Distance %": ma10_distance,
         "MA20 Distance %": ma20_distance,
         "1D Return %": round(period_return(data, 1), 2) if pd.notna(period_return(data, 1)) else "N/A",
@@ -5606,6 +5699,13 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
     ranked["sector status sort"] = ranked["Sector Leadership Status"].map(
         {"LEADING SECTOR": 0, "IMPROVING SECTOR": 1, "NEUTRAL SECTOR": 2, "CYCLICAL RISK": 3, "LAGGING SECTOR": 4}
     ).fillna(3)
+    ranked["execution quality sort"] = (
+        pd.to_numeric(ranked.get("Entry Quality Score"), errors="coerce").fillna(0)
+        + pd.to_numeric(ranked.get("Institutional Tightness Score"), errors="coerce").fillna(0)
+        + pd.to_numeric(ranked.get("Healthy Pullback Score"), errors="coerce").fillna(0)
+        + pd.to_numeric(ranked.get("Breakout Quality Score"), errors="coerce").fillna(0)
+        - (pd.to_numeric(ranked.get("MA10 Distance %"), errors="coerce").fillna(0).clip(lower=0) / 3)
+    )
     ranked = ranked.sort_values(
         [
             "tier sort",
@@ -5619,6 +5719,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Adjusted Final Score",
             "Institutional Quality Score",
             "sector status sort",
+            "execution quality sort",
             "Institutional Tightness Score",
             "Healthy Pullback Score",
             "Breakout Quality Score",
@@ -5632,7 +5733,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Final Score",
             "earnings sort",
         ],
-        ascending=[True, True, True, True, True, True, False, False, False, False, True, False, False, False, False, False, False, False, False, False, True, False, True],
+        ascending=[True, True, True, True, True, True, False, False, False, False, True, False, False, False, False, False, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -8118,6 +8219,13 @@ def render_swing_scanner(
     visible["sector status sort"] = visible.get("Sector Leadership Status", pd.Series("", index=visible.index)).map(
         {"LEADING SECTOR": 0, "IMPROVING SECTOR": 1, "NEUTRAL SECTOR": 2, "CYCLICAL RISK": 3, "LAGGING SECTOR": 4}
     ).fillna(3)
+    visible["execution quality sort"] = (
+        pd.to_numeric(visible.get("Entry Quality Score"), errors="coerce").fillna(0)
+        + pd.to_numeric(visible.get("Institutional Tightness Score"), errors="coerce").fillna(0)
+        + pd.to_numeric(visible.get("Healthy Pullback Score"), errors="coerce").fillna(0)
+        + pd.to_numeric(visible.get("Breakout Quality Score"), errors="coerce").fillna(0)
+        - (pd.to_numeric(visible.get("MA10 Distance %"), errors="coerce").fillna(0).clip(lower=0) / 3)
+    )
     visible = visible.sort_values(
         [
             "tier sort",
@@ -8125,9 +8233,10 @@ def render_swing_scanner(
             "Professional Score",
             "Entry Quality Score",
             "Institutional Quality Score",
+            "execution quality sort",
             "Risk %",
         ],
-        ascending=[True, True, False, False, False, True],
+        ascending=[True, True, False, False, False, False, True],
     )
 
     compact_columns = [
