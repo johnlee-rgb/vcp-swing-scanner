@@ -1802,7 +1802,11 @@ PROTECTED_SETUP_TYPES = {
     "EARLY VCP",
     "PULLBACK TO MA10",
     "PULLBACK TO MA20",
+    "HEALTHY PULLBACK WATCH",
+    "POST-BREAKOUT DIGESTION",
 }
+
+PRACTICAL_TP_NOTE = "TP2 selected as practical swing target; TP3 is runner only."
 
 
 def risk_bucket_state(
@@ -1905,6 +1909,70 @@ def validate_ideal_tp(
         signal_state=signal_state,
     )
     return fixed_tp, fixed_reason if not ideal_tp_reason else f"{fixed_reason}; {ideal_tp_reason}", fixed_r
+
+
+def enforce_tp_ladder(entry: float, stop: float, tp1: float, tp2: float, tp3: float) -> Tuple[float, float, float]:
+    """Keep practical long targets ordered above entry."""
+    risk_per_share = max(float(entry) - float(stop), 0.01)
+    tp1 = max(float(tp1), float(entry) + 1.5 * risk_per_share)
+    tp2 = max(float(tp2), tp1 + 0.5 * risk_per_share, float(entry) + 2.0 * risk_per_share)
+    tp3 = max(float(tp3), tp2 + 0.5 * risk_per_share, float(entry) + 3.0 * risk_per_share)
+    return round(tp1, 2), round(tp2, 2), round(tp3, 2)
+
+
+def calculate_trader_tp_plan(
+    *,
+    entry: float,
+    stop: float,
+    current_close: float,
+    nearest_resistance: float,
+    recent_high: float,
+    institutional_quality_score: int,
+    rs_score: float,
+    sector_score: int,
+    market_environment: str,
+    extended: bool,
+) -> Tuple[float, float, float, float, str, str, float]:
+    """Build trader-style TP1/TP2/TP3 where TP2 is usually the swing plan."""
+    risk_per_share = max(float(entry) - float(stop), 0.01)
+    target_15r = float(entry) + 1.5 * risk_per_share
+    target_2r = float(entry) + 2.0 * risk_per_share
+    target_25r = float(entry) + 2.5 * risk_per_share
+    target_3r = float(entry) + 3.0 * risk_per_share
+    major_resistance = nearest_resistance if pd.notna(nearest_resistance) and nearest_resistance > entry else round_number_resistance(max(entry, current_close))
+    breakout_extension = recent_high * 1.02 if pd.notna(recent_high) and recent_high > entry else target_2r
+    measured_move = float(entry) + max(float(current_close) - float(entry), risk_per_share) * 1.25
+
+    tp1_candidates = [target_15r, target_2r, major_resistance, breakout_extension]
+    tp1_valid = [value for value in tp1_candidates if pd.notna(value) and value > entry]
+    tp1 = min(tp1_valid, key=lambda value: abs(value - target_15r)) if tp1_valid else target_15r
+    if tp1 > target_2r * 1.05:
+        tp1 = target_2r
+
+    tp2_candidates = [target_2r, target_25r, target_3r, measured_move]
+    if major_resistance > tp1:
+        tp2_candidates.append(major_resistance)
+    tp2_valid = [value for value in tp2_candidates if pd.notna(value) and value > tp1]
+    tp2 = min(tp2_valid, key=lambda value: abs(value - target_25r)) if tp2_valid else target_2r
+
+    runner_allowed = (
+        institutional_quality_score >= 8
+        and score_at_least(rs_score, 8)
+        and sector_score >= 7
+        and market_environment == "CONFIRMED UPTREND"
+        and not extended
+    )
+    tp3_base = max(target_3r, tp2 + 0.5 * risk_per_share, recent_high * 1.08 if pd.notna(recent_high) else target_3r)
+    tp3 = tp3_base if runner_allowed else max(target_3r, tp2 + 0.5 * risk_per_share)
+    tp1, tp2, tp3 = enforce_tp_ladder(entry, stop, tp1, tp2, tp3)
+
+    ideal_tp = tp3 if runner_allowed else tp2
+    tp_type = "RUNNER TP" if runner_allowed else "PRACTICAL SWING TP"
+    if ideal_tp > entry * 1.35:
+        tp_type = "RUNNER TP" if runner_allowed else "TOO FAR / USE TRAILING STOP"
+        ideal_tp = tp2
+    ideal_r = round((ideal_tp - entry) / risk_per_share, 2)
+    return tp1, tp2, tp3, round(ideal_tp, 2), tp_type, PRACTICAL_TP_NOTE, ideal_r
 
 
 def calculate_ideal_tp_plan(
@@ -2139,6 +2207,8 @@ def classify_setup_type(
     resistance_breakout_mode: str,
     momentum_breakout_candidate: bool,
     latest: pd.Series,
+    healthy_pullback_label: str = "",
+    institutional_tightness_score: int = 0,
 ) -> str:
     """Separate pattern classification from the raw VCP detector."""
     if momentum_breakout_candidate:
@@ -2148,13 +2218,24 @@ def classify_setup_type(
     if action == "EXTENDED" or current_setup_status == "EXTENDED":
         return "EXTENDED"
     if action == "FAILED" or current_setup_status == "FAILED BREAKOUT":
+        if healthy_pullback_label == "HEALTHY PULLBACK":
+            return "HEALTHY PULLBACK WATCH"
         return "FAILED"
+    close = float(latest["Close"])
+    pivot_value = float(latest.get("Pivot", np.nan)) if pd.notna(latest.get("Pivot", np.nan)) else np.nan
+    if healthy_pullback_label == "HEALTHY PULLBACK":
+        return "HEALTHY PULLBACK WATCH"
+    if pd.notna(pivot_value) and close > pivot_value and close >= min(float(latest["MA10"]), float(latest["MA20"])):
+        return "POST-BREAKOUT DIGESTION"
+    if pd.notna(pivot_value) and close < pivot_value and close > min(float(latest["MA10"]), float(latest["MA20"])):
+        return "PULLBACK TO MA10" if close >= float(latest["MA10"]) else "PULLBACK TO MA20"
+    if pd.notna(pivot_value) and 0 <= (pivot_value - close) / close * 100 <= 3 and institutional_tightness_score >= 7:
+        return "RESISTANCE BREAKOUT WATCH"
     if vcp_status == "VALID VCP":
         return "TRUE VCP"
     if vcp_status == "EARLY VCP":
         return "EARLY VCP"
     if action == "PULLBACK ENTRY":
-        close = float(latest["Close"])
         ma10_gap = abs(close - float(latest["MA10"])) / close * 100 if close else np.nan
         ma20_gap = abs(close - float(latest["MA20"])) / close * 100 if close else np.nan
         return "PULLBACK TO MA10" if pd.notna(ma10_gap) and ma10_gap <= 3 else "PULLBACK TO MA20" if pd.notna(ma20_gap) and ma20_gap <= 5 else "PULLBACK TO MA20"
@@ -2548,6 +2629,104 @@ def calculate_explosive_score(data: pd.DataFrame, pivot: PivotInfo, higher_low_s
     return score, label
 
 
+def calculate_healthy_pullback_score(data: pd.DataFrame, pivot: PivotInfo) -> Tuple[int, str, bool]:
+    """Score whether a leader is digesting normally instead of breaking down."""
+    latest = data.iloc[-1]
+    score = 0
+    close = float(latest["Close"])
+    avg_vol20 = float(latest.get("AvgVol20", np.nan)) if pd.notna(latest.get("AvgVol20", np.nan)) else np.nan
+    recent_high_volume = float(data["Volume"].tail(20).max()) if len(data) >= 20 else float(latest["Volume"])
+    lighter_than_breakout = bool(pd.notna(recent_high_volume) and latest["Volume"] < recent_high_volume * 0.75)
+
+    if close >= float(latest["MA10"]):
+        score += 2
+    if close >= float(latest["MA20"]):
+        score += 2
+    if lighter_than_breakout:
+        score += 2
+    if pd.notna(avg_vol20) and latest["Volume"] < avg_vol20:
+        score += 1
+    daily_range = max(float(latest["High"]) - float(latest["Low"]), 0.01)
+    if close >= float(latest["Low"]) + 0.5 * daily_range:
+        score += 1
+    rsi = latest.get("RSI14", np.nan)
+    if pd.notna(rsi) and 50 <= rsi <= 75:
+        score += 1
+    if pd.notna(pivot.pivot) and close >= pivot.pivot * 0.97:
+        score += 1
+
+    heavy_volume = pd.notna(avg_vol20) and latest["Volume"] > avg_vol20 * 1.15
+    red_candle = close < float(latest["Open"])
+    body_pct = abs(close - float(latest["Open"])) / max(close, 0.01) * 100
+    recent_structure_low = float(data["Low"].iloc[-21:-1].min()) if len(data) > 21 else np.nan
+    if close < float(latest["MA20"]) and heavy_volume:
+        score -= 3
+    if pd.notna(recent_structure_low) and close < recent_structure_low:
+        score -= 2
+    if red_candle and heavy_volume and body_pct >= 3:
+        score -= 2
+    if pd.notna(pivot.pivot) and data["High"].tail(10).max() > pivot.pivot * 1.02 and close < pivot.pivot and heavy_volume:
+        score -= 2
+
+    score = int(min(max(score, 0), 10))
+    if score >= 8:
+        label = "HEALTHY PULLBACK"
+    elif score >= 6:
+        label = "NORMAL DIGESTION"
+    elif score >= 3:
+        label = "WARNING PULLBACK"
+    else:
+        label = "FAILED PULLBACK"
+    return score, label, lighter_than_breakout
+
+
+def calculate_institutional_tightness_score(data: pd.DataFrame, pivot: PivotInfo) -> Tuple[int, str]:
+    """Score tight institutional accumulation from price range and volume behavior."""
+    latest = data.iloc[-1]
+    score = 0
+    closes = data["Close"].tail(5)
+    ranges = data["RangePct"].tail(10)
+    avg_vol20 = latest.get("AvgVol20", np.nan)
+
+    if len(closes) >= 3 and (closes.tail(3).max() - closes.tail(3).min()) / max(float(latest["Close"]), 0.01) * 100 <= 2:
+        score += 2
+    if len(ranges) >= 10 and ranges.tail(5).mean() < ranges.head(5).mean():
+        score += 2
+    if has_volume_contraction(data):
+        score += 2
+    if latest["Close"] >= latest["MA10"]:
+        score += 1
+    if pd.notna(pivot.pivot) and latest["Close"] >= pivot.pivot * 0.97:
+        score += 1
+    small_candles = int((data["RangePct"].tail(5) <= data["RangePct"].tail(20).mean()).sum()) if len(data) >= 20 else 0
+    if small_candles >= 3:
+        score += 1
+    if distribution_days_count(data, lookback=5) == 0:
+        score += 1
+
+    wide_candles = int((data["RangePct"].tail(5) > data["RangePct"].tail(20).mean() * 1.6).sum()) if len(data) >= 20 else 0
+    high_volume_red = int(((data["Close"].tail(5) < data["Open"].tail(5)) & (data["Volume"].tail(5) > avg_vol20)).sum()) if pd.notna(avg_vol20) else 0
+    if wide_candles >= 2:
+        score -= 2
+    if high_volume_red >= 2:
+        score -= 2
+    if latest["Close"] < latest["MA10"] and pd.notna(avg_vol20) and latest["Volume"] > avg_vol20:
+        score -= 2
+    if pd.notna(pivot.pivot) and latest["Close"] < pivot.pivot * 0.98 and pd.notna(avg_vol20) and latest["Volume"] > avg_vol20:
+        score -= 2
+
+    score = int(min(max(score, 0), 10))
+    if score >= 8:
+        label = "TIGHT LEADER"
+    elif score >= 6:
+        label = "TIGHT BASE"
+    elif score >= 4:
+        label = "LOOSE BUT STRONG"
+    else:
+        label = "WIDE AND RISKY"
+    return score, label
+
+
 def detect_stage_analysis(data: pd.DataFrame) -> str:
     """Classify the longer-term stage using MA150/MA200 and trend maturity."""
     if len(data) < 210:
@@ -2611,46 +2790,68 @@ def calculate_breakout_quality_score(
     market_environment: str,
     extended: bool,
     stage_label: str,
+    institutional_tightness_score: int = 0,
+    sector_leadership_status: str = "NEUTRAL SECTOR",
+    ma10_distance: float = np.nan,
 ) -> int:
     """Score the quality of a breakout trigger from 0 to 10."""
     latest = data.iloc[-1]
     score = 0
+    avg_vol20 = latest.get("AvgVol20", np.nan)
+    daily_range = max(float(latest["High"]) - float(latest["Low"]), 0.01)
+    close_position = (float(latest["Close"]) - float(latest["Low"])) / daily_range
+    upper_wick_pct = (float(latest["High"]) - max(float(latest["Open"]), float(latest["Close"]))) / daily_range
     close_band_pct = (
         (data["Close"].tail(5).max() - data["Close"].tail(5).min()) / latest["Close"] * 100
         if len(data) >= 5 and latest["Close"]
         else np.nan
     )
+    if close_position >= 0.75:
+        score += 2
+    elif close_position >= 0.5:
+        score += 1
     if pd.notna(close_band_pct) and close_band_pct <= 3:
         score += 2
     elif pd.notna(close_band_pct) and close_band_pct <= 5:
         score += 1
 
-    if has_volume_contraction(data):
+    if institutional_tightness_score >= 7 or has_volume_contraction(data):
         score += 2
     if pd.notna(rvol) and rvol > 2:
         score += 2
     elif pd.notna(rvol) and rvol >= 1.5:
         score += 1
+    elif pd.notna(avg_vol20) and latest["Volume"] > avg_vol20 * 1.25:
+        score += 2
     if pivot.label == "Breakout in progress" or (pd.notna(pivot.distance_pct) and -2 <= pivot.distance_pct <= 5):
         score += 1
     if score_at_least(rs_score, 7):
+        score += 1
+    if sector_leadership_status == "LEADING SECTOR":
         score += 1
     if market_environment == "CONFIRMED UPTREND":
         score += 1
 
     wide_candle = bool(latest.get("RangePct", np.nan) > data["RangePct"].tail(20).mean() * 1.8) if len(data) >= 20 else False
-    if extended:
+    if extended or (pd.notna(ma10_distance) and ma10_distance > 12):
         score -= 2
     if wide_candle:
         score -= 1
+    if upper_wick_pct >= 0.4:
+        score -= 2
     if pd.notna(rvol) and rvol < 1:
-        score -= 1
+        score -= 2
+    elif pd.notna(avg_vol20) and latest["Volume"] < avg_vol20 and pivot.label == "Breakout in progress":
+        score -= 2
+    if pd.notna(latest.get("RSI14", np.nan)) and latest["RSI14"] > 85 and pd.notna(ma10_distance) and ma10_distance > 8:
+        score -= 2
     if stage_label in {"LATE STAGE 2", "STAGE 3 RISK", "STAGE 4"}:
         score -= 1
     return int(min(max(score, 0), 10))
 
 
 def calculate_eod_breakout_quality_score(
+    data: pd.DataFrame | None,
     pivot: PivotInfo,
     rs_score: float,
     tightness_score: int,
@@ -2661,9 +2862,30 @@ def calculate_eod_breakout_quality_score(
     setup_grade: str,
     vcp_status: str,
     setup_type: str,
+    institutional_tightness_score: int = 0,
+    sector_leadership_status: str = "NEUTRAL SECTOR",
 ) -> int:
     """Score EOD breakout quality without requiring intraday RVOL."""
     score = 0
+    latest = data.iloc[-1] if isinstance(data, pd.DataFrame) and not data.empty else None
+    if latest is not None:
+        daily_range = max(float(latest["High"]) - float(latest["Low"]), 0.01)
+        close_position = (float(latest["Close"]) - float(latest["Low"])) / daily_range
+        upper_wick_pct = (float(latest["High"]) - max(float(latest["Open"]), float(latest["Close"]))) / daily_range
+        avg_vol20 = latest.get("AvgVol20", np.nan)
+        if close_position >= 0.75:
+            score += 2
+        elif close_position >= 0.5:
+            score += 1
+        if upper_wick_pct >= 0.4:
+            score -= 2
+        if pd.notna(avg_vol20) and pivot.label == "Breakout in progress" and latest["Volume"] < avg_vol20:
+            score -= 2
+        if pd.notna(avg_vol20) and pivot.label == "Breakout in progress" and latest["Volume"] > avg_vol20 * 1.25:
+            score += 2
+        ma10_distance = (latest["Close"] - latest["MA10"]) / latest["MA10"] * 100 if latest["MA10"] else np.nan
+        if pd.notna(latest.get("RSI14", np.nan)) and latest["RSI14"] > 85 and pd.notna(ma10_distance) and ma10_distance > 8:
+            score -= 2
     distance = pivot.distance_pct
     if pd.notna(distance):
         if pivot.label == "Breakout in progress" or -3 <= distance <= 3:
@@ -2676,6 +2898,10 @@ def calculate_eod_breakout_quality_score(
     elif score_at_least(rs_score, 6):
         score += 1
 
+    if institutional_tightness_score >= 8:
+        score += 2
+    elif institutional_tightness_score >= 6:
+        score += 1
     if tightness_score >= 4:
         score += 2
     elif tightness_score >= 3:
@@ -2712,6 +2938,10 @@ def calculate_eod_breakout_quality_score(
         score -= 1
     elif setup_grade == "Reject":
         score -= 2
+    if sector_leadership_status == "LEADING SECTOR":
+        score += 1
+    elif sector_leadership_status in {"LAGGING SECTOR", "CYCLICAL RISK"}:
+        score -= 1
 
     return int(min(max(score, 0), 10))
 
@@ -2726,20 +2956,31 @@ def determine_watch_type(
     earnings_risk_label: str,
     resistance_breakout_mode: str,
     pivot: PivotInfo,
+    healthy_pullback_label: str = "",
+    institutional_tightness_score: int = 0,
+    setup_type_label: str = "",
 ) -> str:
     """Classify why a non-BUY-NOW setup belongs on the watchlist."""
     if signal_state == "BUY NOW":
         return "NONE"
     if earnings_risk_label == "HIGH RISK" and signal_state in {"WATCH", "BUY ON BREAKOUT", "WAIT PULLBACK"}:
         return "EARNINGS RISK WATCH"
+    if healthy_pullback_label == "HEALTHY PULLBACK" or setup_type in {"HEALTHY PULLBACK WATCH"}:
+        return "HEALTHY PULLBACK"
+    if institutional_tightness_score >= 7:
+        return "TIGHT BASE"
+    if setup_type == "POST-BREAKOUT DIGESTION":
+        return "POST-BREAKOUT DIGESTION"
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH" or setup_type == "RESISTANCE BREAKOUT WATCH":
         return "RESISTANCE BREAKOUT WATCH"
     if setup_type == "MOMENTUM BREAKOUT EXCEPTION" or action == "MOMENTUM BREAKOUT":
         return "MOMENTUM WATCH"
     if setup_type == "PULLBACK TO MA10":
-        return "PULLBACK TO MA10"
+        return "WAIT MA10 SUPPORT"
     if setup_type == "PULLBACK TO MA20" or signal_state == "WAIT PULLBACK":
-        return "PULLBACK TO MA20"
+        return "WAIT MA20 SUPPORT"
+    if signal_state == "EXTENDED DO NOT CHASE":
+        return "EXTENDED RESET"
     if signal_state == "BUY ON BREAKOUT" and volume_confirmation != "YES":
         return "WAIT VOLUME"
     if breakout_alert == "NEAR BREAKOUT" or (pd.notna(pivot.distance_pct) and -1 <= pivot.distance_pct <= 5):
@@ -3061,6 +3302,7 @@ INSTITUTIONAL_LEADER_TICKERS = {
 STRONG_MIDCAP_LEADER_TICKERS = {"VRT", "APP", "PLTR", "NET", "DDOG", "SNOW", "COIN", "HOOD", "GEV", "VST", "CEG"}
 CYCLICAL_SECTOR_GROUPS = {"Energy", "Materials"}
 DEFENSIVE_SECTOR_GROUPS = {"Healthcare", "Utilities", "Consumer", "Real Estate"}
+CYCLICAL_INDUSTRY_TERMS = ("steel", "commodity", "mining", "metal", "oil", "gas", "materials", "coal")
 LEADING_THEME_GROUPS = {
     "AI / Semis",
     "Power / Utilities",
@@ -3072,6 +3314,36 @@ LEADING_THEME_GROUPS = {
     "Semiconductors",
     "Technology",
 }
+
+
+def sector_leadership_status_and_weight(
+    *,
+    sector_info: dict,
+    sector_leadership: str,
+    sector_score: int,
+    rs_score: float,
+) -> Tuple[str, int]:
+    """Classify sector context without extra data fetches."""
+    sector_group = sector_info.get("sector_group", "Other")
+    theme_group = sector_info.get("theme_group", sector_group)
+    industry_text = f"{sector_info.get('sector', '')} {sector_info.get('industry', '')} {theme_group}".lower()
+
+    cyclical = sector_group in CYCLICAL_SECTOR_GROUPS or any(term in industry_text for term in CYCLICAL_INDUSTRY_TERMS)
+    leading_theme = theme_group in {"AI / Semis", "Semiconductors", "Technology", "Power / Utilities"} or sector_group in {"Semiconductors", "Technology"}
+
+    if cyclical and not (sector_leadership == "Leader" and sector_score >= 3):
+        return "CYCLICAL RISK", -3
+    if leading_theme and sector_leadership == "Leader" and sector_score >= 3:
+        return "LEADING SECTOR", 8
+    if sector_leadership == "Leader" and sector_score >= 3:
+        return "LEADING SECTOR", 5
+    if sector_score >= 2 or (leading_theme and score_at_least(rs_score, 7)):
+        return "IMPROVING SECTOR", 3
+    if sector_group in DEFENSIVE_SECTOR_GROUPS and not score_at_least(rs_score, 8):
+        return "LAGGING SECTOR", -2
+    if sector_leadership == "Laggard":
+        return "LAGGING SECTOR", -3
+    return "NEUTRAL SECTOR", 0
 
 
 def calculate_institutional_quality_score(
@@ -3164,9 +3436,24 @@ def leader_quality_label(
     return "LAGGARD / AVOID" if not score_at_least(rs_score, 5) else "MOMENTUM LEADER"
 
 
-def adjusted_final_score(final_score: float, institutional_quality_score: int, sector_score: int, market_score: int) -> float:
+def adjusted_final_score(
+    final_score: float,
+    institutional_quality_score: int,
+    sector_score: int,
+    market_score: int,
+    sector_leadership_weight: int = 0,
+    institutional_tightness_score: int = 0,
+) -> float:
     """Blend chart score with institutional and market context for ranking."""
-    score = float(final_score) * 0.70 + institutional_quality_score * 3 + sector_score * 2 + market_score
+    tightness_boost = 4 if institutional_tightness_score >= 8 else 2 if institutional_tightness_score >= 7 else 0
+    score = (
+        float(final_score) * 0.65
+        + institutional_quality_score * 3
+        + sector_score * 1.5
+        + market_score
+        + sector_leadership_weight
+        + tightness_boost
+    )
     return round(min(max(score, 0), 100), 1)
 
 
@@ -3233,7 +3520,7 @@ def institutional_decision_reason(
     if signal_state == "BUY ON BREAKOUT":
         if pd.notna(risk_pct) and risk_pct > 10:
             return "BUY ON BREAKOUT: good setup but risk slightly above preferred 10%; wait for clean trigger."
-        return "BUY ON BREAKOUT: near pivot, wait for volume confirmation."
+        return "BUY ON BREAKOUT: near pivot, strong RS, wait for breakout volume."
     if signal_state == "WATCH":
         if earnings_risk_label == "HIGH RISK":
             return "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
@@ -3245,9 +3532,9 @@ def institutional_decision_reason(
             return "WAIT PULLBACK: strong leader but stop distance too wide."
         if pd.notna(risk_pct) and risk_pct > 12:
             return "WAIT PULLBACK: risk above ideal range, wait for tighter entry."
-        return "WAIT PULLBACK: setup is strong but entry is stretched; wait for MA10/MA20 support."
+        return "WAIT PULLBACK: strong leader but stop distance too wide; wait for tighter MA10/MA20 entry."
     if signal_state == "EXTENDED DO NOT CHASE":
-        return "EXTENDED: wait for pullback, do not chase."
+        return "EXTENDED: do not chase; wait for base or MA10 reset."
     return "REJECT: actual hard reject condition triggered."
 
 
@@ -3469,6 +3756,53 @@ def decision_engine_regression_checks() -> None:
         ascending=[True, False, False, False, False, True],
     )["Signal State"].tolist()
     assert ranked_states[0] == "BUY NOW" and ranked_states[-1] == "REJECT"
+    tp1, tp2, tp3, ideal, tp_type, tp_reason, _ = calculate_trader_tp_plan(
+        entry=240,
+        stop=228,
+        current_close=242,
+        nearest_resistance=268,
+        recent_high=270,
+        institutional_quality_score=9,
+        rs_score=9,
+        sector_score=8,
+        market_environment="UPTREND UNDER PRESSURE",
+        extended=False,
+    )
+    assert 240 < tp1 < tp2 < tp3
+    assert ideal == tp2 and tp_type == "PRACTICAL SWING TP" and "TP2 selected" in tp_reason
+    dates = pd.date_range("2026-01-01", periods=25)
+    pullback_data = pd.DataFrame(
+        {
+            "Open": [100 + i * 0.8 for i in range(25)],
+            "High": [102 + i * 0.8 for i in range(25)],
+            "Low": [99 + i * 0.8 for i in range(25)],
+            "Close": [101 + i * 0.8 for i in range(25)],
+            "Volume": [2_000_000] * 20 + [900_000, 850_000, 800_000, 780_000, 760_000],
+            "MA10": [98 + i * 0.75 for i in range(25)],
+            "MA20": [96 + i * 0.7 for i in range(25)],
+            "AvgVol20": [1_500_000] * 25,
+            "RSI14": [62] * 25,
+            "RangePct": [2] * 25,
+        },
+        index=dates,
+    )
+    hp_score, hp_label, lighter = calculate_healthy_pullback_score(pullback_data, PivotInfo(118, 1, 119, "Near pivot", 3))
+    tight_score, tight_label = calculate_institutional_tightness_score(pullback_data, PivotInfo(118, 1, 119, "Near pivot", 3))
+    assert hp_score >= 7 and hp_label in {"HEALTHY PULLBACK", "NORMAL DIGESTION"} and lighter
+    assert tight_score >= 6 and tight_label in {"TIGHT LEADER", "TIGHT BASE"}
+    semi_status, semi_weight = sector_leadership_status_and_weight(
+        sector_info={"sector_group": "Semiconductors", "theme_group": "AI / Semis", "sector": "Technology", "industry": "Semiconductors"},
+        sector_leadership="Leader",
+        sector_score=3,
+        rs_score=9,
+    )
+    steel_status, steel_weight = sector_leadership_status_and_weight(
+        sector_info={"sector_group": "Materials", "theme_group": "Materials", "sector": "Steel", "industry": "Steel"},
+        sector_leadership="Average",
+        sector_score=1,
+        rs_score=9,
+    )
+    assert semi_status == "LEADING SECTOR" and semi_weight > steel_weight and steel_status == "CYCLICAL RISK"
 
 
 def reason_with_signal_prefix(signal_state: str, decision_reason: str) -> str:
@@ -3548,9 +3882,12 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         rs_score = numeric_or_na(row.get("RS Score Raw", row.get("RS Score")))
         final_score = numeric_or_na(row.get("Final Score"))
         setup_type = str(row.get("Setup Type", ""))
+        institutional_quality = numeric_or_na(row.get("Institutional Quality Score"))
+        price_above_ma20 = numeric_or_na(row.get("close")) >= numeric_or_na(row.get("MA20", row.get("close"))) if pd.notna(numeric_or_na(row.get("close"))) else False
 
         protected = (
             (pd.notna(rs_score) and pd.notna(final_score) and rs_score >= 8 and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 12)
+            or (pd.notna(institutional_quality) and institutional_quality >= 8 and pd.notna(rs_score) and rs_score >= 8 and price_above_ma20)
             or setup_type in PROTECTED_SETUP_TYPES
             or str(row.get("VCP Status", "")) in {"VALID VCP", "EARLY VCP"}
         )
@@ -3573,30 +3910,40 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
 
         entry = numeric_or_na(row.get("Entry Trigger"))
         stop = numeric_or_na(row.get("Stop Loss"))
-        target_2r = numeric_or_na(row.get("Target 2R"))
-        target_3r = numeric_or_na(row.get("Target 3R"))
+        tp1 = numeric_or_na(row.get("TP1", row.get("Target 1R")))
+        tp2 = numeric_or_na(row.get("TP2", row.get("Target 2R")))
+        tp3 = numeric_or_na(row.get("TP3", row.get("Target 3R")))
+        target_2r = numeric_or_na(row.get("Target 2R", tp2))
+        target_3r = numeric_or_na(row.get("Target 3R", tp3))
         ideal_tp = numeric_or_na(row.get("Ideal TP"))
         ideal_r = numeric_or_na(row.get("Ideal TP R"))
         nearest_resistance = numeric_or_na(row.get("Nearest Resistance"))
         current_close = numeric_or_na(row.get("Current Price", row.get("close")))
         if all(pd.notna(value) for value in [entry, stop, target_2r, target_3r, current_close]):
+            if pd.isna(tp1) or pd.isna(tp2) or pd.isna(tp3):
+                tp1, tp2, tp3 = target_2r, target_2r, target_3r
+            tp1, tp2, tp3 = enforce_tp_ladder(entry, stop, tp1, tp2, tp3)
             if pd.isna(nearest_resistance):
-                nearest_resistance = target_2r
+                nearest_resistance = tp2
             fixed_tp, fixed_reason, fixed_r = validate_ideal_tp(
                 ideal_tp=ideal_tp,
                 ideal_tp_reason=str(row.get("Ideal TP Reason", "")),
                 ideal_r=ideal_r if pd.notna(ideal_r) else 0,
                 entry=entry,
                 stop=stop,
-                target_2r=target_2r,
-                target_3r=target_3r,
+                target_2r=tp2,
+                target_3r=tp3,
                 nearest_resistance=nearest_resistance,
                 current_close=current_close,
                 signal_state=signal_state,
             )
+            fixed.at[idx, "TP1"] = tp1
+            fixed.at[idx, "TP2"] = tp2
+            fixed.at[idx, "TP3"] = tp3
             fixed.at[idx, "Ideal TP"] = fixed_tp
             fixed.at[idx, "Ideal TP Reason"] = fixed_reason
             fixed.at[idx, "Ideal TP R"] = fixed_r
+            fixed.at[idx, "TP Type"] = "RUNNER TP" if fixed_tp > entry * 1.35 else row.get("TP Type", "PRACTICAL SWING TP") or "PRACTICAL SWING TP"
 
         fixed.at[idx, "Signal State"] = signal_state
         fixed.at[idx, "Trade"] = trade
@@ -3604,6 +3951,12 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "Decision Reason"] = decision_reason
         fixed.at[idx, "Trade Reason"] = decision_reason
         fixed.at[idx, "Watchlist Reason"] = "Already Trade YES" if trade == "YES" else decision_reason
+        if row.get("Healthy Pullback Label") == "HEALTHY PULLBACK" and signal_state in {"WATCH", "WAIT PULLBACK"}:
+            fixed.at[idx, "Watch Type"] = "HEALTHY PULLBACK"
+        elif numeric_or_na(row.get("Institutional Tightness Score")) >= 7 and signal_state in {"WATCH", "BUY ON BREAKOUT"}:
+            fixed.at[idx, "Watch Type"] = "TIGHT BASE"
+        elif signal_state == "REJECT" and not str(row.get("Hard Reject Reason", "")):
+            fixed.at[idx, "Hard Reject Reason"] = "REJECT: hard reject reason unavailable; rerun scan."
         fixed.at[idx, "signal sort"] = SIGNAL_STATE_PRIORITY.get(signal_state, 9)
     return fixed
 
@@ -3858,6 +4211,14 @@ def build_scan_row(
         rvol, intraday_volume_ratio, rvol_label = np.nan, np.nan, "EOD only"
     stage_label = detect_stage_analysis(data)
     institutional_action = detect_institutional_action(data)
+    healthy_pullback_score, healthy_pullback_label, lighter_pullback_volume = calculate_healthy_pullback_score(data, pivot)
+    institutional_tightness_score, institutional_tightness_label = calculate_institutional_tightness_score(data, pivot)
+    sector_leadership_status, sector_leadership_weight = sector_leadership_status_and_weight(
+        sector_info=sector_info,
+        sector_leadership=sector_leadership,
+        sector_score=sector_score,
+        rs_score=rs_score,
+    )
     institutional_quality_score = calculate_institutional_quality_score(
         ticker=ticker,
         sector_info=sector_info,
@@ -3871,6 +4232,8 @@ def build_scan_row(
         ma10_distance=ma10_distance,
         rsi=float(latest["RSI14"]),
     )
+    if sector_leadership_status == "CYCLICAL RISK" and (float(latest["RSI14"]) > 85 or extended):
+        institutional_quality_score = max(institutional_quality_score - 2, 0)
     leader_label = leader_quality_label(
         ticker=ticker,
         sector_info=sector_info,
@@ -3880,7 +4243,14 @@ def build_scan_row(
         sector_score=sector_score,
         institutional_quality_score=institutional_quality_score,
     )
-    adjusted_score = adjusted_final_score(final_score, institutional_quality_score, sector_score, market_score)
+    adjusted_score = adjusted_final_score(
+        final_score,
+        institutional_quality_score,
+        sector_score,
+        market_score,
+        sector_leadership_weight=sector_leadership_weight,
+        institutional_tightness_score=institutional_tightness_score,
+    )
     breakout_quality_score = calculate_breakout_quality_score(
         data=data,
         pivot=pivot,
@@ -3889,6 +4259,9 @@ def build_scan_row(
         market_environment=market_environment,
         extended=extended,
         stage_label=stage_label,
+        institutional_tightness_score=institutional_tightness_score,
+        sector_leadership_status=sector_leadership_status,
+        ma10_distance=ma10_distance,
     )
     earnings_intelligence = earnings_intelligence_label(earnings_label, post_earnings_label)
     trade, trade_reason = decide_trade(
@@ -3968,6 +4341,8 @@ def build_scan_row(
     if (not momentum_breakout_candidate) and quality_grade == "C" and vcp.status == "NOT VCP" and rs_score < 5:
         trade = "NO"
         trade_reason = "Not VCP and weak relative strength"
+    latest_with_pivot = latest.copy()
+    latest_with_pivot["Pivot"] = pivot.pivot
     if not live_mode:
         provisional_setup_type = classify_setup_type(
             vcp_status=vcp.status,
@@ -3975,9 +4350,12 @@ def build_scan_row(
             current_setup_status=current_setup_status,
             resistance_breakout_mode="NO",
             momentum_breakout_candidate=momentum_breakout_candidate,
-            latest=latest,
+            latest=latest_with_pivot,
+            healthy_pullback_label=healthy_pullback_label,
+            institutional_tightness_score=institutional_tightness_score,
         )
         breakout_quality_score = calculate_eod_breakout_quality_score(
+            data=data,
             pivot=pivot,
             rs_score=rs_score,
             tightness_score=tightness_score,
@@ -3988,6 +4366,8 @@ def build_scan_row(
             setup_grade=quality_grade,
             vcp_status=vcp.status,
             setup_type=provisional_setup_type,
+            institutional_tightness_score=institutional_tightness_score,
+            sector_leadership_status=sector_leadership_status,
         )
     live_breakout_status = (
         detect_live_breakout_status(
@@ -4041,6 +4421,20 @@ def build_scan_row(
         rsi=float(latest["RSI14"]),
         earnings_risk_label=earnings_label,
     )
+    sector_context_score = min(10, sector_score * 2 + (2 if sector_leadership_status == "LEADING SECTOR" else 1 if sector_leadership_status == "IMPROVING SECTOR" else 0))
+    practical_tp1, practical_tp2, practical_tp3, ideal_tp, tp_type, practical_tp_reason, ideal_r = calculate_trader_tp_plan(
+        entry=entry,
+        stop=stop,
+        current_close=float(latest["Close"]),
+        nearest_resistance=nearest_resistance,
+        recent_high=float(latest.get("High52W", np.nan)),
+        institutional_quality_score=institutional_quality_score,
+        rs_score=rs_score,
+        sector_score=sector_context_score,
+        market_environment=market_environment,
+        extended=extended,
+    )
+    ideal_tp_reason = practical_tp_reason
     risk_quality_note = risk_note(risk_pct, aggressive_mode)
     if trade == "YES" and risk_pct > 10 and not aggressive_mode:
         trade = "NO"
@@ -4048,8 +4442,10 @@ def build_scan_row(
     if resistance_breakout_mode == "RESISTANCE BREAKOUT WATCH":
         trade = "NO"
         trade_reason = "Needs breakout above resistance"
-        ideal_tp = rb_2r
-        ideal_tp_reason = "Needs clean breakout above resistance before swing entry"
+        practical_tp1, practical_tp2, practical_tp3 = enforce_tp_ladder(rb_entry, rb_stop, rb_1r, rb_2r, rb_3r)
+        ideal_tp = practical_tp2
+        tp_type = "PRACTICAL SWING TP"
+        ideal_tp_reason = f"Needs clean breakout above resistance before swing entry; {PRACTICAL_TP_NOTE}"
         sell_strategy = "WATCH / SCALP ONLY"
         trail_stop = rb_stop
         ideal_r = round((ideal_tp - rb_entry) / max(rb_entry - rb_stop, 0.01), 2)
@@ -4102,7 +4498,9 @@ def build_scan_row(
         current_setup_status=current_setup_status,
         resistance_breakout_mode=resistance_breakout_mode,
         momentum_breakout_candidate=momentum_breakout_candidate,
-        latest=latest,
+        latest=latest_with_pivot,
+        healthy_pullback_label=healthy_pullback_label,
+        institutional_tightness_score=institutional_tightness_score,
     )
     signal_state, signal_trade, signal_watchlist, signal_why, signal_decision = determine_signal_state(
         setup_grade=quality_grade,
@@ -4193,7 +4591,27 @@ def build_scan_row(
         rsi=float(latest["RSI14"]),
         leader_label=leader_label,
     )
-    decision_reason = hard_reject_reason if hard_reject else institutional_decision_reason(
+    strong_institutional_pullback = (
+        leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}
+        and healthy_pullback_score >= 7
+        and (price_above_ma10 or holding_ma20)
+        and lighter_pullback_volume
+        and score_at_least(rs_score, 7)
+    )
+    decision_reason_override = ""
+    if strong_institutional_pullback and not hard_reject:
+        signal_state = "WAIT PULLBACK" if pd.notna(risk_pct) and risk_pct > 10 else "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        quality_grade = "A" if quality_grade == "Reject" else quality_grade
+        decision_reason_override = "WATCH: healthy pullback, holding MA10 with lighter volume; wait for rebound trigger."
+    if sector_leadership_status == "CYCLICAL RISK" and leader_label == "CYCLICAL BREAKOUT" and not hard_reject:
+        if signal_state == "BUY NOW":
+            signal_state = "WATCH"
+            trade = "NO"
+            watchlist_flag = "YES"
+        decision_reason_override = "WATCH: strong technical breakout but cyclical sector; monitor volume and RSI."
+    decision_reason = hard_reject_reason if hard_reject else decision_reason_override or institutional_decision_reason(
         signal_state=signal_state,
         ticker=ticker,
         leader_label=leader_label,
@@ -4243,16 +4661,24 @@ def build_scan_row(
         earnings_risk_label=earnings_label,
         resistance_breakout_mode=resistance_breakout_mode,
         pivot=pivot,
+        healthy_pullback_label=healthy_pullback_label,
+        institutional_tightness_score=institutional_tightness_score,
     )
     if watch_type == "MOMENTUM WATCH" or setup_type == "MOMENTUM BREAKOUT EXCEPTION":
         prefix = DECISION_PREFIX_BY_STATE.get(signal_state, "WATCH:").rstrip(":")
         decision_reason = f"{prefix}: high RS leader, not pure VCP but valid momentum setup"
+    elif watch_type == "HEALTHY PULLBACK":
+        decision_reason = "WATCH: healthy pullback, holding MA10 with lighter volume; wait for rebound trigger."
+    elif watch_type == "TIGHT BASE":
+        decision_reason = "WATCH: tight institutional base; wait for breakout volume."
+    elif watch_type == "POST-BREAKOUT DIGESTION":
+        decision_reason = "WATCH: post-breakout digestion; wait for rebound trigger."
     elif signal_state == "BUY ON BREAKOUT":
-        decision_reason = "BUY ON BREAKOUT: near pivot, wait for volume confirmation"
-    elif signal_state == "WATCH" and watch_type in {"PULLBACK TO MA10", "PULLBACK TO MA20"}:
+        decision_reason = "BUY ON BREAKOUT: near pivot, strong RS, wait for breakout volume."
+    elif signal_state == "WATCH" and watch_type in {"WAIT MA10 SUPPORT", "WAIT MA20 SUPPORT"}:
         decision_reason = "WATCH: pullback setup; wait for MA10/MA20 support confirmation"
     elif signal_state == "EXTENDED DO NOT CHASE":
-        decision_reason = "EXTENDED: wait for pullback, do not chase"
+        decision_reason = "EXTENDED: do not chase; wait for base or MA10 reset."
 
     signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
         signal_state=signal_state,
@@ -4271,6 +4697,8 @@ def build_scan_row(
         earnings_risk_label=earnings_label,
         resistance_breakout_mode=resistance_breakout_mode,
         pivot=pivot,
+        healthy_pullback_label=healthy_pullback_label,
+        institutional_tightness_score=institutional_tightness_score,
     )
     if watch_type == "EARNINGS RISK WATCH" and signal_state == "WATCH":
         decision_reason = "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
@@ -4283,18 +4711,25 @@ def build_scan_row(
         sell_strategy = "AVOID / NO TRADE"
     elif signal_state == "EXTENDED DO NOT CHASE":
         sell_strategy = "AVOID / NO TRADE"
+    practical_tp1, practical_tp2, practical_tp3 = enforce_tp_ladder(entry, stop, practical_tp1, practical_tp2, practical_tp3)
     ideal_tp, ideal_tp_reason, ideal_r = validate_ideal_tp(
         ideal_tp=ideal_tp,
         ideal_tp_reason=ideal_tp_reason,
         ideal_r=ideal_r,
         entry=entry,
         stop=stop,
-        target_2r=target_2r,
-        target_3r=target_3r,
+        target_2r=practical_tp2,
+        target_3r=practical_tp3,
         nearest_resistance=nearest_resistance,
         current_close=float(latest["Close"]),
         signal_state=signal_state,
     )
+    if ideal_tp > entry * 1.35:
+        tp_type = "RUNNER TP" if tp_type == "RUNNER TP" else "TOO FAR / USE TRAILING STOP"
+    if PRACTICAL_TP_NOTE not in decision_reason and signal_state in ACTIONABLE_SIGNAL_STATES:
+        decision_reason = f"{decision_reason} {PRACTICAL_TP_NOTE}"
+        trade_reason = decision_reason
+        watchlist_reason = "Already Trade YES" if trade == "YES" else decision_reason
 
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
     latest_candle = pd.Timestamp(data.index[-1])
@@ -4363,12 +4798,18 @@ def build_scan_row(
         "Sector Score": sector_score,
         "Sector ETF": sector_etf,
         "Sector Leadership": sector_leadership,
+        "Sector Leadership Status": sector_leadership_status,
+        "Sector Leadership Weight": sector_leadership_weight,
         "Sector Spread %": sector_spread if sector_spread is not None else "N/A",
         "Market Score": market_score,
         "Market Environment": market_environment,
         "Final Score": final_score,
         "Adjusted Final Score": adjusted_score,
         "Institutional Quality Score": institutional_quality_score,
+        "Healthy Pullback Score": healthy_pullback_score,
+        "Healthy Pullback Label": healthy_pullback_label,
+        "Institutional Tightness Score": institutional_tightness_score,
+        "Institutional Tightness Label": institutional_tightness_label,
         "Leader Quality Label": leader_label,
         "Breakout Quality Score": breakout_quality_score,
         "Stage Analysis": stage_label,
@@ -4424,9 +4865,9 @@ def build_scan_row(
         "Target 1R": target_1r,
         "Target 2R": target_2r,
         "Target 3R": target_3r,
-        "TP1": target_1r,
-        "TP2": target_2r,
-        "TP3": target_3r,
+        "TP1": practical_tp1,
+        "TP2": practical_tp2,
+        "TP3": practical_tp3,
         "Nearest Resistance": nearest_resistance,
         "Resistance Blocked": "YES" if resistance_blocks_1r else "NO",
         "Resistance Breakout Mode": resistance_breakout_mode,
@@ -4438,6 +4879,7 @@ def build_scan_row(
         "Resistance Breakout 3R": rb_3r,
         "Resistance Breakout Risk %": rb_risk_pct,
         "Ideal TP": ideal_tp,
+        "TP Type": tp_type,
         "Ideal TP Reason": ideal_tp_reason,
         "Sell Strategy": sell_strategy,
         "Trail Stop Level": trail_stop,
@@ -4517,6 +4959,9 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Target 1R",
         "Target 2R",
         "Target 3R",
+        "TP1",
+        "TP2",
+        "TP3",
         "Nearest Resistance",
         "Breakout Above Resistance Trigger",
         "Resistance Breakout Entry",
@@ -4690,6 +5135,12 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ranked["RVOL"] = 0
     if "WATCHLIST FLAG" not in ranked:
         ranked["WATCHLIST FLAG"] = "NO"
+    if "Institutional Tightness Score" not in ranked:
+        ranked["Institutional Tightness Score"] = 0
+    if "Healthy Pullback Score" not in ranked:
+        ranked["Healthy Pullback Score"] = 0
+    if "Sector Leadership Status" not in ranked:
+        ranked["Sector Leadership Status"] = "NEUTRAL SECTOR"
     ranked["RS Sort"] = pd.to_numeric(ranked.get("RS Score Raw", ranked.get("RS Score")), errors="coerce")
     ranked["RVOL Sort"] = pd.to_numeric(ranked.get("RVOL"), errors="coerce").fillna(0)
     setup_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
@@ -4727,6 +5178,9 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
     ranked["vcp sort"] = np.where(ranked["VCP Status"].isin(["VALID VCP", "EARLY VCP"]), 0, 1)
     ranked["breakout sort"] = ranked["Breakout Alert"].map(breakout_priority).fillna(9)
     ranked["earnings sort"] = np.where(ranked["Earnings Risk"] == "HIGH RISK", 1, 0)
+    ranked["sector status sort"] = ranked["Sector Leadership Status"].map(
+        {"LEADING SECTOR": 0, "IMPROVING SECTOR": 1, "NEUTRAL SECTOR": 2, "CYCLICAL RISK": 3, "LAGGING SECTOR": 4}
+    ).fillna(3)
     ranked = ranked.sort_values(
         [
             "signal sort",
@@ -4736,6 +5190,9 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "breakout sort",
             "Adjusted Final Score",
             "Institutional Quality Score",
+            "sector status sort",
+            "Institutional Tightness Score",
+            "Healthy Pullback Score",
             "Breakout Quality Score",
             "RVOL Sort",
             "Explosive Score",
@@ -4747,7 +5204,7 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
             "Final Score",
             "earnings sort",
         ],
-        ascending=[True, True, True, True, True, False, False, False, False, False, False, False, False, False, True, False, True],
+        ascending=[True, True, True, True, True, False, False, True, False, False, False, False, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
 
@@ -6958,11 +7415,16 @@ def render_swing_scanner(
         "RS Score",
         "RS Score Raw",
         "Sector Leadership",
+        "Sector Leadership Status",
         "Volume Confirmation",
         "Earnings Risk",
         "Final Score",
         "Adjusted Final Score",
         "Institutional Quality Score",
+        "Healthy Pullback Score",
+        "Healthy Pullback Label",
+        "Institutional Tightness Score",
+        "Institutional Tightness Label",
         "Leader Quality Label",
         "Explosive Score",
         "Explosive Label",
@@ -6983,8 +7445,12 @@ def render_swing_scanner(
         "Days to Earnings",
         "Earnings Setup Score",
         "Target 1R",
+        "TP1",
+        "TP2",
+        "TP3",
         "Nearest Resistance",
         "Ideal TP",
+        "TP Type",
         "Ideal TP Reason",
         "Sell Strategy",
         "Trail Stop Level",
@@ -7217,29 +7683,38 @@ def render_swing_scanner(
     visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
     visible["sector leadership sort"] = visible["Sector Leadership"].map({"Leader": 0, "Average": 1, "Laggard": 2}).fillna(3)
+    visible["sector status sort"] = visible.get("Sector Leadership Status", pd.Series("", index=visible.index)).map(
+        {"LEADING SECTOR": 0, "IMPROVING SECTOR": 1, "NEUTRAL SECTOR": 2, "CYCLICAL RISK": 3, "LAGGING SECTOR": 4}
+    ).fillna(3)
     visible = visible.sort_values(
         [
             "signal sort",
             "Adjusted Final Score",
             "Institutional Quality Score",
+            "sector status sort",
+            "Institutional Tightness Score",
+            "Healthy Pullback Score",
             "RS Sort",
             "Breakout Quality Score",
             "Risk %",
             "sector leadership sort",
         ],
-        ascending=[True, False, False, False, False, True, True],
+        ascending=[True, False, False, True, False, False, False, False, True, True],
     )
 
     compact_columns = [
         "ticker",
         "Sector / Industry",
         "Leader Quality Label",
+        "Sector Leadership Status",
         "Setup Type",
         "Signal State",
+        "Watch Type",
         "Trade",
-        "Final Score",
         "Adjusted Final Score",
         "Institutional Quality Score",
+        "Healthy Pullback Score",
+        "Institutional Tightness Score",
         "Breakout Quality Score",
         "RS Score",
         "Risk %",
@@ -7247,7 +7722,11 @@ def render_swing_scanner(
         "Pivot",
         "Entry Trigger",
         "Stop Loss",
+        "TP1",
+        "TP2",
+        "TP3",
         "Ideal TP",
+        "TP Type",
         "Decision Reason",
     ]
     diagnostic_columns = compact_columns + [
@@ -7256,13 +7735,16 @@ def render_swing_scanner(
         "Theme Group",
         "Sector Raw",
         "Industry Raw",
-        "Watch Type",
         "VCP Label",
         "Contractions",
         "Volume Dry-Up",
         "Trend Score",
         "Technical Score",
         "Tightness Score",
+        "Healthy Pullback Label",
+        "Institutional Tightness Label",
+        "Sector Leadership Weight",
+        "Final Score",
         "Explosive Score",
         "RS Score Raw",
         "Intraday Volume Ratio",
