@@ -4156,6 +4156,33 @@ def finalize_signal_outputs(
     return signal_state, trade, watchlist_flag, reason_with_signal_prefix(signal_state, decision_reason)
 
 
+def action_readiness_label(
+    *,
+    trade_tier: str,
+    signal_state: str,
+    professional_score: float,
+    entry_quality_score: float,
+) -> str:
+    """Summarize how close a row is to executable action without changing score or tier."""
+    if trade_tier == "Tier 4 - Avoid / Reject":
+        return "AVOID"
+    if signal_state == "BUY NOW":
+        return "READY NOW"
+    if signal_state == "BUY ON BREAKOUT":
+        return "WAIT TRIGGER"
+    if signal_state == "WAIT PULLBACK":
+        return "WAIT PULLBACK"
+    if (
+        trade_tier == "Tier 2 - High Quality, Wait Better Entry"
+        and pd.notna(professional_score)
+        and professional_score >= 80
+        and pd.notna(entry_quality_score)
+        and entry_quality_score >= 5
+    ):
+        return "NEAR TIER 1"
+    return "WAIT TRIGGER" if signal_state == "WATCH" else "AVOID"
+
+
 def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
     """Repair final consistency before display and export without changing the UI flow."""
     if frame.empty:
@@ -4171,6 +4198,7 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         rs_score = numeric_or_na(row.get("RS Score Raw", row.get("RS Score")))
         final_score = numeric_or_na(row.get("Final Score"))
         setup_type = str(row.get("Setup Type", ""))
+        leader_label_value = str(row.get("Leader Quality Label", ""))
         institutional_quality = numeric_or_na(row.get("Institutional Quality Score"))
         entry_quality = numeric_or_na(row.get("Entry Quality Score"))
         professional_score = numeric_or_na(row.get("Professional Score", row.get("Adjusted Final Score")))
@@ -4229,6 +4257,15 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
                 trade_tier = "Tier 4 - Avoid / Reject"
         if not hard_reject and signal_state in {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
             trade_tier = "Tier 2 - High Quality, Wait Better Entry" if strong_leader_floor or professional_score >= 68 else "Tier 3 - Leadership Watchlist"
+        if (
+            leader_label_value == "LAGGARD / AVOID"
+            and trade_tier == "Tier 2 - High Quality, Wait Better Entry"
+            and not (pd.notna(rs_score) and rs_score >= 7 and pd.notna(entry_quality) and entry_quality >= 8)
+        ):
+            trade_tier = "Tier 3 - Leadership Watchlist"
+        if trade_tier == "Tier 2 - High Quality, Wait Better Entry" and signal_state == "BUY ON BREAKOUT" and entry_quality < 7:
+            signal_state = "WATCH"
+            decision_reason = "WATCH: near trigger but entry quality is not clean enough for breakout action yet."
 
         if trade_tier == "Tier 1 - Immediate Action":
             if signal_state == "BUY NOW":
@@ -4325,6 +4362,12 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "Professional Score"] = round(float(professional_score), 1)
         fixed.at[idx, "Entry Quality Score"] = int(entry_quality)
         fixed.at[idx, "Trade Tier"] = trade_tier
+        fixed.at[idx, "Action Readiness Label"] = action_readiness_label(
+            trade_tier=trade_tier,
+            signal_state=signal_state,
+            professional_score=professional_score,
+            entry_quality_score=entry_quality,
+        )
         if row.get("Healthy Pullback Label") == "HEALTHY PULLBACK" and signal_state in {"WATCH", "WAIT PULLBACK"}:
             fixed.at[idx, "Watch Type"] = "HEALTHY PULLBACK"
         elif numeric_or_na(row.get("Institutional Tightness Score")) >= 7 and signal_state in {"WATCH", "BUY ON BREAKOUT"}:
@@ -5190,6 +5233,23 @@ def build_scan_row(
             watchlist_flag = "NO"
             decision_reason = tier_reason
 
+    if (
+        leader_label == "LAGGARD / AVOID"
+        and trade_tier == "Tier 2 - High Quality, Wait Better Entry"
+        and not (score_at_least(rs_score, 7) and entry_quality_score >= 8)
+    ):
+        trade_tier = "Tier 3 - Leadership Watchlist"
+        if signal_state in {"BUY NOW", "BUY ON BREAKOUT"}:
+            signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "TIER 3: leadership watchlist; setup not ready."
+    if trade_tier == "Tier 2 - High Quality, Wait Better Entry" and signal_state == "BUY ON BREAKOUT" and entry_quality_score < 7:
+        signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "WATCH: near trigger but entry quality is not clean enough for breakout action yet."
+
     signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
         signal_state=signal_state,
         trade=trade,
@@ -5230,6 +5290,12 @@ def build_scan_row(
         pivot=pivot,
         healthy_pullback_label=healthy_pullback_label,
         institutional_tightness_score=institutional_tightness_score,
+    )
+    action_readiness = action_readiness_label(
+        trade_tier=trade_tier,
+        signal_state=signal_state,
+        professional_score=professional_score,
+        entry_quality_score=entry_quality_score,
     )
     trade_reason = decision_reason
     watchlist_reason = "Already Trade YES" if trade == "YES" else decision_reason
@@ -5313,6 +5379,7 @@ def build_scan_row(
         "Entry Quality Score": entry_quality_score,
         "Entry Quality Label": entry_quality_label,
         "Trade Tier": trade_tier,
+        "Action Readiness Label": action_readiness,
         "Healthy Pullback Score": healthy_pullback_score,
         "Healthy Pullback Label": healthy_pullback_label,
         "Institutional Tightness Score": institutional_tightness_score,
@@ -5526,10 +5593,14 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "VCP Label",
         "Setup Type",
         "Signal State",
+        "Trade Tier",
+        "Action Readiness Label",
         "Setup Quality Grade",
         "Action Label",
         "Breakout Alert",
         "Live Breakout Status",
+        "Professional Score",
+        "Entry Quality Score",
         "Final Score",
         "Breakout Quality Score",
         "RS Score",
@@ -8245,6 +8316,7 @@ def render_swing_scanner(
         "Leader Quality Label",
         "Sector Leadership Status",
         "Trade Tier",
+        "Action Readiness Label",
         "Setup Type",
         "Signal State",
         "Watch Type",
@@ -8376,6 +8448,9 @@ def render_swing_scanner(
     focus_source["trade sort"] = np.where(focus_source["Trade"] == "YES", 0, 1)
     focus_source["watchlist sort"] = np.where(focus_source["WATCHLIST FLAG"] == "YES", 0, 1)
     focus_source["quality sort"] = focus_source["Setup Quality Grade"].map(quality_priority).fillna(9)
+    focus_source["tier sort"] = focus_source.get("Trade Tier", pd.Series("", index=focus_source.index)).map(TRADE_TIER_PRIORITY).fillna(9)
+    focus_source["Professional Score Sort"] = pd.to_numeric(focus_source.get("Professional Score"), errors="coerce").fillna(0)
+    focus_source["Entry Quality Sort"] = pd.to_numeric(focus_source.get("Entry Quality Score"), errors="coerce").fillna(0)
 
     buy_now_focus = focus_source[focus_source["Signal State"] == "BUY NOW"].sort_values(
         ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
@@ -8421,6 +8496,16 @@ def render_swing_scanner(
         ["quality sort", "Risk %", "Adjusted Final Score", "Final Score"],
         ascending=[True, True, False, False],
     )
+    closest_to_action_focus = focus_source[
+        (focus_source["Trade Tier"] == "Tier 2 - High Quality, Wait Better Entry")
+        & (focus_source["Professional Score Sort"] >= 80)
+        & (focus_source["Entry Quality Sort"] >= 5)
+        & (focus_source["RS Sort"] >= 7)
+        & (focus_source["Signal State"] != "EXTENDED DO NOT CHASE")
+    ].sort_values(
+        ["Professional Score Sort", "Entry Quality Sort", "Institutional Quality Score", "RS Sort", "Risk %"],
+        ascending=[False, False, False, False, True],
+    )
 
     st.subheader("Daily Focus Summary")
     if buy_now_focus.empty:
@@ -8435,6 +8520,7 @@ def render_swing_scanner(
     with focus_cols[3]:
         show_focus_group("Top Momentum Breakout Exceptions", momentum_focus, "Decision Reason")
     show_focus_group("Top Pullback Setups", pullback_focus, "Decision Reason")
+    show_focus_group("Closest To Action", closest_to_action_focus, "Decision Reason")
 
     st.subheader("Action View")
     actionable_states = ["BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"]
