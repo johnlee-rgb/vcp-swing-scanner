@@ -663,6 +663,7 @@ HK_MARKET_TICKERS = ["^HSI", "2800.HK", "3033.HK", "3067.HK"]
 ALL_CONTEXT_TICKERS = list(dict.fromkeys(MARKET_TICKERS + HK_MARKET_TICKERS))
 ACTION_ORDER = {"READY": 0, "PULLBACK ENTRY": 1, "WATCH": 2, "EXTENDED": 3, "FAILED": 4}
 TRADE_HISTORY_FILE = "trade_signals_history.csv"
+POSITIONS_FILE = "positions.csv"
 TRADE_HISTORY_COLUMNS = [
     "timestamp",
     "scan date",
@@ -726,6 +727,33 @@ SCANNER_TO_HISTORY_COLUMNS = {
     "TP Type": "TP type",
     "Decision Reason": "decision reason",
 }
+POSITION_STORAGE_COLUMNS = [
+    "position_id",
+    "ticker",
+    "entry_date",
+    "entry_price",
+    "position_size",
+    "fees",
+    "broker",
+    "account",
+    "original_thesis_source",
+    "original_signal_state",
+    "original_setup_type",
+    "original_trade_tier",
+    "original_professional_score",
+    "original_entry_trigger",
+    "original_stop_loss",
+    "original_tp1",
+    "original_tp2",
+    "original_tp3",
+    "original_ideal_tp",
+    "original_decision_reason",
+    "notes",
+    "created_at",
+    "updated_at",
+    "current_stop_loss_override",
+    "manual_tp_override",
+]
 
 
 @dataclass
@@ -5972,9 +6000,12 @@ def normalize_positions_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "qty": "position_size",
         "quantity": "position_size",
         "date": "entry_date",
+        "commission": "fees",
+        "fee": "fees",
     }
     normalized = normalized.rename(columns={key: value for key, value in aliases.items() if key in normalized.columns})
     for column in [
+        "position_id",
         "ticker",
         "entry_date",
         "entry_price",
@@ -5982,19 +6013,174 @@ def normalize_positions_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "notes",
         "broker",
         "account",
-        "commission",
+        "fees",
         "current_stop_loss_override",
         "manual_tp_override",
     ]:
         if column not in normalized.columns:
-            normalized[column] = "" if column in {"ticker", "entry_date", "notes", "broker", "account"} else np.nan
+            normalized[column] = "" if column in {"position_id", "ticker", "entry_date", "notes", "broker", "account"} else np.nan
     normalized["ticker"] = normalized["ticker"].astype(str).str.upper().str.strip()
     normalized["entry_date"] = pd.to_datetime(normalized["entry_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    for column in ["entry_price", "position_size", "commission", "current_stop_loss_override", "manual_tp_override"]:
+    for column in ["entry_price", "position_size", "fees", "current_stop_loss_override", "manual_tp_override"]:
         normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     normalized = normalized.dropna(subset=["ticker", "entry_price", "position_size"])
     normalized = normalized[normalized["ticker"].astype(str).str.len() > 0]
     return normalized
+
+
+def load_positions_file() -> pd.DataFrame:
+    """Load persisted positions, tolerating missing or older files."""
+    try:
+        if pd.io.common.file_exists(POSITIONS_FILE):
+            loaded = pd.read_csv(POSITIONS_FILE)
+            for column in POSITION_STORAGE_COLUMNS:
+                if column not in loaded.columns:
+                    loaded[column] = "" if column not in {"entry_price", "position_size", "fees", "current_stop_loss_override", "manual_tp_override"} else np.nan
+            return loaded[POSITION_STORAGE_COLUMNS]
+    except Exception:
+        pass
+    return pd.DataFrame(columns=POSITION_STORAGE_COLUMNS)
+
+
+def save_positions_file(frame: pd.DataFrame) -> None:
+    """Persist positions to positions.csv without crashing the app."""
+    try:
+        saved = frame.copy()
+        for column in POSITION_STORAGE_COLUMNS:
+            if column not in saved.columns:
+                saved[column] = "" if column not in {"entry_price", "position_size", "fees", "current_stop_loss_override", "manual_tp_override"} else np.nan
+        saved[POSITION_STORAGE_COLUMNS].to_csv(POSITIONS_FILE, index=False)
+    except Exception:
+        pass
+
+
+def position_duplicate_exists(frame: pd.DataFrame, ticker: str, entry_date: str, entry_price: float) -> bool:
+    """Detect duplicate position by ticker + entry date + entry price."""
+    if frame.empty:
+        return False
+    dates = pd.to_datetime(frame.get("entry_date"), errors="coerce").dt.strftime("%Y-%m-%d")
+    prices = pd.to_numeric(frame.get("entry_price"), errors="coerce").round(4)
+    return bool(
+        (
+            (frame.get("ticker", "").astype(str).str.upper() == str(ticker).upper())
+            & (dates == pd.to_datetime(entry_date, errors="coerce").strftime("%Y-%m-%d"))
+            & (prices == round(float(entry_price), 4))
+        ).any()
+    )
+
+
+def build_position_record(
+    *,
+    ticker: str,
+    entry_date: str,
+    entry_price: float,
+    position_size: float,
+    fees: float = 0.0,
+    broker: str = "",
+    account: str = "",
+    notes: str = "",
+    stop_override: float = np.nan,
+    tp_override: float = np.nan,
+    history: pd.DataFrame | None = None,
+    uploaded_export: pd.DataFrame | None = None,
+    current_fallback: pd.DataFrame | None = None,
+) -> dict:
+    """Create a persisted position row and snapshot the original thesis at save time."""
+    now = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y-%m-%d %H:%M:%S %Z")
+    thesis, thesis_source = match_original_thesis(
+        ticker,
+        entry_date,
+        history if history is not None else pd.DataFrame(),
+        uploaded_export if uploaded_export is not None else pd.DataFrame(),
+        current_fallback if current_fallback is not None else pd.DataFrame(),
+    )
+    parsed_entry_date = pd.to_datetime(entry_date, errors="coerce")
+    safe_entry_date = parsed_entry_date.strftime("%Y-%m-%d") if pd.notna(parsed_entry_date) else datetime.now().strftime("%Y-%m-%d")
+    position_id = f"{str(ticker).upper()}-{safe_entry_date.replace('-', '')}-{round(float(entry_price), 4)}-{int(time.time())}"
+    return {
+        "position_id": position_id,
+        "ticker": str(ticker).upper().strip(),
+        "entry_date": safe_entry_date,
+        "entry_price": float(entry_price),
+        "position_size": float(position_size),
+        "fees": float(fees) if pd.notna(fees) else 0.0,
+        "broker": broker,
+        "account": account,
+        "original_thesis_source": thesis_source,
+        "original_signal_state": thesis.get("signal state", "N/A"),
+        "original_setup_type": thesis.get("setup type", "N/A"),
+        "original_trade_tier": thesis.get("trade tier", "N/A"),
+        "original_professional_score": thesis.get("professional score", "N/A"),
+        "original_entry_trigger": thesis.get("entry trigger", "N/A"),
+        "original_stop_loss": thesis.get("stop loss", np.nan),
+        "original_tp1": thesis.get("TP1", "N/A"),
+        "original_tp2": thesis.get("TP2", "N/A"),
+        "original_tp3": thesis.get("TP3", "N/A"),
+        "original_ideal_tp": thesis.get("ideal TP", "N/A"),
+        "original_decision_reason": thesis.get("decision reason", "N/A"),
+        "notes": notes,
+        "created_at": now,
+        "updated_at": now,
+        "current_stop_loss_override": stop_override if pd.notna(stop_override) and float(stop_override) > 0 else np.nan,
+        "manual_tp_override": tp_override if pd.notna(tp_override) and float(tp_override) > 0 else np.nan,
+    }
+
+
+def thesis_from_saved_position(position: pd.Series) -> Tuple[pd.Series, str]:
+    """Use saved original thesis snapshot as the first source for persisted positions."""
+    source = position.get("original_thesis_source", "")
+    if not source:
+        return pd.Series(dtype=object), ""
+    return pd.Series(
+        {
+            "signal state": position.get("original_signal_state", "N/A"),
+            "setup type": position.get("original_setup_type", "N/A"),
+            "trade tier": position.get("original_trade_tier", "N/A"),
+            "professional score": position.get("original_professional_score", "N/A"),
+            "entry trigger": position.get("original_entry_trigger", "N/A"),
+            "stop loss": position.get("original_stop_loss", np.nan),
+            "TP1": position.get("original_tp1", "N/A"),
+            "TP2": position.get("original_tp2", "N/A"),
+            "TP3": position.get("original_tp3", "N/A"),
+            "ideal TP": position.get("original_ideal_tp", "N/A"),
+            "decision reason": position.get("original_decision_reason", "N/A"),
+        }
+    ), str(source)
+
+
+def extract_futu_screenshot_details(uploaded_file) -> Tuple[dict, str]:
+    """Best-effort OCR extraction for broker screenshots; always safe to fail."""
+    details = {"ticker": "", "stock_name": "", "direction": "", "quantity": np.nan, "price": np.nan, "amount": np.nan, "trade_date": "", "trade_time": "", "fees": np.nan}
+    try:
+        from PIL import Image
+        import pytesseract
+
+        uploaded_file.seek(0)
+        image = Image.open(uploaded_file)
+        text = pytesseract.image_to_string(image)
+        upper = text.upper()
+        ticker_match = re.search(r"\b[A-Z]{1,5}(?:\.[A-Z]{1,3})?\b", upper)
+        if ticker_match:
+            details["ticker"] = ticker_match.group(0)
+        direction_match = re.search(r"\b(BUY|SELL|BOUGHT|SOLD)\b", upper)
+        if direction_match:
+            details["direction"] = direction_match.group(0)
+        numbers = [float(value.replace(",", "")) for value in re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", text)]
+        if numbers:
+            details["price"] = numbers[0]
+        if len(numbers) > 1:
+            details["quantity"] = numbers[1]
+        if len(numbers) > 2:
+            details["amount"] = numbers[2]
+        date_match = re.search(r"(20\d{2}[-/]\d{1,2}[-/]\d{1,2})", text)
+        if date_match:
+            details["trade_date"] = pd.to_datetime(date_match.group(1), errors="coerce").strftime("%Y-%m-%d")
+        time_match = re.search(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", text)
+        if time_match:
+            details["trade_time"] = time_match.group(0)
+        return details, "OCR attempted. Please confirm the extracted position details manually."
+    except Exception:
+        return details, "Screenshot uploaded. Please confirm position details manually."
 
 
 def history_like_from_scanner_export(frame: pd.DataFrame) -> pd.DataFrame:
@@ -6028,8 +6214,10 @@ def match_original_thesis(
         if matches.empty:
             return None
         if "scan date" in matches.columns and pd.notna(entry_dt):
-            matches["_date_diff"] = (pd.to_datetime(matches["scan date"], errors="coerce") - entry_dt).abs()
-            matches = matches.sort_values("_date_diff", na_position="last")
+            scan_dates = pd.to_datetime(matches["scan date"], errors="coerce")
+            matches["_date_before_or_same"] = scan_dates <= entry_dt
+            matches["_date_diff"] = (scan_dates - entry_dt).abs()
+            matches = matches.sort_values(["_date_before_or_same", "_date_diff"], ascending=[False, True], na_position="last")
         return matches.iloc[0], source
 
     for frame, source in [
@@ -6043,7 +6231,7 @@ def match_original_thesis(
     return pd.Series(dtype=object), "Manual Entry"
 
 
-def calculate_position_management_row(position: pd.Series, thesis: pd.Series, thesis_source: str, data: pd.DataFrame | None) -> dict:
+def calculate_position_management_row(position: pd.Series, thesis: pd.Series, thesis_source: str, data: pd.DataFrame | None, quote: dict | None = None) -> dict:
     """Calculate daily active-position management fields from daily OHLCV."""
     ticker = str(position.get("ticker", "")).upper()
     entry_price = float(position.get("entry_price", np.nan))
@@ -6062,7 +6250,8 @@ def calculate_position_management_row(position: pd.Series, thesis: pd.Series, th
         original_stop = entry_price * 0.92
     risk_per_share = max(entry_price - float(original_stop), 0.01)
     gain_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else np.nan
-    unrealized_pl = (current_price - entry_price) * position_size - (numeric_or_na(position.get("commission")) if pd.notna(numeric_or_na(position.get("commission"))) else 0)
+    fees = numeric_or_na(position.get("fees", position.get("commission")))
+    unrealized_pl = (current_price - entry_price) * position_size - (fees if pd.notna(fees) else 0)
     current_r = (current_price - entry_price) / risk_per_share
     days_held = (pd.Timestamp.today().normalize() - pd.to_datetime(entry_date, errors="coerce")).days if pd.notna(pd.to_datetime(entry_date, errors="coerce")) else np.nan
     ma10 = numeric_or_na(latest.get("MA10"))
@@ -6151,6 +6340,31 @@ def calculate_position_management_row(position: pd.Series, thesis: pd.Series, th
     if thesis_source == "Current Scanner Fallback":
         explanation = f"Original thesis unavailable. This analysis uses current scanner fallback only. {explanation}"
 
+    quote = quote or {}
+    premarket_price = numeric_or_na(quote.get("premarket_price"))
+    afterhours_price = numeric_or_na(quote.get("afterhours_price"))
+    external_price = afterhours_price if pd.notna(afterhours_price) else premarket_price
+    external_label = "After-hours" if pd.notna(afterhours_price) else "Pre-market" if pd.notna(premarket_price) else "N/A"
+    external_move_pct = (external_price / current_price - 1) * 100 if pd.notna(external_price) and current_price > 0 else np.nan
+    alert_status = "NORMAL"
+    alert_reason = "After-hours data unavailable."
+    if pd.notna(external_move_pct):
+        alert_reason = f"{external_label} move {external_move_pct:.2f}%."
+        if abs(external_move_pct) >= 3:
+            alert_status = "WARNING"
+        if external_price <= suggested_stop or (pd.notna(ma10) and external_price < ma10):
+            alert_status = "ACTION NEEDED"
+            alert_reason = f"{external_label} price is below stop/MA10."
+        elif external_price >= updated_tp2:
+            alert_status = "WATCH"
+            alert_reason = f"{external_label} price is above TP2."
+        elif external_price >= updated_tp1:
+            alert_status = "WATCH"
+            alert_reason = f"{external_label} price is above TP1."
+        elif pd.notna(pivot) and external_price < pivot:
+            alert_status = "WARNING"
+            alert_reason = f"{external_label} price is below pivot."
+
     return {
         "ticker": ticker,
         "entry date": entry_date,
@@ -6189,6 +6403,10 @@ def calculate_position_management_row(position: pd.Series, thesis: pd.Series, th
         "updated ideal TP": round(float(updated_ideal), 2),
         "TP status": tp_status,
         "suggested action": suggested_action,
+        "after-hours / pre-market price": round(float(external_price), 2) if pd.notna(external_price) else "N/A",
+        "after-hours / pre-market move %": round(float(external_move_pct), 2) if pd.notna(external_move_pct) else "N/A",
+        "after-hours alert": alert_status,
+        "after-hours alert reason": alert_reason,
         "original thesis vs current action": explanation,
         "notes": position.get("notes", ""),
         "_data": data,
@@ -8183,10 +8401,11 @@ def render_my_positions() -> None:
     st.subheader("My Positions")
     st.caption("Existing position management is separate from new-entry scanner signals.")
     if "positions_df" not in st.session_state:
-        st.session_state["positions_df"] = pd.DataFrame()
+        st.session_state["positions_df"] = load_positions_file()
 
     history = load_trade_signal_history()
     current_fallback = combined_session_results()
+    st.markdown("**Original Scanner Export**")
     export_file = st.file_uploader("Upload original scanner export CSV or PDF", type=["csv", "pdf"], key="positions_scanner_export")
     uploaded_export = history_like_from_scanner_export(parse_uploaded_scanner_export(export_file)) if export_file is not None else pd.DataFrame()
     if export_file is not None:
@@ -8206,7 +8425,7 @@ def render_my_positions() -> None:
             opt_cols = st.columns(5)
             broker = opt_cols[0].text_input("Broker")
             account = opt_cols[1].text_input("Account")
-            commission = opt_cols[2].number_input("Commission", min_value=0.0, step=0.01)
+            fees = opt_cols[2].number_input("Fees", min_value=0.0, step=0.01)
             stop_override = opt_cols[3].number_input("Current Stop Loss Override", min_value=0.0, step=0.01)
             tp_override = opt_cols[4].number_input("Manual TP Override", min_value=0.0, step=0.01)
             notes = st.text_area("Notes")
@@ -8222,16 +8441,38 @@ def render_my_positions() -> None:
                         "notes": notes,
                         "broker": broker,
                         "account": account,
-                        "commission": commission,
+                        "fees": fees,
                         "current_stop_loss_override": stop_override if stop_override > 0 else np.nan,
                         "manual_tp_override": tp_override if tp_override > 0 else np.nan,
                     }
                 ]
             )
-            st.session_state["positions_df"] = pd.concat([st.session_state["positions_df"], new_position], ignore_index=True)
-            st.success("Position added.")
+            new_position = normalize_positions_frame(new_position).iloc[0]
+            positions_existing = st.session_state["positions_df"]
+            if position_duplicate_exists(positions_existing, new_position["ticker"], new_position["entry_date"], new_position["entry_price"]):
+                st.warning("Duplicate position detected by ticker + entry date + entry price. Edit the existing position or change the entry details.")
+            else:
+                record = build_position_record(
+                    ticker=new_position["ticker"],
+                    entry_date=new_position["entry_date"],
+                    entry_price=new_position["entry_price"],
+                    position_size=new_position["position_size"],
+                    fees=new_position.get("fees", 0),
+                    broker=broker,
+                    account=account,
+                    notes=notes,
+                    stop_override=stop_override,
+                    tp_override=tp_override,
+                    history=history,
+                    uploaded_export=uploaded_export,
+                    current_fallback=current_fallback,
+                )
+                st.session_state["positions_df"] = pd.concat([positions_existing, pd.DataFrame([record])], ignore_index=True)
+                save_positions_file(st.session_state["positions_df"])
+                st.success("Position saved to positions.csv.")
 
     with input_tabs[1]:
+        st.markdown("**Position CSV**")
         positions_upload = st.file_uploader("Upload manual positions CSV", type=["csv"], key="positions_csv")
         st.caption("Accepted columns: ticker, entry_date, entry_price, position_size, notes")
         if positions_upload is not None:
@@ -8239,28 +8480,71 @@ def render_my_positions() -> None:
             if uploaded_positions.empty:
                 st.warning("No valid positions found in CSV.")
             elif st.button("Add Uploaded Positions", type="primary"):
-                st.session_state["positions_df"] = pd.concat([st.session_state["positions_df"], uploaded_positions], ignore_index=True)
-                st.success(f"Added {len(uploaded_positions)} positions.")
+                records = []
+                skipped = 0
+                existing = st.session_state["positions_df"]
+                for _, uploaded_position in uploaded_positions.iterrows():
+                    if position_duplicate_exists(existing, uploaded_position["ticker"], uploaded_position["entry_date"], uploaded_position["entry_price"]):
+                        skipped += 1
+                        continue
+                    records.append(
+                        build_position_record(
+                            ticker=uploaded_position["ticker"],
+                            entry_date=uploaded_position["entry_date"],
+                            entry_price=uploaded_position["entry_price"],
+                            position_size=uploaded_position["position_size"],
+                            fees=uploaded_position.get("fees", 0),
+                            broker=uploaded_position.get("broker", ""),
+                            account=uploaded_position.get("account", ""),
+                            notes=uploaded_position.get("notes", ""),
+                            stop_override=uploaded_position.get("current_stop_loss_override", np.nan),
+                            tp_override=uploaded_position.get("manual_tp_override", np.nan),
+                            history=history,
+                            uploaded_export=uploaded_export,
+                            current_fallback=current_fallback,
+                        )
+                    )
+                if records:
+                    st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame(records)], ignore_index=True)
+                    save_positions_file(st.session_state["positions_df"])
+                st.success(f"Added {len(records)} positions. Skipped {skipped} duplicates.")
 
     with input_tabs[2]:
-        screenshot = st.file_uploader("Upload Futu screenshot", type=["png", "jpg", "jpeg"], key="futu_screenshot")
+        st.markdown("**Broker / Futu Position or Trade Screenshot**")
+        screenshot = st.file_uploader("Upload Futu screenshot", type=["png", "jpg", "jpeg", "webp"], key="futu_screenshot")
         if screenshot is not None:
             st.image(screenshot, caption="Uploaded Futu screenshot")
-            st.info("Please confirm the extracted position details manually.")
+            extracted, ocr_status = extract_futu_screenshot_details(screenshot)
+            st.info(ocr_status)
             with st.form("screenshot_confirm_form"):
                 cols = st.columns(4)
-                s_ticker = cols[0].text_input("Confirm Ticker")
-                s_date = cols[1].date_input("Confirm Entry Date")
-                s_entry = cols[2].number_input("Confirm Entry Price", min_value=0.0, step=0.01)
-                s_size = cols[3].number_input("Confirm Position Size", min_value=0.0, step=1.0)
-                s_notes = st.text_area("Screenshot Notes", value="From Futu screenshot; manually confirmed.")
-                add_screenshot_position = st.form_submit_button("Add Confirmed Position")
+                s_ticker = cols[0].text_input("Ticker", value=str(extracted.get("ticker", "")))
+                default_date = pd.to_datetime(extracted.get("trade_date"), errors="coerce")
+                s_date = cols[1].date_input("Entry Date", value=default_date.date() if pd.notna(default_date) else datetime.now().date())
+                s_entry = cols[2].number_input("Entry Price", min_value=0.0, value=float(extracted.get("price")) if pd.notna(extracted.get("price")) else 0.0, step=0.01)
+                s_size = cols[3].number_input("Position Size", min_value=0.0, value=float(extracted.get("quantity")) if pd.notna(extracted.get("quantity")) else 0.0, step=1.0)
+                s_fee = st.number_input("Fees", min_value=0.0, value=float(extracted.get("fees")) if pd.notna(extracted.get("fees")) else 0.0, step=0.01)
+                s_notes = st.text_area("Notes", value=f"From Futu screenshot; manually confirmed. Direction: {extracted.get('direction', '')}; time: {extracted.get('trade_time', '')}")
+                add_screenshot_position = st.form_submit_button("Save Position")
             if add_screenshot_position and s_ticker and s_entry > 0 and s_size > 0:
-                confirmed = pd.DataFrame(
-                    [{"ticker": s_ticker.upper(), "entry_date": s_date.strftime("%Y-%m-%d"), "entry_price": s_entry, "position_size": s_size, "notes": s_notes}]
-                )
-                st.session_state["positions_df"] = pd.concat([st.session_state["positions_df"], confirmed], ignore_index=True)
-                st.success("Confirmed position added.")
+                existing = st.session_state["positions_df"]
+                if position_duplicate_exists(existing, s_ticker, s_date.strftime("%Y-%m-%d"), s_entry):
+                    st.warning("Duplicate position detected by ticker + entry date + entry price. Edit the existing position or change the entry details.")
+                else:
+                    record = build_position_record(
+                        ticker=s_ticker,
+                        entry_date=s_date.strftime("%Y-%m-%d"),
+                        entry_price=s_entry,
+                        position_size=s_size,
+                        fees=s_fee,
+                        notes=s_notes,
+                        history=history,
+                        uploaded_export=uploaded_export,
+                        current_fallback=current_fallback,
+                    )
+                    st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame([record])], ignore_index=True)
+                    save_positions_file(st.session_state["positions_df"])
+                    st.success("Position saved to positions.csv.")
 
     positions = normalize_positions_frame(st.session_state.get("positions_df", pd.DataFrame()))
     if positions.empty:
@@ -8271,21 +8555,44 @@ def render_my_positions() -> None:
 
     with st.expander("Current Open Positions", expanded=False):
         edited_positions = st.data_editor(positions, width="stretch", hide_index=True, num_rows="dynamic")
-        if st.button("Save Edited Positions"):
-            st.session_state["positions_df"] = normalize_positions_frame(edited_positions)
-            st.success("Positions updated.")
+        edit_cols = st.columns(3)
+        if edit_cols[0].button("Edit Position"):
+            st.info("Edit fields directly in the table, then click Save Changes.")
+        if edit_cols[1].button("Save Changes"):
+            saved_positions = edited_positions.copy()
+            saved_positions["updated_at"] = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            st.session_state["positions_df"] = saved_positions
+            save_positions_file(saved_positions)
+            positions = normalize_positions_frame(saved_positions)
+            st.success("Positions updated in positions.csv.")
+        delete_options = positions["position_id"].where(positions["position_id"].astype(str).str.len() > 0, positions["ticker"] + "-" + positions["entry_date"].astype(str)).tolist()
+        delete_choice = edit_cols[2].selectbox("Delete Position", [""] + delete_options)
+        if delete_choice and st.button("Delete Selected Position"):
+            delete_mask = (positions["position_id"] == delete_choice) | ((positions["ticker"] + "-" + positions["entry_date"].astype(str)) == delete_choice)
+            st.session_state["positions_df"] = positions[~delete_mask].copy()
+            save_positions_file(st.session_state["positions_df"])
+            positions = normalize_positions_frame(st.session_state["positions_df"])
+            st.success("Position deleted.")
+    if positions.empty:
+        st.info("No saved positions remain.")
+        return
 
     tickers = tuple(sorted(positions["ticker"].dropna().astype(str).str.upper().unique()))
+    refresh_positions = st.button("Refresh Position Data", type="primary")
     with st.spinner("Updating open positions with daily data..."):
-        raw_data = download_daily_data(tickers, period="1y", force_token=datetime.now().strftime("%Y-%m-%d"))
+        force_token = datetime.now().isoformat() if refresh_positions else datetime.now().strftime("%Y-%m-%d")
+        raw_data = download_daily_data(tickers, period="1y", force_token=force_token)
+        quote_data = {ticker: fetch_live_quote(ticker, include_info=True) for ticker in tickers}
         indicator_data = {ticker: add_indicators(frame) for ticker, frame in raw_data.items() if frame is not None and not frame.empty}
         rows = []
         for _, position in positions.iterrows():
-            thesis, thesis_source = match_original_thesis(position["ticker"], position["entry_date"], history, uploaded_export, current_fallback)
-            rows.append(calculate_position_management_row(position, thesis, thesis_source, indicator_data.get(position["ticker"])))
+            thesis, thesis_source = thesis_from_saved_position(position)
+            if thesis.empty:
+                thesis, thesis_source = match_original_thesis(position["ticker"], position["entry_date"], history, uploaded_export, current_fallback)
+            rows.append(calculate_position_management_row(position, thesis, thesis_source, indicator_data.get(position["ticker"]), quote_data.get(position["ticker"], {})))
         managed = pd.DataFrame(rows)
 
-    card_cols = st.columns(9)
+    card_cols = st.columns(10)
     card_cols[0].metric("Total open positions", len(managed))
     card_cols[1].metric("Total unrealized P/L", f"${pd.to_numeric(managed['unrealized P/L'], errors='coerce').sum():,.2f}")
     best = managed.sort_values("gain %", ascending=False).iloc[0]
@@ -8297,6 +8604,29 @@ def render_my_positions() -> None:
     card_cols[6].metric("Need action", int(managed["suggested action"].isin(["TAKE PARTIAL", "MOVE STOP UP", "REDUCE", "EXIT"]).sum()))
     card_cols[7].metric("Near stop", int((managed["current price"].astype(float) <= managed["suggested stop loss today"].astype(float) * 1.03).sum()))
     card_cols[8].metric("Near TP", int((managed["TP status"] != "NOT HIT").sum()))
+    card_cols[9].metric("After-hours alerts", int(managed["after-hours alert"].isin(["WATCH", "WARNING", "ACTION NEEDED"]).sum()))
+
+    with st.expander("After-hours / Pre-market Alert Panel", expanded=True):
+        alert_cols = ["ticker", "after-hours / pre-market price", "after-hours / pre-market move %", "after-hours alert", "after-hours alert reason", "suggested action"]
+        st.dataframe(round_display_values(managed[alert_cols]), width="stretch", hide_index=True)
+
+    with st.expander("Notification Settings", expanded=False):
+        notify_cols = st.columns(3)
+        enable_email = notify_cols[0].checkbox("Enable email alert", value=False, key="positions_email_alert")
+        enable_telegram = notify_cols[1].checkbox("Enable Telegram alert", value=False, key="positions_telegram_alert")
+        alert_threshold = notify_cols[2].number_input("Alert threshold %", min_value=0.0, value=3.0, step=0.5)
+        near_stop_alert = st.checkbox("Alert when price near stop", value=True)
+        near_tp_alert = st.checkbox("Alert when price near TP", value=True)
+        after_hours_alert = st.checkbox("Alert when after-hours move exceeds threshold", value=True)
+        if enable_email or enable_telegram:
+            st.info("Configure Telegram and email credentials in Settings or Streamlit secrets. Missing credentials are ignored safely.")
+        triggered = managed[
+            ((managed["after-hours alert"].isin(["WARNING", "ACTION NEEDED"])) & after_hours_alert)
+            | ((managed["current price"].astype(float) <= managed["suggested stop loss today"].astype(float) * 1.03) & near_stop_alert)
+            | ((managed["TP status"] != "NOT HIT") & near_tp_alert)
+            | (pd.to_numeric(managed["after-hours / pre-market move %"], errors="coerce").abs() >= alert_threshold)
+        ]
+        st.caption(f"{len(triggered)} positions currently meet notification rules.")
 
     export_columns = [
         "ticker",
@@ -8319,6 +8649,8 @@ def render_my_positions() -> None:
         "updated TP2",
         "updated TP3",
         "suggested action",
+        "after-hours alert",
+        "after-hours alert reason",
         "original thesis vs current action",
     ]
     display_columns = export_columns + [
@@ -8332,6 +8664,8 @@ def render_my_positions() -> None:
         "pullback from high %",
         "updated ideal TP",
         "TP status",
+        "after-hours / pre-market price",
+        "after-hours / pre-market move %",
         "original trade tier",
         "original professional score",
         "original decision reason",
