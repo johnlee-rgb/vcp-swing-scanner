@@ -662,6 +662,70 @@ MARKET_TICKERS = [
 HK_MARKET_TICKERS = ["^HSI", "2800.HK", "3033.HK", "3067.HK"]
 ALL_CONTEXT_TICKERS = list(dict.fromkeys(MARKET_TICKERS + HK_MARKET_TICKERS))
 ACTION_ORDER = {"READY": 0, "PULLBACK ENTRY": 1, "WATCH": 2, "EXTENDED": 3, "FAILED": 4}
+TRADE_HISTORY_FILE = "trade_signals_history.csv"
+TRADE_HISTORY_COLUMNS = [
+    "timestamp",
+    "scan date",
+    "scanner type",
+    "ticker",
+    "sector / industry",
+    "leader quality label",
+    "sector leadership status",
+    "trade tier",
+    "setup type",
+    "signal state",
+    "watch type",
+    "trade",
+    "professional score",
+    "adjusted final score",
+    "institutional quality score",
+    "entry quality score",
+    "healthy pullback score",
+    "institutional tightness score",
+    "breakout quality score",
+    "RS score",
+    "risk %",
+    "close",
+    "pivot",
+    "entry trigger",
+    "stop loss",
+    "TP1",
+    "TP2",
+    "TP3",
+    "ideal TP",
+    "TP type",
+    "decision reason",
+]
+SCANNER_TO_HISTORY_COLUMNS = {
+    "ticker": "ticker",
+    "Sector / Industry": "sector / industry",
+    "Leader Quality Label": "leader quality label",
+    "Sector Leadership Status": "sector leadership status",
+    "Trade Tier": "trade tier",
+    "Setup Type": "setup type",
+    "Signal State": "signal state",
+    "Watch Type": "watch type",
+    "Trade": "trade",
+    "Professional Score": "professional score",
+    "Adjusted Final Score": "adjusted final score",
+    "Institutional Quality Score": "institutional quality score",
+    "Entry Quality Score": "entry quality score",
+    "Healthy Pullback Score": "healthy pullback score",
+    "Institutional Tightness Score": "institutional tightness score",
+    "Breakout Quality Score": "breakout quality score",
+    "RS Score": "RS score",
+    "Risk %": "risk %",
+    "close": "close",
+    "Pivot": "pivot",
+    "Entry Trigger": "entry trigger",
+    "Stop Loss": "stop loss",
+    "TP1": "TP1",
+    "TP2": "TP2",
+    "TP3": "TP3",
+    "Ideal TP": "ideal TP",
+    "TP Type": "TP type",
+    "Decision Reason": "decision reason",
+}
 
 
 @dataclass
@@ -5570,6 +5634,22 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Sector Spread %",
         "MA10 Distance %",
         "MA20 Distance %",
+        "current price",
+        "gain %",
+        "unrealized P/L",
+        "current R multiple",
+        "distance from MA10",
+        "distance from MA20",
+        "current RSI",
+        "current volume vs 20-day average",
+        "highest price since entry",
+        "lowest price since entry",
+        "pullback from high %",
+        "suggested stop loss today",
+        "updated TP1",
+        "updated TP2",
+        "updated TP3",
+        "updated ideal TP",
     ]
     for column in two_decimal_columns:
         if column in rounded.columns:
@@ -5807,6 +5887,315 @@ def select_ai_top_5(results: pd.DataFrame) -> pd.DataFrame:
         ascending=[True, True, True, True, True, True, False, False, False, False, True, False, False, False, False, False, False, False, False, False, False, True, False, True],
     )
     return ranked.head(5)
+
+
+def normalize_uploaded_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize uploaded CSV/export headers while preserving readable columns."""
+    normalized = frame.copy()
+    normalized.columns = [str(column).strip() for column in normalized.columns]
+    return normalized
+
+
+def scanner_frame_to_history(frame: pd.DataFrame, scanner_type: str) -> pd.DataFrame:
+    """Convert a scanner result table into the compact trade history archive schema."""
+    if frame.empty:
+        return pd.DataFrame(columns=TRADE_HISTORY_COLUMNS)
+    archived = pd.DataFrame(index=frame.index)
+    now = datetime.now(ZoneInfo("Asia/Singapore"))
+    archived["timestamp"] = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    archived["scan date"] = now.strftime("%Y-%m-%d")
+    archived["scanner type"] = scanner_type
+    for source, target in SCANNER_TO_HISTORY_COLUMNS.items():
+        archived[target] = frame[source] if source in frame.columns else "N/A"
+    return archived[TRADE_HISTORY_COLUMNS]
+
+
+def append_trade_signal_history(frame: pd.DataFrame, scanner_type: str) -> None:
+    """Append every completed scanner run to trade_signals_history.csv."""
+    archive_rows = scanner_frame_to_history(frame, scanner_type)
+    if archive_rows.empty:
+        return
+    try:
+        existing = pd.read_csv(TRADE_HISTORY_FILE) if pd.io.common.file_exists(TRADE_HISTORY_FILE) else pd.DataFrame()
+        combined = pd.concat([existing, archive_rows], ignore_index=True)
+        combined.to_csv(TRADE_HISTORY_FILE, index=False)
+    except Exception:
+        pass
+
+
+def load_trade_signal_history() -> pd.DataFrame:
+    """Load saved trade-signal history if available."""
+    try:
+        if pd.io.common.file_exists(TRADE_HISTORY_FILE):
+            return pd.read_csv(TRADE_HISTORY_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame(columns=TRADE_HISTORY_COLUMNS)
+
+
+def parse_uploaded_scanner_export(uploaded_file) -> pd.DataFrame:
+    """Read scanner CSV exports, and best-effort parse the app's simple PDF export."""
+    if uploaded_file is None:
+        return pd.DataFrame()
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith(".csv"):
+            return normalize_uploaded_columns(pd.read_csv(uploaded_file))
+        if name.endswith(".pdf"):
+            text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
+            lines = [line.replace("\\(", "(").replace("\\)", ")") for line in re.findall(r"\((.*?)\) Tj", text)]
+            table_lines = [line for line in lines if "|" in line]
+            if len(table_lines) < 2:
+                return pd.DataFrame()
+            header = [part.strip() for part in table_lines[0].split("|")]
+            rows = []
+            for line in table_lines[1:]:
+                parts = [part.strip() for part in line.split("|")]
+                if len(parts) == len(header):
+                    rows.append(dict(zip(header, parts)))
+            return normalize_uploaded_columns(pd.DataFrame(rows))
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def normalize_positions_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Accept simple manual position CSV fields and normalize for analysis."""
+    if frame.empty:
+        return pd.DataFrame()
+    normalized = frame.copy()
+    normalized.columns = [str(column).strip().lower().replace(" ", "_") for column in normalized.columns]
+    aliases = {
+        "symbol": "ticker",
+        "entry": "entry_price",
+        "shares": "position_size",
+        "qty": "position_size",
+        "quantity": "position_size",
+        "date": "entry_date",
+    }
+    normalized = normalized.rename(columns={key: value for key, value in aliases.items() if key in normalized.columns})
+    for column in [
+        "ticker",
+        "entry_date",
+        "entry_price",
+        "position_size",
+        "notes",
+        "broker",
+        "account",
+        "commission",
+        "current_stop_loss_override",
+        "manual_tp_override",
+    ]:
+        if column not in normalized.columns:
+            normalized[column] = "" if column in {"ticker", "entry_date", "notes", "broker", "account"} else np.nan
+    normalized["ticker"] = normalized["ticker"].astype(str).str.upper().str.strip()
+    normalized["entry_date"] = pd.to_datetime(normalized["entry_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for column in ["entry_price", "position_size", "commission", "current_stop_loss_override", "manual_tp_override"]:
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
+    normalized = normalized.dropna(subset=["ticker", "entry_price", "position_size"])
+    normalized = normalized[normalized["ticker"].astype(str).str.len() > 0]
+    return normalized
+
+
+def history_like_from_scanner_export(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert uploaded scanner CSV/PDF rows to history-like lower-case fields."""
+    if frame.empty:
+        return pd.DataFrame(columns=TRADE_HISTORY_COLUMNS)
+    converted = pd.DataFrame(index=frame.index)
+    converted["timestamp"] = "Uploaded export"
+    converted["scan date"] = pd.Timestamp.today().strftime("%Y-%m-%d")
+    converted["scanner type"] = "Uploaded Scanner Export"
+    for source, target in SCANNER_TO_HISTORY_COLUMNS.items():
+        converted[target] = frame[source] if source in frame.columns else frame.get(target, "N/A")
+    return converted[TRADE_HISTORY_COLUMNS]
+
+
+def match_original_thesis(
+    ticker: str,
+    entry_date: str,
+    history: pd.DataFrame,
+    uploaded_export: pd.DataFrame,
+    current_fallback: pd.DataFrame,
+) -> Tuple[pd.Series, str]:
+    """Find the closest available original thesis for a position."""
+    symbol = str(ticker).upper()
+    entry_dt = pd.to_datetime(entry_date, errors="coerce")
+
+    def closest(frame: pd.DataFrame, source: str) -> Tuple[pd.Series, str] | None:
+        if frame.empty or "ticker" not in frame.columns:
+            return None
+        matches = frame[frame["ticker"].astype(str).str.upper() == symbol].copy()
+        if matches.empty:
+            return None
+        if "scan date" in matches.columns and pd.notna(entry_dt):
+            matches["_date_diff"] = (pd.to_datetime(matches["scan date"], errors="coerce") - entry_dt).abs()
+            matches = matches.sort_values("_date_diff", na_position="last")
+        return matches.iloc[0], source
+
+    for frame, source in [
+        (history, "Trade History Archive"),
+        (uploaded_export, "Uploaded Scanner Export"),
+        (scanner_frame_to_history(current_fallback, "Current Scanner Fallback"), "Current Scanner Fallback"),
+    ]:
+        result = closest(frame, source)
+        if result is not None:
+            return result
+    return pd.Series(dtype=object), "Manual Entry"
+
+
+def calculate_position_management_row(position: pd.Series, thesis: pd.Series, thesis_source: str, data: pd.DataFrame | None) -> dict:
+    """Calculate daily active-position management fields from daily OHLCV."""
+    ticker = str(position.get("ticker", "")).upper()
+    entry_price = float(position.get("entry_price", np.nan))
+    position_size = float(position.get("position_size", np.nan))
+    entry_date = str(position.get("entry_date", ""))
+    latest = data.iloc[-1] if data is not None and not data.empty else pd.Series(dtype=object)
+    since_entry = data[data.index >= pd.to_datetime(entry_date, errors="coerce")] if data is not None and not data.empty else pd.DataFrame()
+    if since_entry.empty and data is not None:
+        since_entry = data.tail(1)
+
+    current_price = float(latest.get("Close", entry_price)) if pd.notna(latest.get("Close", np.nan)) else entry_price
+    original_stop = numeric_or_na(position.get("current_stop_loss_override"))
+    if pd.isna(original_stop):
+        original_stop = numeric_or_na(thesis.get("stop loss"))
+    if pd.isna(original_stop) or original_stop <= 0:
+        original_stop = entry_price * 0.92
+    risk_per_share = max(entry_price - float(original_stop), 0.01)
+    gain_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else np.nan
+    unrealized_pl = (current_price - entry_price) * position_size - (numeric_or_na(position.get("commission")) if pd.notna(numeric_or_na(position.get("commission"))) else 0)
+    current_r = (current_price - entry_price) / risk_per_share
+    days_held = (pd.Timestamp.today().normalize() - pd.to_datetime(entry_date, errors="coerce")).days if pd.notna(pd.to_datetime(entry_date, errors="coerce")) else np.nan
+    ma10 = numeric_or_na(latest.get("MA10"))
+    ma20 = numeric_or_na(latest.get("MA20"))
+    ma50 = numeric_or_na(latest.get("MA50"))
+    rsi = numeric_or_na(latest.get("RSI14"))
+    avg_vol20 = numeric_or_na(latest.get("AvgVol20"))
+    vol_ratio = float(latest.get("Volume", np.nan)) / avg_vol20 if pd.notna(avg_vol20) and avg_vol20 > 0 else np.nan
+    highest_since_entry = float(since_entry["High"].max()) if not since_entry.empty and "High" in since_entry else current_price
+    lowest_since_entry = float(since_entry["Low"].min()) if not since_entry.empty and "Low" in since_entry else current_price
+    pullback_from_high = (current_price / highest_since_entry - 1) * 100 if highest_since_entry > 0 else np.nan
+    prior_day_low = float(data["Low"].iloc[-2]) if data is not None and len(data) >= 2 else current_price
+    two_day_low = float(data["Low"].tail(2).min()) if data is not None and len(data) >= 2 else prior_day_low
+    heavy_down = bool(pd.notna(vol_ratio) and vol_ratio >= 1.3 and current_price < float(latest.get("Open", current_price)))
+    below_ma10 = pd.notna(ma10) and current_price < ma10
+    below_ma20 = pd.notna(ma20) and current_price < ma20
+    distance_ma10 = (current_price / ma10 - 1) * 100 if pd.notna(ma10) and ma10 > 0 else np.nan
+    distance_ma20 = (current_price / ma20 - 1) * 100 if pd.notna(ma20) and ma20 > 0 else np.nan
+    pivot = numeric_or_na(thesis.get("pivot"))
+
+    if current_price <= original_stop or (below_ma20 and heavy_down) or (pd.notna(pivot) and current_price < pivot and current_price < entry_price):
+        thesis_status = "FAILED"
+    elif below_ma10 and heavy_down:
+        thesis_status = "WEAKENING"
+    elif below_ma10:
+        thesis_status = "NEEDS CONFIRMATION"
+    elif current_price > entry_price and (pd.isna(ma10) or current_price >= ma10) and (pd.isna(ma20) or current_price >= ma20):
+        thesis_status = "PLAYING OUT" if current_r >= 0.8 else "STILL VALID"
+    else:
+        thesis_status = "STILL VALID"
+
+    suggested_stop = float(original_stop)
+    suggested_action = "HOLD"
+    if current_r >= 2:
+        suggested_stop = max(suggested_stop, ma10 if pd.notna(ma10) else entry_price, two_day_low)
+        suggested_action = "HOLD / TRAIL STOP"
+    elif current_r >= 1.5:
+        suggested_stop = max(suggested_stop, entry_price, prior_day_low)
+        suggested_action = "MOVE STOP UP"
+    elif current_r >= 1:
+        suggested_stop = max(suggested_stop, entry_price, ma10 if pd.notna(ma10) else entry_price)
+        suggested_action = "MOVE STOP UP"
+    if pd.notna(distance_ma10) and distance_ma10 > 12:
+        suggested_stop = max(suggested_stop, two_day_low, prior_day_low)
+        suggested_action = "TAKE PARTIAL" if current_r >= 1 else "HOLD / TRAIL STOP"
+    if below_ma10 and heavy_down:
+        suggested_action = "REDUCE"
+    if thesis_status == "FAILED":
+        suggested_action = "EXIT"
+        suggested_stop = current_price
+    if thesis_status == "STILL VALID" and pd.notna(vol_ratio) and vol_ratio < 1 and (below_ma10 or abs(distance_ma10) <= 3 if pd.notna(distance_ma10) else False):
+        suggested_action = "ADD ON WATCH"
+
+    original_tp1 = numeric_or_na(thesis.get("TP1"))
+    original_tp2 = numeric_or_na(thesis.get("TP2"))
+    original_tp3 = numeric_or_na(thesis.get("TP3"))
+    manual_tp = numeric_or_na(position.get("manual_tp_override"))
+    updated_tp1 = max(original_tp1 if pd.notna(original_tp1) else entry_price + 1.5 * risk_per_share, current_price) if current_r >= 1 else (original_tp1 if pd.notna(original_tp1) else entry_price + 1.5 * risk_per_share)
+    updated_tp2 = max(original_tp2 if pd.notna(original_tp2) else entry_price + 2.5 * risk_per_share, updated_tp1 + 0.5 * risk_per_share)
+    updated_tp3 = max(original_tp3 if pd.notna(original_tp3) else entry_price + 3 * risk_per_share, highest_since_entry * 1.03, updated_tp2 + 0.5 * risk_per_share)
+    updated_ideal = manual_tp if pd.notna(manual_tp) and manual_tp > current_price else updated_tp2
+    if current_price >= updated_tp3:
+        tp_status = "TRAIL RUNNER"
+        suggested_action = "HOLD / TRAIL STOP"
+    elif current_price >= updated_tp2:
+        tp_status = "TP2 HIT"
+        suggested_action = "TAKE PARTIAL" if suggested_action not in {"EXIT", "REDUCE"} else suggested_action
+    elif current_price >= updated_tp1:
+        tp_status = "TP1 HIT"
+        suggested_action = "TAKE PARTIAL" if suggested_action not in {"EXIT", "REDUCE"} else suggested_action
+    else:
+        tp_status = "NOT HIT"
+
+    if thesis_source == "Manual Entry":
+        explanation = "Original thesis unavailable. This analysis uses manual entry and current daily data only."
+    elif thesis_status == "FAILED":
+        explanation = "Original thesis failed. Price broke stop / MA20 with volume."
+    elif tp_status in {"TP1 HIT", "TP2 HIT"}:
+        explanation = f"Stock reached {tp_status.replace(' HIT', '')}. Consider partial profit and move stop up."
+    elif thesis_status == "PLAYING OUT":
+        explanation = "Original breakout thesis is working. Price is above entry and holding MA10/MA20. Continue to trail stop."
+    elif thesis_status == "NEEDS CONFIRMATION":
+        explanation = "Original thesis still valid but momentum is cooling. Wait for rebound or reduce if MA10 breaks."
+    else:
+        explanation = "Original thesis still valid. Manage as an existing position, not a new entry."
+    if thesis_source == "Current Scanner Fallback":
+        explanation = f"Original thesis unavailable. This analysis uses current scanner fallback only. {explanation}"
+
+    return {
+        "ticker": ticker,
+        "entry date": entry_date,
+        "entry price": round(entry_price, 2),
+        "position size": position_size,
+        "current price": round(current_price, 2),
+        "gain %": round(gain_pct, 2) if pd.notna(gain_pct) else np.nan,
+        "unrealized P/L": round(unrealized_pl, 2),
+        "current R multiple": round(current_r, 2),
+        "days held": days_held,
+        "distance from MA10": round(distance_ma10, 2) if pd.notna(distance_ma10) else np.nan,
+        "distance from MA20": round(distance_ma20, 2) if pd.notna(distance_ma20) else np.nan,
+        "current RSI": round(rsi, 1) if pd.notna(rsi) else np.nan,
+        "current volume vs 20-day average": round(vol_ratio, 2) if pd.notna(vol_ratio) else np.nan,
+        "highest price since entry": round(highest_since_entry, 2),
+        "lowest price since entry": round(lowest_since_entry, 2),
+        "pullback from high %": round(pullback_from_high, 2) if pd.notna(pullback_from_high) else np.nan,
+        "original thesis source": thesis_source,
+        "original signal": thesis.get("signal state", "N/A"),
+        "original setup type": thesis.get("setup type", "N/A"),
+        "original trade tier": thesis.get("trade tier", "N/A"),
+        "original professional score": thesis.get("professional score", "N/A"),
+        "original entry trigger": thesis.get("entry trigger", "N/A"),
+        "original stop loss": round(float(original_stop), 2),
+        "original TP1": thesis.get("TP1", "N/A"),
+        "original TP2": thesis.get("TP2", "N/A"),
+        "original TP3": thesis.get("TP3", "N/A"),
+        "original ideal TP": thesis.get("ideal TP", "N/A"),
+        "original TP type": thesis.get("TP type", "N/A"),
+        "original decision reason": thesis.get("decision reason", "N/A"),
+        "thesis status": thesis_status,
+        "suggested stop loss today": round(float(suggested_stop), 2),
+        "updated TP1": round(float(updated_tp1), 2),
+        "updated TP2": round(float(updated_tp2), 2),
+        "updated TP3": round(float(updated_tp3), 2),
+        "updated ideal TP": round(float(updated_ideal), 2),
+        "TP status": tp_status,
+        "suggested action": suggested_action,
+        "original thesis vs current action": explanation,
+        "notes": position.get("notes", ""),
+        "_data": data,
+        "_ma10": ma10,
+        "_ma20": ma20,
+        "_ma50": ma50,
+    }
 
 
 def alert_message(row: pd.Series) -> str:
@@ -7729,6 +8118,227 @@ def render_settings() -> None:
     st.write("The app skips failed tickers and missing yfinance earnings data instead of crashing.")
 
 
+def make_position_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
+    """Chart an existing holding with original thesis and updated management levels."""
+    chart_data = data.tail(160) if data is not None and not data.empty else pd.DataFrame()
+    figure = go.Figure()
+    if chart_data.empty:
+        return figure
+    figure.add_trace(
+        go.Candlestick(
+            x=chart_data.index,
+            open=chart_data["Open"],
+            high=chart_data["High"],
+            low=chart_data["Low"],
+            close=chart_data["Close"],
+            name="Price",
+        )
+    )
+    for ma, color in (("MA10", "#2563eb"), ("MA20", "#f59e0b"), ("MA50", "#16a34a")):
+        if ma in chart_data.columns:
+            figure.add_trace(go.Scatter(x=chart_data.index, y=chart_data[ma], mode="lines", line=dict(width=1.6, color=color), name=ma))
+    figure.add_trace(
+        go.Bar(x=chart_data.index, y=chart_data["Volume"], marker_color="#94a3b8", opacity=0.3, name="Volume", yaxis="y2")
+    )
+    levels = [
+        ("Entry", row.get("entry price"), "#2563eb"),
+        ("Original Stop", row.get("original stop loss"), "#dc2626"),
+        ("Suggested Stop", row.get("suggested stop loss today"), "#ea580c"),
+        ("TP1", row.get("updated TP1"), "#22c55e"),
+        ("TP2", row.get("updated TP2"), "#16a34a"),
+        ("TP3", row.get("updated TP3"), "#15803d"),
+        ("Ideal TP", row.get("updated ideal TP"), "#0f766e"),
+    ]
+    for label, value, color in levels:
+        numeric = numeric_or_na(value)
+        if pd.notna(numeric):
+            figure.add_hline(y=float(numeric), line_dash="dash", line_color=color, annotation_text=label)
+    entry_dt = pd.to_datetime(row.get("entry date"), errors="coerce")
+    if pd.notna(entry_dt) and chart_data.index.min() <= entry_dt <= chart_data.index.max():
+        figure.add_vline(x=entry_dt, line_dash="dot", line_color="#7c3aed", annotation_text="Entry")
+    figure.update_layout(
+        title=f"{ticker} existing position management",
+        height=600,
+        margin=dict(l=12, r=12, t=48, b=24),
+        xaxis_rangeslider_visible=False,
+        yaxis=dict(title="Price"),
+        yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False, rangemode="tozero"),
+        legend=dict(orientation="h", y=1.02, x=0),
+        template="plotly_white",
+    )
+    return figure
+
+
+def render_my_positions() -> None:
+    """Render simplified active position manager and trade history matching."""
+    st.subheader("My Positions")
+    st.caption("Existing position management is separate from new-entry scanner signals.")
+    if "positions_df" not in st.session_state:
+        st.session_state["positions_df"] = pd.DataFrame()
+
+    history = load_trade_signal_history()
+    current_fallback = combined_session_results()
+    export_file = st.file_uploader("Upload original scanner export CSV or PDF", type=["csv", "pdf"], key="positions_scanner_export")
+    uploaded_export = history_like_from_scanner_export(parse_uploaded_scanner_export(export_file)) if export_file is not None else pd.DataFrame()
+    if export_file is not None:
+        if uploaded_export.empty:
+            st.warning("Uploaded scanner export could not be parsed. CSV export works best; PDF parsing is best-effort.")
+        else:
+            st.success(f"Loaded {len(uploaded_export)} uploaded scanner export rows.")
+
+    input_tabs = st.tabs(["Manual Input", "Upload Positions CSV", "Futu Screenshot"])
+    with input_tabs[0]:
+        with st.form("manual_position_form", clear_on_submit=False):
+            cols = st.columns(4)
+            ticker = cols[0].text_input("Ticker")
+            entry_date = cols[1].date_input("Entry Date")
+            entry_price = cols[2].number_input("Entry Price", min_value=0.0, step=0.01)
+            position_size = cols[3].number_input("Position Size", min_value=0.0, step=1.0)
+            opt_cols = st.columns(5)
+            broker = opt_cols[0].text_input("Broker")
+            account = opt_cols[1].text_input("Account")
+            commission = opt_cols[2].number_input("Commission", min_value=0.0, step=0.01)
+            stop_override = opt_cols[3].number_input("Current Stop Loss Override", min_value=0.0, step=0.01)
+            tp_override = opt_cols[4].number_input("Manual TP Override", min_value=0.0, step=0.01)
+            notes = st.text_area("Notes")
+            submitted = st.form_submit_button("Add Position", type="primary")
+        if submitted and ticker and entry_price > 0 and position_size > 0:
+            new_position = pd.DataFrame(
+                [
+                    {
+                        "ticker": ticker.upper().strip(),
+                        "entry_date": entry_date.strftime("%Y-%m-%d"),
+                        "entry_price": entry_price,
+                        "position_size": position_size,
+                        "notes": notes,
+                        "broker": broker,
+                        "account": account,
+                        "commission": commission,
+                        "current_stop_loss_override": stop_override if stop_override > 0 else np.nan,
+                        "manual_tp_override": tp_override if tp_override > 0 else np.nan,
+                    }
+                ]
+            )
+            st.session_state["positions_df"] = pd.concat([st.session_state["positions_df"], new_position], ignore_index=True)
+            st.success("Position added.")
+
+    with input_tabs[1]:
+        positions_upload = st.file_uploader("Upload manual positions CSV", type=["csv"], key="positions_csv")
+        st.caption("Accepted columns: ticker, entry_date, entry_price, position_size, notes")
+        if positions_upload is not None:
+            uploaded_positions = normalize_positions_frame(pd.read_csv(positions_upload))
+            if uploaded_positions.empty:
+                st.warning("No valid positions found in CSV.")
+            elif st.button("Add Uploaded Positions", type="primary"):
+                st.session_state["positions_df"] = pd.concat([st.session_state["positions_df"], uploaded_positions], ignore_index=True)
+                st.success(f"Added {len(uploaded_positions)} positions.")
+
+    with input_tabs[2]:
+        screenshot = st.file_uploader("Upload Futu screenshot", type=["png", "jpg", "jpeg"], key="futu_screenshot")
+        if screenshot is not None:
+            st.image(screenshot, caption="Uploaded Futu screenshot")
+            st.info("Please confirm the extracted position details manually.")
+            with st.form("screenshot_confirm_form"):
+                cols = st.columns(4)
+                s_ticker = cols[0].text_input("Confirm Ticker")
+                s_date = cols[1].date_input("Confirm Entry Date")
+                s_entry = cols[2].number_input("Confirm Entry Price", min_value=0.0, step=0.01)
+                s_size = cols[3].number_input("Confirm Position Size", min_value=0.0, step=1.0)
+                s_notes = st.text_area("Screenshot Notes", value="From Futu screenshot; manually confirmed.")
+                add_screenshot_position = st.form_submit_button("Add Confirmed Position")
+            if add_screenshot_position and s_ticker and s_entry > 0 and s_size > 0:
+                confirmed = pd.DataFrame(
+                    [{"ticker": s_ticker.upper(), "entry_date": s_date.strftime("%Y-%m-%d"), "entry_price": s_entry, "position_size": s_size, "notes": s_notes}]
+                )
+                st.session_state["positions_df"] = pd.concat([st.session_state["positions_df"], confirmed], ignore_index=True)
+                st.success("Confirmed position added.")
+
+    positions = normalize_positions_frame(st.session_state.get("positions_df", pd.DataFrame()))
+    if positions.empty:
+        st.info("Add a position manually, upload a positions CSV, or confirm a Futu screenshot position.")
+        if not history.empty:
+            st.caption(f"Trade history archive loaded: {len(history)} saved signal rows.")
+        return
+
+    with st.expander("Current Open Positions", expanded=False):
+        edited_positions = st.data_editor(positions, width="stretch", hide_index=True, num_rows="dynamic")
+        if st.button("Save Edited Positions"):
+            st.session_state["positions_df"] = normalize_positions_frame(edited_positions)
+            st.success("Positions updated.")
+
+    tickers = tuple(sorted(positions["ticker"].dropna().astype(str).str.upper().unique()))
+    with st.spinner("Updating open positions with daily data..."):
+        raw_data = download_daily_data(tickers, period="1y", force_token=datetime.now().strftime("%Y-%m-%d"))
+        indicator_data = {ticker: add_indicators(frame) for ticker, frame in raw_data.items() if frame is not None and not frame.empty}
+        rows = []
+        for _, position in positions.iterrows():
+            thesis, thesis_source = match_original_thesis(position["ticker"], position["entry_date"], history, uploaded_export, current_fallback)
+            rows.append(calculate_position_management_row(position, thesis, thesis_source, indicator_data.get(position["ticker"])))
+        managed = pd.DataFrame(rows)
+
+    card_cols = st.columns(9)
+    card_cols[0].metric("Total open positions", len(managed))
+    card_cols[1].metric("Total unrealized P/L", f"${pd.to_numeric(managed['unrealized P/L'], errors='coerce').sum():,.2f}")
+    best = managed.sort_values("gain %", ascending=False).iloc[0]
+    worst = managed.sort_values("gain %", ascending=True).iloc[0]
+    card_cols[2].metric("Best performer", f"{best['ticker']} {best['gain %']}%")
+    card_cols[3].metric("Worst performer", f"{worst['ticker']} {worst['gain %']}%")
+    card_cols[4].metric("Above +1R", int((pd.to_numeric(managed["current R multiple"], errors="coerce") >= 1).sum()))
+    card_cols[5].metric("Below entry", int((pd.to_numeric(managed["gain %"], errors="coerce") < 0).sum()))
+    card_cols[6].metric("Need action", int(managed["suggested action"].isin(["TAKE PARTIAL", "MOVE STOP UP", "REDUCE", "EXIT"]).sum()))
+    card_cols[7].metric("Near stop", int((managed["current price"].astype(float) <= managed["suggested stop loss today"].astype(float) * 1.03).sum()))
+    card_cols[8].metric("Near TP", int((managed["TP status"] != "NOT HIT").sum()))
+
+    export_columns = [
+        "ticker",
+        "entry date",
+        "entry price",
+        "current price",
+        "gain %",
+        "unrealized P/L",
+        "current R multiple",
+        "original thesis source",
+        "original signal",
+        "original setup type",
+        "original stop loss",
+        "original TP1",
+        "original TP2",
+        "original TP3",
+        "thesis status",
+        "suggested stop loss today",
+        "updated TP1",
+        "updated TP2",
+        "updated TP3",
+        "suggested action",
+        "original thesis vs current action",
+    ]
+    display_columns = export_columns + [
+        "position size",
+        "days held",
+        "distance from MA10",
+        "distance from MA20",
+        "current RSI",
+        "current volume vs 20-day average",
+        "highest price since entry",
+        "pullback from high %",
+        "updated ideal TP",
+        "TP status",
+        "original trade tier",
+        "original professional score",
+        "original decision reason",
+    ]
+    st.dataframe(round_display_values(managed[display_columns]), width="stretch", hide_index=True)
+    st.download_button("Export Positions CSV", data=managed[export_columns].to_csv(index=False).encode("utf-8"), file_name="positions_export.csv", mime="text/csv")
+    st.download_button("Export Positions PDF", data=dataframe_to_simple_pdf(managed[export_columns], "Positions Export"), file_name="positions_export.pdf", mime="application/pdf")
+
+    selected_ticker = st.selectbox("Chart holding", managed["ticker"].tolist(), key="position_chart_ticker")
+    selected = managed[managed["ticker"] == selected_ticker].iloc[0]
+    selected_data = selected.get("_data")
+    if isinstance(selected_data, pd.DataFrame) and not selected_data.empty:
+        st.plotly_chart(make_position_chart(selected_ticker, selected_data, selected), width="stretch")
+    st.caption("New Entry Signal and Existing Position Management are separate: an extended stock can be no-chase for new buyers while still being HOLD / TRAIL STOP for existing holders.")
+
+
 def manage_active_position(
     entry_price: float,
     current_price: float,
@@ -7983,6 +8593,7 @@ def render_swing_scanner(
                 aggressive_mode=aggressive_mode,
             )
             results = validate_scan_results(results)
+            append_trade_signal_history(results, scan_mode)
             st.session_state[f"{key_prefix}_results"] = results
             st.session_state[f"{key_prefix}_indicator_data"] = indicator_data
             st.session_state[f"{key_prefix}_summary"] = summary
@@ -8024,6 +8635,7 @@ def render_swing_scanner(
         "Institutional Quality Score",
         "Entry Quality Score",
         "Trade Tier",
+        "Action Readiness Label",
         "Healthy Pullback Score",
         "Healthy Pullback Label",
         "Institutional Tightness Score",
@@ -8678,8 +9290,8 @@ def main() -> None:
     st.title("IPO + Swing Pro Scanner")
     st.caption("Daily swing-trading scanner plus IPO grey-market scoring and trade planning.")
 
-    us_tab, hk_tab, ipo_tab, top5_tab, alerts_tab, settings_tab = st.tabs(
-        ["US Scanner", "HK Scanner", "IPO Scanner", "Top 5 Trades", "Alerts", "Settings"]
+    us_tab, hk_tab, positions_tab, ipo_tab, top5_tab, alerts_tab, settings_tab = st.tabs(
+        ["US Scanner", "HK Scanner", "My Positions", "IPO Scanner", "Top 5 Trades", "Alerts", "Settings"]
     )
     with us_tab:
         render_swing_scanner(
@@ -8712,6 +9324,8 @@ def main() -> None:
             default_mode="HK Pro Market Scan",
             key_prefix="hk",
         )
+    with positions_tab:
+        render_my_positions()
     with ipo_tab:
         render_ipo_scanner()
     with top5_tab:
