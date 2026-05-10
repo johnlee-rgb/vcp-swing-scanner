@@ -6183,6 +6183,34 @@ def extract_futu_screenshot_details(uploaded_file) -> Tuple[dict, str]:
         return details, "Screenshot uploaded. Please confirm position details manually."
 
 
+def detect_uploaded_file_type(uploaded_file) -> Tuple[str, str, pd.DataFrame, dict]:
+    """Classify unified My Positions uploads into scanner export, position CSV, or screenshot."""
+    name = uploaded_file.name
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if extension == "csv":
+        try:
+            frame = normalize_uploaded_columns(pd.read_csv(uploaded_file))
+            lowered = {str(column).strip().lower().replace(" ", "_") for column in frame.columns}
+            position_cols = {"ticker", "entry_date", "entry_price", "position_size"}
+            scanner_markers = {"signal_state", "setup_type", "entry_trigger", "stop_loss", "professional_score", "trade_tier"}
+            if position_cols.issubset(lowered):
+                return "Position CSV", "loaded", frame, {}
+            if "ticker" in lowered and len(scanner_markers.intersection(lowered)) >= 3:
+                return "Scanner Export CSV", "loaded", frame, {}
+            return "Unsupported / unreadable", "failed: CSV columns not recognized. Required position columns: ticker, entry_date, entry_price, position_size.", frame, {}
+        except Exception as exc:
+            return "Unsupported / unreadable", f"failed: {exc}", pd.DataFrame(), {}
+    if extension == "pdf":
+        frame = parse_uploaded_scanner_export(uploaded_file)
+        if frame.empty:
+            return "Scanner Export PDF", "failed: PDF could not be parsed", pd.DataFrame(), {}
+        return "Scanner Export PDF", "loaded", frame, {}
+    if extension in {"png", "jpg", "jpeg", "webp"}:
+        extracted, status = extract_futu_screenshot_details(uploaded_file)
+        return "Futu Screenshot", "needs confirmation", pd.DataFrame(), {"extracted": extracted, "status": status, "file": uploaded_file}
+    return "Unsupported / unreadable", "failed: unsupported file type", pd.DataFrame(), {}
+
+
 def history_like_from_scanner_export(frame: pd.DataFrame) -> pd.DataFrame:
     """Convert uploaded scanner CSV/PDF rows to history-like lower-case fields."""
     if frame.empty:
@@ -8405,17 +8433,149 @@ def render_my_positions() -> None:
 
     history = load_trade_signal_history()
     current_fallback = combined_session_results()
-    st.markdown("**Original Scanner Export**")
-    export_file = st.file_uploader("Upload original scanner export CSV or PDF", type=["csv", "pdf"], key="positions_scanner_export")
-    uploaded_export = history_like_from_scanner_export(parse_uploaded_scanner_export(export_file)) if export_file is not None else pd.DataFrame()
-    if export_file is not None:
-        if uploaded_export.empty:
-            st.warning("Uploaded scanner export could not be parsed. CSV export works best; PDF parsing is best-effort.")
-        else:
-            st.success(f"Loaded {len(uploaded_export)} uploaded scanner export rows.")
+    uploaded_files = st.file_uploader(
+        "Upload scanner export, positions CSV, or Futu screenshots",
+        type=["csv", "pdf", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="my_positions_unified_uploader",
+    )
+    scanner_export_frames: List[pd.DataFrame] = []
+    position_csv_frames: List[Tuple[str, pd.DataFrame]] = []
+    screenshot_items: List[dict] = []
+    upload_summary = []
+    for uploaded_file in uploaded_files or []:
+        detected_type, status, frame, payload = detect_uploaded_file_type(uploaded_file)
+        upload_summary.append({"filename": uploaded_file.name, "detected type": detected_type, "status": status})
+        if detected_type.startswith("Scanner Export") and not frame.empty:
+            scanner_export_frames.append(history_like_from_scanner_export(frame))
+        elif detected_type == "Position CSV" and not frame.empty:
+            position_csv_frames.append((uploaded_file.name, normalize_positions_frame(frame)))
+        elif detected_type == "Futu Screenshot":
+            payload["filename"] = uploaded_file.name
+            screenshot_items.append(payload)
 
-    input_tabs = st.tabs(["Manual Input", "Upload Positions CSV", "Futu Screenshot"])
-    with input_tabs[0]:
+    uploaded_export = pd.concat(scanner_export_frames, ignore_index=True) if scanner_export_frames else pd.DataFrame()
+    if upload_summary:
+        summary_frame = pd.DataFrame(upload_summary)
+        counts = summary_frame["detected type"].value_counts()
+        st.write(
+            f"Uploaded files: Scanner exports: {int(counts.get('Scanner Export CSV', 0) + counts.get('Scanner Export PDF', 0))} | "
+            f"Position CSV files: {int(counts.get('Position CSV', 0))} | "
+            f"Futu screenshots: {int(counts.get('Futu Screenshot', 0))} | "
+            f"Unsupported / unreadable: {int(counts.get('Unsupported / unreadable', 0))}"
+        )
+        st.dataframe(summary_frame, width="stretch", hide_index=True)
+    if not uploaded_export.empty:
+        st.success(f"Loaded {len(uploaded_export)} uploaded scanner export rows.")
+
+    if position_csv_frames:
+        with st.expander("Position CSV Imports", expanded=True):
+            for filename, frame in position_csv_frames:
+                st.markdown(f"**{filename}**")
+                if frame.empty:
+                    st.warning("Required columns: ticker, entry_date, entry_price, position_size.")
+                else:
+                    st.dataframe(frame.head(20), width="stretch", hide_index=True)
+            if st.button("Import Position CSV Files", type="primary"):
+                records = []
+                skipped = 0
+                existing = st.session_state["positions_df"]
+                for _, frame in position_csv_frames:
+                    for _, uploaded_position in frame.iterrows():
+                        if position_duplicate_exists(existing, uploaded_position["ticker"], uploaded_position["entry_date"], uploaded_position["entry_price"]):
+                            skipped += 1
+                            continue
+                        records.append(
+                            build_position_record(
+                                ticker=uploaded_position["ticker"],
+                                entry_date=uploaded_position["entry_date"],
+                                entry_price=uploaded_position["entry_price"],
+                                position_size=uploaded_position["position_size"],
+                                fees=uploaded_position.get("fees", 0),
+                                broker=uploaded_position.get("broker", ""),
+                                account=uploaded_position.get("account", ""),
+                                notes=uploaded_position.get("notes", ""),
+                                stop_override=uploaded_position.get("current_stop_loss_override", np.nan),
+                                tp_override=uploaded_position.get("manual_tp_override", np.nan),
+                                history=history,
+                                uploaded_export=uploaded_export,
+                                current_fallback=current_fallback,
+                            )
+                        )
+                if records:
+                    st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame(records)], ignore_index=True)
+                    save_positions_file(st.session_state["positions_df"])
+                st.success(f"Added {len(records)} positions. Skipped {skipped} duplicates.")
+
+    if screenshot_items:
+        st.markdown("**Futu Screenshot Confirmations**")
+        confirmed_records = []
+        for index, item in enumerate(screenshot_items):
+            filename = item.get("filename", f"screenshot_{index}")
+            extracted = item.get("extracted", {})
+            status = item.get("status", "Screenshot uploaded. Please confirm details manually.")
+            with st.expander(filename, expanded=index == 0):
+                st.image(item.get("file"), caption=filename)
+                st.info(status)
+                cols = st.columns(5)
+                default_date = pd.to_datetime(extracted.get("trade_date"), errors="coerce")
+                key_base = f"screenshot_{index}_{filename}"
+                s_ticker = cols[0].text_input("Ticker", value=str(extracted.get("ticker", "")), key=f"{key_base}_ticker")
+                s_date = cols[1].date_input("Entry Date", value=default_date.date() if pd.notna(default_date) else datetime.now().date(), key=f"{key_base}_date")
+                s_entry = cols[2].number_input("Entry Price", min_value=0.0, value=float(extracted.get("price")) if pd.notna(extracted.get("price")) else 0.0, step=0.01, key=f"{key_base}_entry")
+                s_size = cols[3].number_input("Position Size", min_value=0.0, value=float(extracted.get("quantity")) if pd.notna(extracted.get("quantity")) else 0.0, step=1.0, key=f"{key_base}_size")
+                s_fee = cols[4].number_input("Fees", min_value=0.0, value=float(extracted.get("fees")) if pd.notna(extracted.get("fees")) else 0.0, step=0.01, key=f"{key_base}_fee")
+                s_notes = st.text_area("Notes", value=f"From Futu screenshot; manually confirmed. Direction: {extracted.get('direction', '')}; time: {extracted.get('trade_time', '')}", key=f"{key_base}_notes")
+                if s_ticker and s_entry > 0 and s_size > 0:
+                    confirmed_records.append((s_ticker, s_date.strftime("%Y-%m-%d"), s_entry, s_size, s_fee, s_notes))
+                if st.button("Save This Position", key=f"{key_base}_save"):
+                    existing = st.session_state["positions_df"]
+                    if not s_ticker or s_entry <= 0 or s_size <= 0:
+                        st.warning("Please confirm ticker, entry price, and position size before saving.")
+                    elif position_duplicate_exists(existing, s_ticker, s_date.strftime("%Y-%m-%d"), s_entry):
+                        st.warning("Duplicate position detected by ticker + entry date + entry price.")
+                    else:
+                        record = build_position_record(
+                            ticker=s_ticker,
+                            entry_date=s_date.strftime("%Y-%m-%d"),
+                            entry_price=s_entry,
+                            position_size=s_size,
+                            fees=s_fee,
+                            notes=s_notes,
+                            history=history,
+                            uploaded_export=uploaded_export,
+                            current_fallback=current_fallback,
+                        )
+                        st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame([record])], ignore_index=True)
+                        save_positions_file(st.session_state["positions_df"])
+                        st.success("Position saved to positions.csv.")
+        if st.button("Save All Confirmed Positions", type="primary"):
+            existing = st.session_state["positions_df"]
+            records = []
+            skipped = 0
+            for s_ticker, s_date, s_entry, s_size, s_fee, s_notes in confirmed_records:
+                if position_duplicate_exists(existing, s_ticker, s_date, s_entry):
+                    skipped += 1
+                    continue
+                records.append(
+                    build_position_record(
+                        ticker=s_ticker,
+                        entry_date=s_date,
+                        entry_price=s_entry,
+                        position_size=s_size,
+                        fees=s_fee,
+                        notes=s_notes,
+                        history=history,
+                        uploaded_export=uploaded_export,
+                        current_fallback=current_fallback,
+                    )
+                )
+            if records:
+                st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame(records)], ignore_index=True)
+                save_positions_file(st.session_state["positions_df"])
+            st.success(f"Saved {len(records)} confirmed screenshot positions. Skipped {skipped} duplicates.")
+
+    with st.expander("Manual Input", expanded=not bool(uploaded_files)):
         with st.form("manual_position_form", clear_on_submit=False):
             cols = st.columns(4)
             ticker = cols[0].text_input("Ticker")
@@ -8429,35 +8589,18 @@ def render_my_positions() -> None:
             stop_override = opt_cols[3].number_input("Current Stop Loss Override", min_value=0.0, step=0.01)
             tp_override = opt_cols[4].number_input("Manual TP Override", min_value=0.0, step=0.01)
             notes = st.text_area("Notes")
-            submitted = st.form_submit_button("Add Position", type="primary")
+            submitted = st.form_submit_button("Save Position", type="primary")
         if submitted and ticker and entry_price > 0 and position_size > 0:
-            new_position = pd.DataFrame(
-                [
-                    {
-                        "ticker": ticker.upper().strip(),
-                        "entry_date": entry_date.strftime("%Y-%m-%d"),
-                        "entry_price": entry_price,
-                        "position_size": position_size,
-                        "notes": notes,
-                        "broker": broker,
-                        "account": account,
-                        "fees": fees,
-                        "current_stop_loss_override": stop_override if stop_override > 0 else np.nan,
-                        "manual_tp_override": tp_override if tp_override > 0 else np.nan,
-                    }
-                ]
-            )
-            new_position = normalize_positions_frame(new_position).iloc[0]
-            positions_existing = st.session_state["positions_df"]
-            if position_duplicate_exists(positions_existing, new_position["ticker"], new_position["entry_date"], new_position["entry_price"]):
+            existing = st.session_state["positions_df"]
+            if position_duplicate_exists(existing, ticker, entry_date.strftime("%Y-%m-%d"), entry_price):
                 st.warning("Duplicate position detected by ticker + entry date + entry price. Edit the existing position or change the entry details.")
             else:
                 record = build_position_record(
-                    ticker=new_position["ticker"],
-                    entry_date=new_position["entry_date"],
-                    entry_price=new_position["entry_price"],
-                    position_size=new_position["position_size"],
-                    fees=new_position.get("fees", 0),
+                    ticker=ticker,
+                    entry_date=entry_date.strftime("%Y-%m-%d"),
+                    entry_price=entry_price,
+                    position_size=position_size,
+                    fees=fees,
                     broker=broker,
                     account=account,
                     notes=notes,
@@ -8467,84 +8610,9 @@ def render_my_positions() -> None:
                     uploaded_export=uploaded_export,
                     current_fallback=current_fallback,
                 )
-                st.session_state["positions_df"] = pd.concat([positions_existing, pd.DataFrame([record])], ignore_index=True)
+                st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame([record])], ignore_index=True)
                 save_positions_file(st.session_state["positions_df"])
                 st.success("Position saved to positions.csv.")
-
-    with input_tabs[1]:
-        st.markdown("**Position CSV**")
-        positions_upload = st.file_uploader("Upload manual positions CSV", type=["csv"], key="positions_csv")
-        st.caption("Accepted columns: ticker, entry_date, entry_price, position_size, notes")
-        if positions_upload is not None:
-            uploaded_positions = normalize_positions_frame(pd.read_csv(positions_upload))
-            if uploaded_positions.empty:
-                st.warning("No valid positions found in CSV.")
-            elif st.button("Add Uploaded Positions", type="primary"):
-                records = []
-                skipped = 0
-                existing = st.session_state["positions_df"]
-                for _, uploaded_position in uploaded_positions.iterrows():
-                    if position_duplicate_exists(existing, uploaded_position["ticker"], uploaded_position["entry_date"], uploaded_position["entry_price"]):
-                        skipped += 1
-                        continue
-                    records.append(
-                        build_position_record(
-                            ticker=uploaded_position["ticker"],
-                            entry_date=uploaded_position["entry_date"],
-                            entry_price=uploaded_position["entry_price"],
-                            position_size=uploaded_position["position_size"],
-                            fees=uploaded_position.get("fees", 0),
-                            broker=uploaded_position.get("broker", ""),
-                            account=uploaded_position.get("account", ""),
-                            notes=uploaded_position.get("notes", ""),
-                            stop_override=uploaded_position.get("current_stop_loss_override", np.nan),
-                            tp_override=uploaded_position.get("manual_tp_override", np.nan),
-                            history=history,
-                            uploaded_export=uploaded_export,
-                            current_fallback=current_fallback,
-                        )
-                    )
-                if records:
-                    st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame(records)], ignore_index=True)
-                    save_positions_file(st.session_state["positions_df"])
-                st.success(f"Added {len(records)} positions. Skipped {skipped} duplicates.")
-
-    with input_tabs[2]:
-        st.markdown("**Broker / Futu Position or Trade Screenshot**")
-        screenshot = st.file_uploader("Upload Futu screenshot", type=["png", "jpg", "jpeg", "webp"], key="futu_screenshot")
-        if screenshot is not None:
-            st.image(screenshot, caption="Uploaded Futu screenshot")
-            extracted, ocr_status = extract_futu_screenshot_details(screenshot)
-            st.info(ocr_status)
-            with st.form("screenshot_confirm_form"):
-                cols = st.columns(4)
-                s_ticker = cols[0].text_input("Ticker", value=str(extracted.get("ticker", "")))
-                default_date = pd.to_datetime(extracted.get("trade_date"), errors="coerce")
-                s_date = cols[1].date_input("Entry Date", value=default_date.date() if pd.notna(default_date) else datetime.now().date())
-                s_entry = cols[2].number_input("Entry Price", min_value=0.0, value=float(extracted.get("price")) if pd.notna(extracted.get("price")) else 0.0, step=0.01)
-                s_size = cols[3].number_input("Position Size", min_value=0.0, value=float(extracted.get("quantity")) if pd.notna(extracted.get("quantity")) else 0.0, step=1.0)
-                s_fee = st.number_input("Fees", min_value=0.0, value=float(extracted.get("fees")) if pd.notna(extracted.get("fees")) else 0.0, step=0.01)
-                s_notes = st.text_area("Notes", value=f"From Futu screenshot; manually confirmed. Direction: {extracted.get('direction', '')}; time: {extracted.get('trade_time', '')}")
-                add_screenshot_position = st.form_submit_button("Save Position")
-            if add_screenshot_position and s_ticker and s_entry > 0 and s_size > 0:
-                existing = st.session_state["positions_df"]
-                if position_duplicate_exists(existing, s_ticker, s_date.strftime("%Y-%m-%d"), s_entry):
-                    st.warning("Duplicate position detected by ticker + entry date + entry price. Edit the existing position or change the entry details.")
-                else:
-                    record = build_position_record(
-                        ticker=s_ticker,
-                        entry_date=s_date.strftime("%Y-%m-%d"),
-                        entry_price=s_entry,
-                        position_size=s_size,
-                        fees=s_fee,
-                        notes=s_notes,
-                        history=history,
-                        uploaded_export=uploaded_export,
-                        current_fallback=current_fallback,
-                    )
-                    st.session_state["positions_df"] = pd.concat([existing, pd.DataFrame([record])], ignore_index=True)
-                    save_positions_file(st.session_state["positions_df"])
-                    st.success("Position saved to positions.csv.")
 
     positions = normalize_positions_frame(st.session_state.get("positions_df", pd.DataFrame()))
     if positions.empty:
