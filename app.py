@@ -8124,6 +8124,13 @@ def make_position_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.F
     figure = go.Figure()
     if chart_data.empty:
         return figure
+    chart_data = chart_data.copy()
+    chart_data.index = pd.to_datetime(chart_data.index, errors="coerce")
+    chart_data = chart_data[chart_data.index.notna()]
+    if chart_data.empty:
+        return figure
+    if getattr(chart_data.index, "tz", None) is not None:
+        chart_data.index = chart_data.index.tz_localize(None)
     figure.add_trace(
         go.Candlestick(
             x=chart_data.index,
@@ -8154,8 +8161,10 @@ def make_position_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.F
         if pd.notna(numeric):
             figure.add_hline(y=float(numeric), line_dash="dash", line_color=color, annotation_text=label)
     entry_dt = pd.to_datetime(row.get("entry date"), errors="coerce")
-    if pd.notna(entry_dt) and chart_data.index.min() <= entry_dt <= chart_data.index.max():
-        figure.add_vline(x=entry_dt, line_dash="dot", line_color="#7c3aed", annotation_text="Entry")
+    if pd.notna(entry_dt):
+        entry_dt = entry_dt.tz_localize(None) if getattr(entry_dt, "tzinfo", None) else entry_dt
+        if chart_data.index.min() <= entry_dt <= chart_data.index.max():
+            figure.add_vline(x=entry_dt, line_dash="dot", line_color="#7c3aed", annotation_text="Entry")
     figure.update_layout(
         title=f"{ticker} existing position management",
         height=600,
@@ -8334,8 +8343,15 @@ def render_my_positions() -> None:
     selected_ticker = st.selectbox("Chart holding", managed["ticker"].tolist(), key="position_chart_ticker")
     selected = managed[managed["ticker"] == selected_ticker].iloc[0]
     selected_data = selected.get("_data")
-    if isinstance(selected_data, pd.DataFrame) and not selected_data.empty:
-        st.plotly_chart(make_position_chart(selected_ticker, selected_data, selected), width="stretch")
+    if not isinstance(selected_data, pd.DataFrame) or selected_data.empty:
+        st.warning("No chart data available for this position.")
+    else:
+        if pd.isna(pd.to_datetime(selected.get("entry date"), errors="coerce")):
+            st.warning("Entry date is invalid or unavailable. Chart displayed without entry marker.")
+        try:
+            st.plotly_chart(make_position_chart(selected_ticker, selected_data, selected), width="stretch")
+        except Exception:
+            st.warning("Position chart could not be displayed. Please check entry date and ticker data.")
     st.caption("New Entry Signal and Existing Position Management are separate: an extended stock can be no-chase for new buyers while still being HOLD / TRAIL STOP for existing holders.")
 
 
