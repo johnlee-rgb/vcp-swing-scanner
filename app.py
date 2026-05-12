@@ -3782,6 +3782,94 @@ def executable_score_and_grade(
     return score, grade, reason
 
 
+def calibrate_executable_grade(
+    *,
+    executable_grade: str,
+    executable_score: float,
+    executable_reason: str,
+    signal_state: str,
+    trade: str,
+    watchlist_flag: str,
+    risk_pct: float,
+    entry_timing: str,
+    leader_label: str,
+    character_change_flag: str,
+    hard_reject: bool,
+    setup_type: str,
+    breakout_alert: str,
+    rs_score: float,
+    sector_leadership_status: str,
+) -> Tuple[str, str]:
+    """Keep executable grade aligned with the final displayed signal state."""
+    grade = executable_grade
+    reason = executable_reason
+    risk_ok = pd.notna(risk_pct) and risk_pct <= 10
+    clean_timing = entry_timing in {"IDEAL ENTRY ZONE", "NEAR PIVOT", "BREAKOUT CONFIRMED"}
+    clean_ma10_trigger = entry_timing == "MA10 PULLBACK" and breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
+    buy_now_ok = signal_state == "BUY NOW" and trade == "YES"
+    breakout_ok = signal_state == "BUY ON BREAKOUT" and watchlist_flag == "YES"
+    laggard = leader_label == "LAGGARD / AVOID"
+    weak_laggard = laggard and (
+        (pd.notna(rs_score) and rs_score < 7)
+        or sector_leadership_status in {"LAGGING SECTOR", "CYCLICAL RISK"}
+        or character_change_flag == "CHARACTER CHANGE"
+    )
+
+    a_allowed = (
+        (buy_now_ok or breakout_ok)
+        and risk_ok
+        and (clean_timing or clean_ma10_trigger)
+        and not laggard
+        and character_change_flag != "CHARACTER CHANGE"
+        and not hard_reject
+    )
+
+    if signal_state == "REJECT" or hard_reject or character_change_flag == "CHARACTER CHANGE":
+        grade = "C - AVOID"
+        reason = "C - AVOID: hard reject, failed setup, or character change."
+    elif weak_laggard:
+        grade = "C - AVOID"
+        reason = "C - AVOID: laggard profile with weak RS, poor sector, or damaged structure."
+    elif signal_state == "WATCH":
+        grade = "B - WATCHLIST"
+        if setup_type == "HEALTHY PULLBACK WATCH" and leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}:
+            reason = "B - WATCHLIST: healthy MA10 pullback in leading stock; wait for trigger or breakout confirmation."
+        else:
+            reason = "B - WATCHLIST: good stock, but wait for trigger or confirmation."
+    elif signal_state == "WAIT PULLBACK":
+        if (pd.notna(risk_pct) and risk_pct > 25) or entry_timing in {"TOO LATE", "FAILED SETUP"}:
+            grade = "C - AVOID"
+            reason = "C - AVOID: entry is too late or risk is too wide."
+        else:
+            grade = "B - WATCHLIST"
+            reason = "B - WATCHLIST: quality may be present, but wait for pullback or tighter risk."
+    elif signal_state == "EXTENDED DO NOT CHASE":
+        grade = "B - WATCHLIST" if not laggard and not (pd.notna(risk_pct) and risk_pct > 25) else "C - AVOID"
+        reason = (
+            "B - WATCHLIST: high quality stock but entry is extended; wait for MA10 pullback."
+            if grade == "B - WATCHLIST"
+            else "C - AVOID: extended laggard or risk too wide."
+        )
+    elif grade == "A - EXECUTABLE NOW" and not a_allowed:
+        grade = "B - WATCHLIST" if not weak_laggard else "C - AVOID"
+        reason = (
+            "B - WATCHLIST: good setup, but not actionable today without a BUY NOW or near-trigger breakout state."
+            if grade == "B - WATCHLIST"
+            else "C - AVOID: laggard profile is not executable."
+        )
+    elif laggard and grade == "A - EXECUTABLE NOW":
+        grade = "B - WATCHLIST"
+        reason = "B - WATCHLIST: structure may be acceptable, but laggard quality prevents executable A grade."
+
+    if grade == "A - EXECUTABLE NOW":
+        reason = "A - EXECUTABLE NOW: clean actionable setup, signal aligned, risk controlled."
+    elif grade == "B - WATCHLIST" and not reason.startswith("B - WATCHLIST:"):
+        reason = f"B - WATCHLIST: {reason.split(':', 1)[-1].strip()}"
+    elif grade == "C - AVOID" and not reason.startswith("C - AVOID:"):
+        reason = f"C - AVOID: {reason.split(':', 1)[-1].strip()}"
+    return grade, reason
+
+
 
 def calculate_entry_quality_score(
     *,
@@ -4618,6 +4706,26 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             days_to_earnings=row.get("Days to Earnings"),
             trade_tier=trade_tier,
         )
+        executable_score = numeric_or_na(row.get("Executable Score"))
+        if pd.isna(executable_score):
+            executable_score = 0
+        executable_grade, decision_reason = calibrate_executable_grade(
+            executable_grade=str(row.get("Executable Grade", "C - AVOID")),
+            executable_score=executable_score,
+            executable_reason=str(row.get("Decision Reason", decision_reason)),
+            signal_state=signal_state,
+            trade=trade,
+            watchlist_flag=watchlist_flag,
+            risk_pct=risk_pct,
+            entry_timing=str(row.get("Entry Timing Label", "")),
+            leader_label=leader_label_value,
+            character_change_flag=str(row.get("Character Change Flag", "NONE")),
+            hard_reject=hard_reject,
+            setup_type=setup_type,
+            breakout_alert=str(row.get("Breakout Alert", "")),
+            rs_score=rs_score,
+            sector_leadership_status=str(row.get("Sector Leadership Status", "")),
+        )
 
         entry = numeric_or_na(row.get("Entry Trigger"))
         stop = numeric_or_na(row.get("Stop Loss"))
@@ -4669,6 +4777,8 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "Decision Reason"] = decision_reason
         fixed.at[idx, "Trade Reason"] = decision_reason
         fixed.at[idx, "Watchlist Reason"] = "Already Trade YES" if trade == "YES" else decision_reason
+        fixed.at[idx, "Executable Grade"] = executable_grade
+        fixed.at[idx, "Executable Score"] = round(float(executable_score), 1)
         fixed.at[idx, "Professional Score"] = round(float(professional_score), 1)
         fixed.at[idx, "Entry Quality Score"] = int(entry_quality)
         fixed.at[idx, "Trade Tier"] = trade_tier
@@ -5635,11 +5745,28 @@ def build_scan_row(
         latest=latest,
         leader_label=leader_label,
     )
+    executable_grade, executable_reason = calibrate_executable_grade(
+        executable_grade=executable_grade,
+        executable_score=executable_score,
+        executable_reason=executable_reason,
+        signal_state=signal_state,
+        trade=trade,
+        watchlist_flag=watchlist_flag,
+        risk_pct=risk_pct,
+        entry_timing=entry_timing,
+        leader_label=leader_label,
+        character_change_flag=character_change_flag,
+        hard_reject=hard_reject,
+        setup_type=setup_type,
+        breakout_alert=breakout_alert,
+        rs_score=rs_score,
+        sector_leadership_status=sector_leadership_status,
+    )
     if executable_grade == "C - AVOID" and character_change_flag == "CHARACTER CHANGE":
         trade = "NO"
         watchlist_flag = "NO"
         sell_strategy = "AVOID / NO TRADE"
-    decision_reason = reason_with_signal_prefix(signal_state, f"{executable_reason} Entry timing: {entry_timing}. Stock quality: {leader_label}, theme {theme_weight}/10.")
+    decision_reason = f"{executable_reason} Entry timing: {entry_timing}. Stock quality: {leader_label}, theme {theme_weight}/10."
     action_readiness = action_readiness_label(
         trade_tier=trade_tier,
         signal_state=signal_state,
