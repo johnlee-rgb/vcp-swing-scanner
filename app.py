@@ -641,6 +641,21 @@ for universe_name, universe_tickers in PRESET_UNIVERSES.items():
             MANUAL_SECTOR_MAP.setdefault(symbol, fallback_sector)
 for symbol in MARKET_LEADERS_BASE:
     MANUAL_SECTOR_MAP.setdefault(symbol, ("Technology", "Market leader"))
+COMMON_SECTOR_OVERRIDES = {
+    "NVDA": ("Technology", "Semiconductors"),
+    "AMD": ("Technology", "Semiconductors"),
+    "AVGO": ("Technology", "Semiconductors"),
+    "TSM": ("Technology", "Semiconductors"),
+    "ASML": ("Technology", "Semiconductor Equipment"),
+    "LRCX": ("Technology", "Semiconductor Equipment"),
+    "MU": ("Technology", "Memory Semiconductors"),
+    "DELL": ("Technology", "Computer Hardware / AI Infrastructure"),
+    "VRT": ("Industrials", "Electrical Equipment / Data Center Infrastructure"),
+    "MS": ("Financial Services", "Capital Markets"),
+    "WELL": ("Real Estate", "Healthcare REIT"),
+}
+for symbol, metadata in COMMON_SECTOR_OVERRIDES.items():
+    MANUAL_SECTOR_MAP.setdefault(symbol, metadata)
 
 MARKET_TICKERS = [
     "SPY",
@@ -2916,6 +2931,8 @@ def classify_stage_label(
         return "CLIMAX / PARABOLIC"
     if pd.notna(recent_move) and recent_move > 20 and volatility_expanding:
         return "CLIMAX / PARABOLIC"
+    if (pd.notna(ma20_distance) and ma20_distance > 18) or (pd.notna(ma10_distance) and ma10_distance > 12):
+        return "LATE STAGE 2"
     if pd.notna(ma20_distance) and ma20_distance > 15:
         return "LATE STAGE 2"
     major_uptrend = (
@@ -2939,6 +2956,75 @@ def stage_score_adjustment(stage_label: str) -> int:
 def timing_score_cap(entry_timing: str) -> int:
     """Return the maximum final score allowed by entry timing."""
     return TIMING_SCORE_CAPS.get(entry_timing, 100)
+
+
+def strip_executable_prefix(text: str) -> str:
+    """Remove executable-grade wording before applying the signal-state prefix."""
+    cleaned = str(text or "").strip()
+    for prefix in ("A - EXECUTABLE NOW:", "B - WATCHLIST:", "C - AVOID:"):
+        if cleaned.startswith(prefix):
+            return cleaned[len(prefix):].strip()
+    return cleaned
+
+
+def calculate_quality_score(
+    *,
+    institutional_quality_score: int,
+    rs_score: float,
+    trend_score: int,
+    sector_score: int,
+    theme_weight: int,
+    leader_label: str,
+) -> float:
+    """Raw stock quality score: leadership, RS, trend, sector, sponsorship."""
+    rs_component = min(max(float(rs_score), 0), 10) if pd.notna(rs_score) else 0
+    trend_component = min(max(float(trend_score) * 1.25, 0), 10)
+    sector_component = min(max(float(sector_score) * 2, 0), 10)
+    theme_component = min(max(float(theme_weight), 0), 10)
+    leadership_bonus = 6 if leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"} else 3 if leader_label == "MOMENTUM LEADER" else 0
+    score = (
+        institutional_quality_score * 10 * 0.35
+        + rs_component * 10 * 0.25
+        + trend_component * 10 * 0.20
+        + sector_component * 10 * 0.10
+        + theme_component * 10 * 0.10
+        + leadership_bonus
+    )
+    return round(min(max(score, 0), 100), 1)
+
+
+def calculate_execution_score(
+    *,
+    entry_quality_score: int,
+    tradeability_score: int,
+    vcp_tightness_score: int,
+    ma10_efficiency_score: int,
+    risk_pct: float,
+    ma10_distance: float,
+    ma20_distance: float,
+    character_change_flag: str,
+) -> float:
+    """Execution score: timing, stop distance, tightness, and extension risk."""
+    score = (
+        entry_quality_score * 10 * 0.35
+        + tradeability_score * 10 * 0.25
+        + vcp_tightness_score * 10 * 0.20
+        + ma10_efficiency_score * 10 * 0.20
+    )
+    if pd.notna(risk_pct):
+        if risk_pct > 15:
+            score = min(score, 60)
+        elif risk_pct > 12:
+            score = min(score, 72)
+        elif risk_pct > 10:
+            score = min(score, 82)
+    if pd.notna(ma10_distance) and ma10_distance > 12:
+        score = min(score, 65)
+    if pd.notna(ma20_distance) and ma20_distance > 18:
+        score = min(score, 60)
+    if character_change_flag == "CHARACTER CHANGE":
+        score = min(score, 35)
+    return round(min(max(score, 0), 100), 1)
 
 
 def classify_pullback_quality(
@@ -4013,7 +4099,6 @@ def calibrate_executable_grade(
     clean_timing = entry_timing in {"IDEAL ENTRY ZONE", "NEAR PIVOT", "BREAKOUT CONFIRMED"}
     clean_ma10_trigger = entry_timing == "MA10 PULLBACK" and breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
     buy_now_ok = signal_state == "BUY NOW" and trade == "YES"
-    breakout_ok = signal_state == "BUY ON BREAKOUT" and watchlist_flag == "YES"
     laggard = leader_label == "LAGGARD / AVOID"
     weak_laggard = laggard and (
         (pd.notna(rs_score) and rs_score < 7)
@@ -4022,7 +4107,7 @@ def calibrate_executable_grade(
     )
 
     a_allowed = (
-        (buy_now_ok or breakout_ok)
+        buy_now_ok
         and risk_ok
         and (clean_timing or clean_ma10_trigger)
         and not laggard
@@ -4033,12 +4118,14 @@ def calibrate_executable_grade(
     if signal_state == "REJECT" or hard_reject or character_change_flag == "CHARACTER CHANGE":
         grade = "C - AVOID"
         reason = "C - AVOID: hard reject, failed setup, or character change."
-    elif weak_laggard:
+    elif weak_laggard and signal_state == "REJECT":
         grade = "C - AVOID"
         reason = "C - AVOID: laggard profile with weak RS, poor sector, or damaged structure."
-    elif signal_state == "WATCH":
+    elif signal_state in {"BUY ON BREAKOUT", "WATCH"}:
         grade = "B - WATCHLIST"
-        if setup_type == "HEALTHY PULLBACK WATCH" and leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}:
+        if signal_state == "BUY ON BREAKOUT":
+            reason = "B - WATCHLIST: near breakout trigger, but wait for confirmation before execution."
+        elif setup_type == "HEALTHY PULLBACK WATCH" and leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}:
             reason = "B - WATCHLIST: healthy MA10 pullback in leading stock; wait for trigger or breakout confirmation."
         else:
             reason = "B - WATCHLIST: good stock, but wait for trigger or confirmation."
@@ -4057,11 +4144,11 @@ def calibrate_executable_grade(
             else "C - AVOID: extended laggard or risk too wide."
         )
     elif grade == "A - EXECUTABLE NOW" and not a_allowed:
-        grade = "B - WATCHLIST" if not weak_laggard else "C - AVOID"
+        grade = "B - WATCHLIST"
         reason = (
-            "B - WATCHLIST: good setup, but not actionable today without a BUY NOW or near-trigger breakout state."
+            "B - WATCHLIST: good setup, but not actionable today without a BUY NOW state."
             if grade == "B - WATCHLIST"
-            else "C - AVOID: laggard profile is not executable."
+            else "B - WATCHLIST: laggard profile is not executable today."
         )
     elif laggard and grade == "A - EXECUTABLE NOW":
         grade = "B - WATCHLIST"
@@ -4840,6 +4927,22 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             or setup_type in PROTECTED_SETUP_TYPES
             or str(row.get("VCP Status", "")) in {"VALID VCP", "EARLY VCP"}
         )
+        adjusted_score_value = numeric_or_na(row.get("Adjusted Final Score"))
+        protected_high_quality_leader = (
+            leader_label_value in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}
+            and pd.notna(rs_score)
+            and rs_score >= 8
+            and pd.notna(adjusted_score_value)
+            and adjusted_score_value >= 80
+            and not hard_reject
+        )
+        if signal_state == "REJECT" and protected_high_quality_leader:
+            if entry_timing_value in {"EXTENDED - WAIT", "TOO LATE"} or stage_label_value in {"LATE STAGE 2", "CLIMAX / PARABOLIC"}:
+                signal_state = "WAIT PULLBACK"
+                decision_reason = "WAIT PULLBACK: high-quality leader, but entry is extended; wait for MA10/MA20 reset or tight base."
+            else:
+                signal_state = "WATCH"
+                decision_reason = "WATCH: good high-quality leader, but no clean trigger yet."
         if signal_state == "REJECT" and protected and not hard_reject:
             if pd.notna(risk_pct) and risk_pct > 12:
                 signal_state = "WAIT PULLBACK"
@@ -4961,6 +5064,18 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             executable_grade = "C - AVOID"
             executable_score = min(float(executable_score), 45)
             decision_reason = "C - AVOID: Character change detected: wait for structure to rebuild."
+        reason_detail = strip_executable_prefix(decision_reason)
+        if executable_grade == "C - AVOID" and signal_state != "REJECT":
+            executable_grade = "B - WATCHLIST"
+            if signal_state == "WATCH":
+                reason_detail = "good setup or leader context, but no clean trigger yet."
+            elif signal_state == "WAIT PULLBACK":
+                reason_detail = "quality may be present, but wait for pullback or tighter risk."
+            else:
+                reason_detail = "wait for confirmation before execution."
+        if signal_state == "BUY ON BREAKOUT" and trade != "YES":
+            reason_detail = "near breakout trigger; wait for confirmation before execution."
+        decision_reason = reason_with_signal_prefix(signal_state, reason_detail)
 
         entry = numeric_or_na(row.get("Entry Trigger"))
         stop = numeric_or_na(row.get("Stop Loss"))
@@ -5016,6 +5131,18 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "Executable Score"] = round(float(executable_score), 1)
         fixed.at[idx, "Professional Score"] = round(float(professional_score), 1)
         fixed.at[idx, "Entry Quality Score"] = int(entry_quality)
+        if "Quality Score" not in fixed.columns or pd.isna(numeric_or_na(row.get("Quality Score"))):
+            quality_fallback = max(
+                numeric_or_na(row.get("Institutional Quality Score", 0)) * 10 if pd.notna(numeric_or_na(row.get("Institutional Quality Score", 0))) else 0,
+                numeric_or_na(row.get("Adjusted Final Score", 0)) if pd.notna(numeric_or_na(row.get("Adjusted Final Score", 0))) else 0,
+            )
+            fixed.at[idx, "Quality Score"] = round(float(min(max(quality_fallback, 0), 100)), 1)
+        if "Execution Score" not in fixed.columns or pd.isna(numeric_or_na(row.get("Execution Score"))):
+            execution_fallback = (
+                int(entry_quality) * 6
+                + (numeric_or_na(row.get("Tradeability Score", 0)) if pd.notna(numeric_or_na(row.get("Tradeability Score", 0))) else 0) * 4
+            )
+            fixed.at[idx, "Execution Score"] = round(float(min(max(execution_fallback, 0), 100)), 1)
         fixed.at[idx, "Trade Tier"] = trade_tier
         fixed.at[idx, "Action Readiness Label"] = action_readiness_label(
             trade_tier=trade_tier,
@@ -5993,6 +6120,13 @@ def build_scan_row(
     )
 
     high_quality_leader = leader_label in {"INSTITUTIONAL LEADER", "MOMENTUM LEADER", "SECTOR LEADER"}
+    protected_high_quality_leader = (
+        leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER"}
+        and score_at_least(rs_score, 8)
+        and pd.notna(adjusted_score)
+        and adjusted_score >= 80
+        and not hard_reject
+    )
     extended_timing = entry_timing in {"EXTENDED - WAIT", "TOO LATE"} or stage_maturity_label in {"LATE STAGE 2", "CLIMAX / PARABOLIC"}
     if character_change_flag == "CHARACTER CHANGE":
         signal_state = "REJECT" if hard_reject or current_setup_status in {"FAILED", "FAILED BREAKOUT"} else "WAIT PULLBACK"
@@ -6011,6 +6145,15 @@ def build_scan_row(
         trade = "NO"
         watchlist_flag = "YES"
         decision_reason = "Tradeability is not clean enough for BUY NOW; wait for tighter risk/reward."
+    elif protected_high_quality_leader and signal_state == "REJECT":
+        signal_state = "WAIT PULLBACK" if extended_timing else "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = (
+            "High-quality leader, but entry is extended. Wait for MA10/MA20 reset or tight base."
+            if extended_timing
+            else "Good high-quality leader, but no clean trigger yet."
+        )
 
     buy_now_allowed = (
         quality_grade in {"A+", "A"}
@@ -6082,6 +6225,24 @@ def build_scan_row(
         trade_tier = "Tier 2 - High Quality, Wait Better Entry"
     if signal_state in {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
         trade_tier = "Tier 2 - High Quality, Wait Better Entry" if high_quality_leader else "Tier 3 - Leadership Watchlist"
+    quality_score = calculate_quality_score(
+        institutional_quality_score=institutional_quality_score,
+        rs_score=rs_score,
+        trend_score=trend_score,
+        sector_score=sector_score,
+        theme_weight=theme_weight,
+        leader_label=leader_label,
+    )
+    execution_score = calculate_execution_score(
+        entry_quality_score=entry_quality_score,
+        tradeability_score=tradeability_score,
+        vcp_tightness_score=vcp_tightness_score,
+        ma10_efficiency_score=ma10_efficiency_score,
+        risk_pct=risk_pct,
+        ma10_distance=ma10_distance,
+        ma20_distance=ma20_distance,
+        character_change_flag=character_change_flag,
+    )
 
     executable_score, executable_grade, executable_reason = executable_score_and_grade(
         entry_quality_score=entry_quality_score,
@@ -6128,7 +6289,19 @@ def build_scan_row(
         sell_strategy = "AVOID / NO TRADE" if signal_state == "REJECT" else "WAIT FOR ENTRY"
     elif high_quality_leader and extended_timing and executable_grade == "B - WATCHLIST":
         executable_reason = "B - WATCHLIST: High-quality leader, but entry is extended. Wait for MA10/MA20 reset or tight base."
-    decision_reason = f"{executable_reason} Entry timing: {entry_timing}. Stage: {stage_maturity_label}. Stock quality: {leader_label}, theme {theme_weight}/10."
+    signal_reason_detail = strip_executable_prefix(executable_reason)
+    if signal_state == "BUY ON BREAKOUT":
+        signal_reason_detail = "near trigger; wait for breakout confirmation before execution."
+    elif signal_state == "WATCH" and signal_reason_detail.lower().startswith(("hard reject", "failed setup", "character change", "entry is too late")):
+        signal_reason_detail = "good setup or leader context, but no clean trigger yet."
+    elif signal_state == "WAIT PULLBACK" and high_quality_leader and extended_timing:
+        signal_reason_detail = "high-quality leader, but entry is extended; wait for MA10/MA20 reset or tight base."
+    elif signal_state == "REJECT" and not hard_reject:
+        signal_reason_detail = "weak setup condition triggered."
+    decision_reason = reason_with_signal_prefix(
+        signal_state,
+        f"{signal_reason_detail} Entry timing: {entry_timing}. Stage: {stage_maturity_label}. Stock quality: {leader_label}, theme {theme_weight}/10.",
+    )
     action_readiness = action_readiness_label(
         trade_tier=trade_tier,
         signal_state=signal_state,
@@ -6213,6 +6386,8 @@ def build_scan_row(
         "Final Score": final_score,
         "Adjusted Final Score": adjusted_score,
         "Professional Score": professional_score,
+        "Quality Score": quality_score,
+        "Execution Score": execution_score,
         "Institutional Quality Score": institutional_quality_score,
         "Theme Weight": theme_weight,
         "Executable Grade": executable_grade,
@@ -6403,6 +6578,8 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Intraday Volume Ratio",
         "Final Score",
         "Professional Score",
+        "Quality Score",
+        "Execution Score",
         "Executable Score",
         "Theme Weight",
         "MA10 Efficiency Score",
@@ -6474,6 +6651,8 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "Breakout Alert",
         "Live Breakout Status",
         "Professional Score",
+        "Quality Score",
+        "Execution Score",
         "Entry Quality Score",
         "Final Score",
         "VCP Tightness Score",
@@ -9818,6 +9997,8 @@ def render_swing_scanner(
         "Final Score",
         "Adjusted Final Score",
         "Professional Score",
+        "Quality Score",
+        "Execution Score",
         "Institutional Quality Score",
         "Theme Weight",
         "Executable Grade",
@@ -10102,6 +10283,12 @@ def render_swing_scanner(
     visible["executable sort"] = visible.get("Executable Grade", pd.Series("", index=visible.index)).map(
         {"A - EXECUTABLE NOW": 0, "B - WATCHLIST": 1, "C - AVOID": 2}
     ).fillna(3)
+    visible["wait quality sort"] = np.where(
+        (visible["Signal State"] == "WAIT PULLBACK")
+        & (visible.get("Leader Quality Label", pd.Series("", index=visible.index)).isin(["INSTITUTIONAL LEADER", "SECTOR LEADER", "MOMENTUM LEADER"])),
+        0,
+        np.where(visible["Signal State"] == "WAIT PULLBACK", 1, 0),
+    )
     visible["execution quality sort"] = (
         pd.to_numeric(visible.get("Entry Quality Score"), errors="coerce").fillna(0)
         + pd.to_numeric(visible.get("Institutional Tightness Score"), errors="coerce").fillna(0)
@@ -10112,6 +10299,9 @@ def render_swing_scanner(
     visible = visible.sort_values(
         [
             "signal sort",
+            "wait quality sort",
+            "Execution Score",
+            "Quality Score",
             "quality sort",
             "stage sort",
             "Final Score",
@@ -10119,7 +10309,7 @@ def render_swing_scanner(
             "Tradeability Score",
             "RS Sort",
         ],
-        ascending=[True, True, True, False, False, False, False],
+        ascending=[True, True, False, False, True, True, False, False, False, False],
     )
 
     compact_columns = [
@@ -10132,6 +10322,8 @@ def render_swing_scanner(
         "Pullback Quality",
         "VCP Tightness Score",
         "Tradeability Score",
+        "Execution Score",
+        "Quality Score",
         "Final Score",
         "RS Score",
         "Risk %",
