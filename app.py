@@ -1906,6 +1906,34 @@ PROTECTED_SETUP_TYPES = {
 
 PRACTICAL_TP_NOTE = "TP2 selected as practical swing target; TP3 is runner only."
 
+TIMING_SCORE_CAPS = {
+    "IDEAL ENTRY ZONE": 100,
+    "NEAR PIVOT": 92,
+    "MA10 PULLBACK": 88,
+    "BREAKOUT CONFIRMED": 88,
+    "MA20 PULLBACK": 82,
+    "HEALTHY PULLBACK": 82,
+    "EXTENDED - WAIT": 55,
+    "TOO LATE": 40,
+    "FAILED SETUP": 30,
+}
+STAGE_SCORE_ADJUSTMENTS = {
+    "EARLY STAGE 2": 12,
+    "MID STAGE 2": 5,
+    "LATE STAGE 2": -12,
+    "CLIMAX / PARABOLIC": -25,
+    "FAILED STAGE": -30,
+    "STAGE 1 / NOT READY": -20,
+}
+STAGE_SORT_PRIORITY = {
+    "EARLY STAGE 2": 0,
+    "MID STAGE 2": 1,
+    "LATE STAGE 2": 2,
+    "CLIMAX / PARABOLIC": 3,
+    "FAILED STAGE": 4,
+    "STAGE 1 / NOT READY": 5,
+}
+
 
 def risk_bucket_state(
     risk_pct: float,
@@ -2851,6 +2879,184 @@ def detect_stage_analysis(data: pd.DataFrame) -> str:
     if close > ma150 and not ma200_rising:
         return "STAGE 3 RISK"
     return "STAGE 1 BASE"
+
+
+def classify_stage_label(
+    data: pd.DataFrame,
+    pivot: PivotInfo,
+    character_change_flag: str,
+    current_setup_status: str,
+) -> str:
+    """Classify stage maturity for timing-aware ranking."""
+    if data.empty:
+        return "STAGE 1 / NOT READY"
+    latest = data.iloc[-1]
+    close = float(latest.get("Close", np.nan))
+    ma10 = float(latest.get("MA10", np.nan))
+    ma20 = float(latest.get("MA20", np.nan))
+    ma50 = float(latest.get("MA50", np.nan))
+    ma150 = float(latest.get("MA150", np.nan))
+    ma200 = float(latest.get("MA200", np.nan))
+    rsi = float(latest.get("RSI14", np.nan))
+    ma20_distance = (close / ma20 - 1) * 100 if pd.notna(close) and pd.notna(ma20) and ma20 > 0 else np.nan
+    ma10_distance = (close / ma10 - 1) * 100 if pd.notna(close) and pd.notna(ma10) and ma10 > 0 else np.nan
+    pivot_distance = abs((close / pivot.pivot - 1) * 100) if pd.notna(pivot.pivot) and pivot.pivot else np.nan
+    recent_move = data["Close"].pct_change(10).iloc[-1] * 100 if len(data) >= 11 else np.nan
+    volatility_expanding = (
+        len(data) >= 20
+        and pd.notna(data["RangePct"].tail(5).mean())
+        and data["RangePct"].tail(5).mean() > data["RangePct"].tail(20).mean() * 1.5
+    )
+
+    if character_change_flag == "CHARACTER CHANGE" or current_setup_status in {"FAILED", "FAILED BREAKOUT"}:
+        return "FAILED STAGE"
+    if pd.isna(close) or pd.isna(ma50) or close < ma50:
+        return "STAGE 1 / NOT READY"
+    if pd.notna(ma20_distance) and ma20_distance > 25 and pd.notna(rsi) and rsi > 75:
+        return "CLIMAX / PARABOLIC"
+    if pd.notna(recent_move) and recent_move > 20 and volatility_expanding:
+        return "CLIMAX / PARABOLIC"
+    if pd.notna(ma20_distance) and ma20_distance > 15:
+        return "LATE STAGE 2"
+    major_uptrend = (
+        pd.notna(ma50)
+        and pd.notna(ma150)
+        and pd.notna(ma200)
+        and close > ma50 > ma150 > ma200
+    )
+    if major_uptrend and pd.notna(pivot_distance) and pivot_distance <= 5 and (pd.isna(ma10_distance) or ma10_distance <= 10):
+        return "EARLY STAGE 2"
+    if major_uptrend or (pd.notna(ma150) and pd.notna(ma200) and close > ma150 and close > ma200):
+        return "MID STAGE 2"
+    return "STAGE 1 / NOT READY"
+
+
+def stage_score_adjustment(stage_label: str) -> int:
+    """Return the configured score adjustment for stage maturity."""
+    return STAGE_SCORE_ADJUSTMENTS.get(stage_label, 0)
+
+
+def timing_score_cap(entry_timing: str) -> int:
+    """Return the maximum final score allowed by entry timing."""
+    return TIMING_SCORE_CAPS.get(entry_timing, 100)
+
+
+def classify_pullback_quality(
+    data: pd.DataFrame,
+    pivot: PivotInfo,
+    risk_pct: float,
+    ma10_distance: float,
+    ma20_distance: float,
+    character_change_flag: str,
+) -> str:
+    """Label pullback structure without changing the scan universe."""
+    if data.empty:
+        return "NOT PULLBACK"
+    latest = data.iloc[-1]
+    close = float(latest.get("Close", np.nan))
+    ma10 = float(latest.get("MA10", np.nan))
+    ma20 = float(latest.get("MA20", np.nan))
+    rsi = float(latest.get("RSI14", np.nan))
+    avg_vol20 = latest.get("AvgVol20", np.nan)
+    recent = data.tail(7)
+    volume_controlled = pd.isna(avg_vol20) or float(latest.get("Volume", 0)) <= float(avg_vol20) * 1.1
+    weak_close = float(latest.get("Close", 0)) < (float(latest.get("Low", 0)) + (float(latest.get("High", 0)) - float(latest.get("Low", 0))) * 0.35)
+    wide_red = (
+        float(latest.get("Close", 0)) < float(latest.get("Open", 0))
+        and pd.notna(latest.get("RangePct", np.nan))
+        and len(data) >= 20
+        and float(latest.get("RangePct", 0)) > float(data["RangePct"].tail(20).mean()) * 1.4
+    )
+    tight_flag = (
+        len(recent) >= 3
+        and (recent["Close"].max() - recent["Close"].min()) / max(close, 0.01) * 100 <= 4
+        and recent["Volume"].tail(3).mean() <= recent["Volume"].mean()
+    )
+    recently_extended = len(data) >= 10 and ((data["Close"].tail(10) / data["MA20"].tail(10) - 1) * 100).max() > 20
+
+    if character_change_flag == "CHARACTER CHANGE":
+        return "CLIMAX PULLBACK" if recently_extended else "HIGH RISK PULLBACK"
+    if recently_extended and pd.notna(rsi) and rsi > 75 and (wide_red or weak_close):
+        return "CLIMAX PULLBACK"
+    if wide_red or weak_close or (pd.notna(risk_pct) and risk_pct > 12):
+        return "HIGH RISK PULLBACK"
+    if pd.notna(close) and pd.notna(ma10) and abs(ma10_distance) <= 3 and close >= ma10 and volume_controlled and pd.notna(rsi) and rsi > 50:
+        return "CLEAN MA10 PULLBACK"
+    if pd.notna(close) and pd.notna(ma20) and abs(ma20_distance) <= 4 and close >= ma20 * 0.98 and volume_controlled and pd.notna(rsi) and rsi > 45:
+        return "CLEAN MA20 RESET"
+    if tight_flag:
+        return "TIGHT FLAG"
+    return "NOT PULLBACK"
+
+
+def calculate_vcp_tightness_score(data: pd.DataFrame, vcp: VcpInfo, current_setup_status: str) -> int:
+    """Score VCP-style tightness from range, ATR proxy, volume, and close behavior."""
+    if data.empty:
+        return 0
+    score = 0
+    if vcp.contractions and len(vcp.contractions) >= 2 and vcp.contractions[-1] < vcp.contractions[0]:
+        score += 2
+    if len(data) >= 20:
+        recent_range = data["RangePct"].tail(5).mean()
+        prior_range = data["RangePct"].tail(20).head(10).mean()
+        if pd.notna(recent_range) and pd.notna(prior_range) and recent_range < prior_range:
+            score += 2
+        if int((data["RangePct"].tail(10) > data["RangePct"].tail(20).mean() * 1.5).sum()) <= 1:
+            score += 1
+    if has_volume_contraction(data) or vcp.volume_contraction:
+        score += 2
+    closes = data["Close"].tail(5)
+    if len(closes) >= 3 and (closes.max() - closes.min()) / max(float(closes.iloc[-1]), 0.01) * 100 <= 3:
+        score += 2
+    if current_setup_status not in {"FAILED", "FAILED BREAKOUT"}:
+        score += 1
+    else:
+        score -= 3
+    return int(min(max(score, 0), 10))
+
+
+def calculate_tradeability_score(
+    latest: pd.Series,
+    risk_pct: float,
+    stop: float,
+    ma10_distance: float,
+) -> int:
+    """Score whether the stop, volatility, and liquidity make the setup tradable."""
+    score = 0
+    if pd.notna(risk_pct):
+        if risk_pct <= 8:
+            score += 4
+        elif risk_pct <= 10:
+            score += 3
+        elif risk_pct <= 12:
+            score += 2
+        elif risk_pct <= 15:
+            score += 1
+        elif risk_pct > 25:
+            score -= 3
+    range_pct = latest.get("RangePct", np.nan)
+    if pd.notna(range_pct):
+        if float(range_pct) <= 3:
+            score += 2
+        elif float(range_pct) <= 5:
+            score += 1
+        elif float(range_pct) > 8:
+            score -= 2
+    close = float(latest.get("Close", np.nan))
+    ma10 = float(latest.get("MA10", np.nan))
+    ma20 = float(latest.get("MA20", np.nan))
+    avg_dollar_volume = latest.get("AvgDollarVol50", np.nan)
+    if pd.notna(stop) and pd.notna(ma10) and pd.notna(ma20) and stop <= max(ma10, ma20) * 1.01:
+        score += 1
+    if pd.notna(ma10_distance) and abs(ma10_distance) <= 8:
+        score += 1
+    if pd.notna(avg_dollar_volume) and float(avg_dollar_volume) >= 50_000_000:
+        score += 2
+    elif pd.notna(avg_dollar_volume) and float(avg_dollar_volume) >= 20_000_000:
+        score += 1
+    if pd.notna(close) and pd.notna(stop) and stop >= close:
+        score -= 3
+    return int(min(max(score, 0), 10))
 
 
 def detect_institutional_action(data: pd.DataFrame) -> str:
@@ -4601,7 +4807,32 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         entry_quality = numeric_or_na(row.get("Entry Quality Score"))
         professional_score = numeric_or_na(row.get("Professional Score", row.get("Adjusted Final Score")))
         trade_tier = str(row.get("Trade Tier", ""))
+        entry_timing_value = str(row.get("Entry Timing Label", ""))
+        stage_label_value = str(row.get("Stage Label", ""))
+        character_change_value = str(row.get("Character Change Flag", "NONE"))
+        tradeability_score = numeric_or_na(row.get("Tradeability Score"))
         price_above_ma20 = numeric_or_na(row.get("close")) >= numeric_or_na(row.get("MA20", row.get("close"))) if pd.notna(numeric_or_na(row.get("close"))) else False
+
+        if pd.notna(final_score):
+            capped_final_score = min(float(final_score), timing_score_cap(entry_timing_value))
+            if character_change_value == "CHARACTER CHANGE":
+                capped_final_score = min(capped_final_score, 45)
+            fixed.at[idx, "Final Score"] = round(float(capped_final_score), 1)
+            final_score = capped_final_score
+
+        if character_change_value == "CHARACTER CHANGE":
+            signal_state = "REJECT" if hard_reject else "WAIT PULLBACK"
+            trade = "NO"
+            watchlist_flag = "NO" if signal_state == "REJECT" else "YES"
+            trade_tier = "Tier 4 - Avoid / Reject" if hard_reject else trade_tier
+            professional_score = min(professional_score, 45) if pd.notna(professional_score) else 45
+            decision_reason = "Character change detected: wait for structure to rebuild."
+
+        if pd.notna(tradeability_score) and tradeability_score < 5 and signal_state == "BUY NOW":
+            signal_state = "WAIT PULLBACK" if leader_label_value in {"INSTITUTIONAL LEADER", "MOMENTUM LEADER", "SECTOR LEADER"} else "WATCH"
+            trade = "NO"
+            watchlist_flag = "YES"
+            decision_reason = "Tradeability is not clean enough for BUY NOW; wait for tighter risk/reward."
 
         protected = (
             (pd.notna(rs_score) and pd.notna(final_score) and rs_score >= 8 and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 12)
@@ -4717,15 +4948,19 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             trade=trade,
             watchlist_flag=watchlist_flag,
             risk_pct=risk_pct,
-            entry_timing=str(row.get("Entry Timing Label", "")),
+            entry_timing=entry_timing_value,
             leader_label=leader_label_value,
-            character_change_flag=str(row.get("Character Change Flag", "NONE")),
+            character_change_flag=character_change_value,
             hard_reject=hard_reject,
             setup_type=setup_type,
             breakout_alert=str(row.get("Breakout Alert", "")),
             rs_score=rs_score,
             sector_leadership_status=str(row.get("Sector Leadership Status", "")),
         )
+        if character_change_value == "CHARACTER CHANGE":
+            executable_grade = "C - AVOID"
+            executable_score = min(float(executable_score), 45)
+            decision_reason = "C - AVOID: Character change detected: wait for structure to rebuild."
 
         entry = numeric_or_na(row.get("Entry Trigger"))
         stop = numeric_or_na(row.get("Stop Loss"))
@@ -5726,6 +5961,128 @@ def build_scan_row(
         breakout_alert=breakout_alert,
         character_change_flag=character_change_flag,
     )
+    stage_maturity_label = classify_stage_label(data, pivot, character_change_flag, current_setup_status)
+    pullback_quality = classify_pullback_quality(
+        data=data,
+        pivot=pivot,
+        risk_pct=risk_pct,
+        ma10_distance=ma10_distance,
+        ma20_distance=ma20_distance,
+        character_change_flag=character_change_flag,
+    )
+    vcp_tightness_score = calculate_vcp_tightness_score(data, vcp, current_setup_status)
+    tradeability_score = calculate_tradeability_score(
+        latest=latest,
+        risk_pct=risk_pct,
+        stop=stop,
+        ma10_distance=ma10_distance,
+    )
+
+    final_score = int(min(max(final_score + stage_score_adjustment(stage_maturity_label), 0), 100))
+    final_score = min(final_score, timing_score_cap(entry_timing))
+    if character_change_flag == "CHARACTER CHANGE":
+        final_score = min(final_score, 45)
+    adjusted_score = adjusted_final_score(
+        final_score,
+        institutional_quality_score,
+        sector_score,
+        market_score,
+        sector_leadership_weight=sector_leadership_weight,
+        institutional_tightness_score=institutional_tightness_score,
+        theme_weight=theme_weight,
+    )
+
+    high_quality_leader = leader_label in {"INSTITUTIONAL LEADER", "MOMENTUM LEADER", "SECTOR LEADER"}
+    extended_timing = entry_timing in {"EXTENDED - WAIT", "TOO LATE"} or stage_maturity_label in {"LATE STAGE 2", "CLIMAX / PARABOLIC"}
+    if character_change_flag == "CHARACTER CHANGE":
+        signal_state = "REJECT" if hard_reject or current_setup_status in {"FAILED", "FAILED BREAKOUT"} else "WAIT PULLBACK"
+        trade = "NO"
+        watchlist_flag = "NO" if signal_state == "REJECT" else "YES"
+        decision_reason = "Character change detected: wait for structure to rebuild."
+        sell_strategy = "AVOID / NO TRADE" if signal_state == "REJECT" else "WAIT FOR ENTRY"
+    elif high_quality_leader and extended_timing and not hard_reject:
+        signal_state = "WAIT PULLBACK"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "High-quality leader, but entry is extended. Wait for MA10/MA20 reset or tight base."
+        sell_strategy = "WAIT FOR ENTRY"
+    elif tradeability_score < 5 and signal_state == "BUY NOW":
+        signal_state = "WAIT PULLBACK" if high_quality_leader else "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "Tradeability is not clean enough for BUY NOW; wait for tighter risk/reward."
+
+    buy_now_allowed = (
+        quality_grade in {"A+", "A"}
+        and final_score >= 85
+        and score_at_least(rs_score, 7)
+        and (vcp_tightness_score >= 7 or breakout_quality_score >= 8)
+        and pd.notna(risk_pct)
+        and risk_pct <= 10
+        and tradeability_score >= 6
+        and not extended_timing
+        and character_change_flag != "CHARACTER CHANGE"
+        and not hard_reject
+        and (volume_confirmation == "YES" or breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"})
+    )
+    if signal_state == "BUY NOW" and not buy_now_allowed:
+        if entry_timing in {"NEAR PIVOT", "BREAKOUT CONFIRMED"} and pd.notna(risk_pct) and risk_pct <= 10:
+            signal_state = "BUY ON BREAKOUT"
+        elif high_quality_leader and extended_timing:
+            signal_state = "WAIT PULLBACK"
+        else:
+            signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "Good stock, but execution trigger is not clean enough for BUY NOW."
+
+    signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
+        signal_state=signal_state,
+        trade=trade,
+        watchlist_flag=watchlist_flag,
+        decision_reason=decision_reason,
+        earnings_risk_label=earnings_label,
+        days_to_earnings=earnings_info.get("days_to_earnings"),
+        trade_tier=trade_tier,
+    )
+    professional_score = calculate_professional_score(
+        institutional_quality_score=institutional_quality_score,
+        leader_label=leader_label,
+        sector_leadership_status=sector_leadership_status,
+        rs_score=rs_score,
+        market_score=market_score,
+        entry_quality_score=entry_quality_score,
+        institutional_tightness_score=institutional_tightness_score,
+        healthy_pullback_score=healthy_pullback_score,
+        tightness_score=tightness_score,
+        vcp_status=vcp.status,
+        risk_pct=risk_pct,
+        ideal_r=ideal_r,
+        tp_type=tp_type,
+        signal_state=signal_state,
+        hard_reject=hard_reject,
+        price_above_ma20=bool(float(latest["Close"]) >= float(latest["MA20"])),
+    )
+    trade_tier, tier_reason = determine_trade_tier(
+        professional_score=professional_score,
+        adjusted_score=adjusted_score,
+        entry_quality_score=entry_quality_score,
+        risk_pct=risk_pct,
+        rs_score=rs_score,
+        signal_state=signal_state,
+        leader_label=leader_label,
+        sector_leadership_status=sector_leadership_status,
+        setup_type=setup_type,
+        hard_reject=hard_reject,
+        extended=extended_timing,
+        institutional_quality_score=institutional_quality_score,
+        price_above_ma20=bool(float(latest["Close"]) >= float(latest["MA20"])),
+    )
+    if not hard_reject and high_quality_leader and extended_timing and trade_tier == "Tier 4 - Avoid / Reject":
+        trade_tier = "Tier 2 - High Quality, Wait Better Entry"
+    if signal_state in {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
+        trade_tier = "Tier 2 - High Quality, Wait Better Entry" if high_quality_leader else "Tier 3 - Leadership Watchlist"
+
     executable_score, executable_grade, executable_reason = executable_score_and_grade(
         entry_quality_score=entry_quality_score,
         risk_pct=risk_pct,
@@ -5762,11 +6119,16 @@ def build_scan_row(
         rs_score=rs_score,
         sector_leadership_status=sector_leadership_status,
     )
-    if executable_grade == "C - AVOID" and character_change_flag == "CHARACTER CHANGE":
+    if character_change_flag == "CHARACTER CHANGE":
+        executable_grade = "C - AVOID"
+        executable_score = min(float(executable_score), 45)
+        executable_reason = "C - AVOID: Character change detected: wait for structure to rebuild."
         trade = "NO"
-        watchlist_flag = "NO"
-        sell_strategy = "AVOID / NO TRADE"
-    decision_reason = f"{executable_reason} Entry timing: {entry_timing}. Stock quality: {leader_label}, theme {theme_weight}/10."
+        watchlist_flag = "NO" if signal_state == "REJECT" else "YES"
+        sell_strategy = "AVOID / NO TRADE" if signal_state == "REJECT" else "WAIT FOR ENTRY"
+    elif high_quality_leader and extended_timing and executable_grade == "B - WATCHLIST":
+        executable_reason = "B - WATCHLIST: High-quality leader, but entry is extended. Wait for MA10/MA20 reset or tight base."
+    decision_reason = f"{executable_reason} Entry timing: {entry_timing}. Stage: {stage_maturity_label}. Stock quality: {leader_label}, theme {theme_weight}/10."
     action_readiness = action_readiness_label(
         trade_tier=trade_tier,
         signal_state=signal_state,
@@ -5858,6 +6220,10 @@ def build_scan_row(
         "Entry Timing Label": entry_timing,
         "MA10 Efficiency Score": ma10_efficiency_score,
         "Character Change Flag": character_change_flag,
+        "Stage Label": stage_maturity_label,
+        "Pullback Quality": pullback_quality,
+        "VCP Tightness Score": vcp_tightness_score,
+        "Tradeability Score": tradeability_score,
         "Entry Quality Score": entry_quality_score,
         "Entry Quality Label": entry_quality_label,
         "Trade Tier": trade_tier,
@@ -6040,6 +6406,8 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Executable Score",
         "Theme Weight",
         "MA10 Efficiency Score",
+        "VCP Tightness Score",
+        "Tradeability Score",
         "Entry Quality Score",
         "Breakout Quality Score",
         "RS Score",
@@ -6097,6 +6465,8 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "Executable Grade",
         "Executable Score",
         "Entry Timing Label",
+        "Stage Label",
+        "Pullback Quality",
         "Trade Tier",
         "Action Readiness Label",
         "Setup Quality Grade",
@@ -6106,6 +6476,8 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
         "Professional Score",
         "Entry Quality Score",
         "Final Score",
+        "VCP Tightness Score",
+        "Tradeability Score",
         "Breakout Quality Score",
         "RS Score",
         "RVOL",
@@ -9453,6 +9825,10 @@ def render_swing_scanner(
         "Entry Timing Label",
         "MA10 Efficiency Score",
         "Character Change Flag",
+        "Stage Label",
+        "Pullback Quality",
+        "VCP Tightness Score",
+        "Tradeability Score",
         "Entry Quality Score",
         "Trade Tier",
         "Action Readiness Label",
@@ -9718,6 +10094,7 @@ def render_swing_scanner(
     visible["tier sort"] = visible.get("Trade Tier", pd.Series("", index=visible.index)).map(TRADE_TIER_PRIORITY).fillna(9)
     visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
+    visible["stage sort"] = visible.get("Stage Label", pd.Series("", index=visible.index)).map(STAGE_SORT_PRIORITY).fillna(9)
     visible["sector leadership sort"] = visible["Sector Leadership"].map({"Leader": 0, "Average": 1, "Laggard": 2}).fillna(3)
     visible["sector status sort"] = visible.get("Sector Leadership Status", pd.Series("", index=visible.index)).map(
         {"LEADING SECTOR": 0, "IMPROVING SECTOR": 1, "NEUTRAL SECTOR": 2, "CYCLICAL RISK": 3, "LAGGING SECTOR": 4}
@@ -9734,24 +10111,38 @@ def render_swing_scanner(
     )
     visible = visible.sort_values(
         [
-            "executable sort",
             "signal sort",
-            "Executable Score",
-            "Adjusted Final Score",
+            "quality sort",
+            "stage sort",
+            "Final Score",
+            "VCP Tightness Score",
+            "Tradeability Score",
             "RS Sort",
-            "Risk %",
         ],
-        ascending=[True, True, False, False, False, True],
+        ascending=[True, True, True, False, False, False, False],
     )
 
     compact_columns = [
         "ticker",
         "Sector / Industry",
+        "close",
+        "Signal State",
+        "Setup Quality Grade",
+        "Stage Label",
+        "Pullback Quality",
+        "VCP Tightness Score",
+        "Tradeability Score",
+        "Final Score",
+        "RS Score",
+        "Risk %",
+        "Entry Trigger",
+        "Stop Loss",
+        "Ideal TP",
+        "Decision Reason",
         "Leader Quality Label",
         "Executable Grade",
         "Executable Score",
         "Entry Timing Label",
-        "Signal State",
         "Trade",
         "Setup Type",
         "Watch Type",
@@ -9760,14 +10151,7 @@ def render_swing_scanner(
         "Theme Weight",
         "MA10 Efficiency Score",
         "Character Change Flag",
-        "RS Score",
-        "Risk %",
-        "close",
         "Pivot",
-        "Entry Trigger",
-        "Stop Loss",
-        "Ideal TP",
-        "Decision Reason",
         "Sector Leadership Status",
         "Trade Tier",
         "Action Readiness Label",
@@ -9891,50 +10275,51 @@ def render_swing_scanner(
     focus_source["tier sort"] = focus_source.get("Trade Tier", pd.Series("", index=focus_source.index)).map(TRADE_TIER_PRIORITY).fillna(9)
     focus_source["Professional Score Sort"] = pd.to_numeric(focus_source.get("Professional Score"), errors="coerce").fillna(0)
     focus_source["Entry Quality Sort"] = pd.to_numeric(focus_source.get("Entry Quality Score"), errors="coerce").fillna(0)
+    focus_source["Final Score Sort"] = pd.to_numeric(focus_source.get("Final Score"), errors="coerce").fillna(0)
+    focus_source["VCP Tightness Sort"] = pd.to_numeric(focus_source.get("VCP Tightness Score"), errors="coerce").fillna(0)
+    focus_source["Tradeability Sort"] = pd.to_numeric(focus_source.get("Tradeability Score"), errors="coerce").fillna(0)
 
     buy_now_focus = focus_source[focus_source["Signal State"] == "BUY NOW"].sort_values(
-        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, False, True],
+        ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, True],
     )
     buy_breakout_focus = focus_source[focus_source["Signal State"] == "BUY ON BREAKOUT"].sort_values(
-        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, False, True],
+        ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, True],
     )
     watchlist_focus = focus_source[
         (focus_source["Signal State"] == "WATCH")
         & (focus_source["Setup Type"] != "MOMENTUM BREAKOUT EXCEPTION")
         & (focus_source["Setup Type"] != "RESISTANCE BREAKOUT WATCH")
     ].sort_values(
-        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, False, True],
+        ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, False, True],
     )
-    momentum_focus = focus_source[
-        focus_source["Setup Type"] == "MOMENTUM BREAKOUT EXCEPTION"
+    healthy_pullback_focus = focus_source[
+        focus_source.get("Pullback Quality", pd.Series("", index=focus_source.index)).isin(["CLEAN MA10 PULLBACK", "CLEAN MA20 RESET", "TIGHT FLAG"])
+        | (focus_source.get("Healthy Pullback Label", pd.Series("", index=focus_source.index)) == "HEALTHY PULLBACK")
     ].sort_values(
-        ["signal sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, False, True],
+        ["signal sort", "quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
+        ascending=[True, True, False, False, False, False, True],
     )
-    pullback_focus = focus_source[focus_source["Setup Type"].isin(["PULLBACK TO MA10", "PULLBACK TO MA20"])].sort_values(
-        ["signal sort", "quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, True, False, False, False, False, False, True],
-    )
-    extended_focus = focus_source[focus_source["Signal State"] == "EXTENDED DO NOT CHASE"].sort_values(
-        ["quality sort", "Adjusted Final Score", "Institutional Quality Score", "Final Score", "Explosive Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, False, True],
-    )
-    resistance_focus = focus_source[
-        focus_source["Setup Type"] == "RESISTANCE BREAKOUT WATCH"
+    extended_focus = focus_source[
+        focus_source["Signal State"].isin(["WAIT PULLBACK", "EXTENDED DO NOT CHASE"])
+        & (
+            focus_source.get("Entry Timing Label", pd.Series("", index=focus_source.index)).isin(["EXTENDED - WAIT", "TOO LATE"])
+            | focus_source.get("Stage Label", pd.Series("", index=focus_source.index)).isin(["LATE STAGE 2", "CLIMAX / PARABOLIC"])
+        )
     ].sort_values(
-        ["quality sort", "Explosive Score", "RS Sort", "Tightness Score", "Resistance Breakout Risk %", "Final Score"],
-        ascending=[True, False, False, False, True, False],
+        ["quality sort", "Final Score Sort", "Institutional Quality Score", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
     )
     rejected_focus = focus_source[
         (focus_source["Signal State"] == "REJECT")
         | (focus_source["Setup Quality Grade"] == "Reject")
         | (focus_source["Action Label"] == "FAILED")
+        | (focus_source.get("Executable Grade", pd.Series("", index=focus_source.index)) == "C - AVOID")
     ].sort_values(
-        ["quality sort", "Risk %", "Adjusted Final Score", "Final Score"],
-        ascending=[True, True, False, False],
+        ["quality sort", "Risk %", "Final Score Sort"],
+        ascending=[True, True, False],
     )
     closest_to_action_focus = focus_source[
         (focus_source["Trade Tier"] == "Tier 2 - High Quality, Wait Better Entry")
@@ -9950,16 +10335,20 @@ def render_swing_scanner(
     st.subheader("Daily Focus Summary")
     if buy_now_focus.empty:
         st.info("No clean BUY NOW today. Best action: wait. Watchlist candidates below.")
-    focus_cols = st.columns(4)
+    focus_cols = st.columns(3)
     with focus_cols[0]:
         show_focus_group("Top BUY NOW", buy_now_focus, "Decision Reason")
     with focus_cols[1]:
         show_focus_group("Top BUY ON BREAKOUT", buy_breakout_focus, "Decision Reason")
     with focus_cols[2]:
         show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
-    with focus_cols[3]:
-        show_focus_group("Top Momentum Breakout Exceptions", momentum_focus, "Decision Reason")
-    show_focus_group("Top Pullback Setups", pullback_focus, "Decision Reason")
+    extra_focus_cols = st.columns(3)
+    with extra_focus_cols[0]:
+        show_focus_group("Best Healthy Pullbacks", healthy_pullback_focus, "Decision Reason")
+    with extra_focus_cols[1]:
+        show_focus_group("High Quality But Extended", extended_focus, "Decision Reason")
+    with extra_focus_cols[2]:
+        show_focus_group("Reject / Avoid", rejected_focus, "Decision Reason")
     show_focus_group("Closest To Action", closest_to_action_focus, "Decision Reason")
 
     st.subheader("Action View")
