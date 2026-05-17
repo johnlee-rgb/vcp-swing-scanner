@@ -10690,7 +10690,57 @@ def main() -> None:
             background: #111827;
             border: 1px solid #1e293b;
             border-radius: 10px;
-            padding: 10px;
+            padding: 14px 16px;
+            min-height: 128px;
+            overflow: visible;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 8px;
+        }
+        [data-testid="stMetric"] [data-testid="stMetricLabel"] p {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            line-height: 1.2;
+        }
+        [data-testid="stMetric"] [data-testid="stMetricValue"] {
+            font-size: clamp(1.25rem, 1.8vw, 2.35rem);
+            line-height: 1.08;
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            overflow-wrap: normal;
+            word-break: normal;
+            max-width: 100%;
+        }
+        [data-testid="stMetric"] [data-testid="stMetricValue"] > div,
+        [data-testid="stMetric"] [data-testid="stMetricValue"] p {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            overflow-wrap: normal;
+            word-break: normal;
+            max-width: 100%;
+        }
+        [data-testid="stMetric"] [data-testid="stMetricDelta"] {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            max-width: 100%;
+            align-items: flex-start;
+            line-height: 1.2;
+        }
+        [data-testid="stMetric"] [data-testid="stMetricDelta"] p,
+        [data-testid="stMetric"] [data-testid="stMetricDelta"] div {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            overflow-wrap: anywhere;
+            max-width: 100%;
+        }
+        [data-testid="column"] [data-testid="stMetric"] {
+            height: 100%;
         }
         </style>
         """,
