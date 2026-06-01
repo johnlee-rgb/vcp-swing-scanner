@@ -653,6 +653,20 @@ COMMON_SECTOR_OVERRIDES = {
     "VRT": ("Industrials", "Electrical Equipment / Data Center Infrastructure"),
     "MS": ("Financial Services", "Capital Markets"),
     "WELL": ("Real Estate", "Healthcare REIT"),
+    "CNC": ("Healthcare", "Healthcare Plans"),
+    "MNST": ("Consumer Defensive", "Beverages - Non-Alcoholic"),
+    "ELV": ("Healthcare", "Healthcare Plans"),
+    "HUM": ("Healthcare", "Healthcare Plans"),
+    "CVS": ("Healthcare", "Healthcare Plans / Pharmacy"),
+    "MRK": ("Healthcare", "Drug Manufacturers - General"),
+    "STLD": ("Basic Materials", "Steel"),
+    "DAL": ("Industrials", "Airlines"),
+    "CNI": ("Industrials", "Railroads"),
+    "CROX": ("Consumer Cyclical", "Footwear & Accessories"),
+    "NUE": ("Basic Materials", "Steel"),
+    "AA": ("Basic Materials", "Aluminum"),
+    "TGT": ("Consumer Defensive", "Discount Stores"),
+    "FCX": ("Basic Materials", "Copper"),
 }
 for symbol, metadata in COMMON_SECTOR_OVERRIDES.items():
     MANUAL_SECTOR_MAP.setdefault(symbol, metadata)
@@ -4895,6 +4909,8 @@ def buy_setup_explainability(
     final_score: float,
     breakout_alert: str,
     volume_confirmation: str,
+    setup_quality_grade: str,
+    pullback_quality: str,
 ) -> Dict[str, object]:
     """Explain why a row can or cannot be acted on without adding new data calls."""
     leader_ok = leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER", "MOMENTUM LEADER"}
@@ -4924,18 +4940,22 @@ def buy_setup_explainability(
     if earnings_block:
         strict_blockers.append("Earnings Risk")
 
+    setup_quality_ok = setup_quality_grade not in {"C", "Reject"}
+    pullback_quality_ok = pullback_quality != "HIGH RISK PULLBACK"
     criteria = [
-        ("Adjusted Final Score >= 90", pd.notna(adjusted_value) and adjusted_value >= 90),
-        ("Professional Score >= 85", pd.notna(professional_value) and professional_value >= 85),
-        ("RS >= 8", pd.notna(rs_value) and rs_value >= 8),
-        ("Risk <= 12%", pd.notna(risk_value) and risk_value <= 12),
-        ("Institutional/Sector/Momentum Leader", leader_ok),
-        ("Stage 2 / not failed", not bad_stage),
-        ("No character change", character_change_flag != "CHARACTER CHANGE"),
-        ("No near earnings risk", not earnings_block),
+        ("Adjusted Final Score >= 90", "Adjusted Final Score below 90", pd.notna(adjusted_value) and adjusted_value >= 90),
+        ("Professional Score >= 85", "Professional Score below 85", pd.notna(professional_value) and professional_value >= 85),
+        ("RS >= 8", "RS below 8", pd.notna(rs_value) and rs_value >= 8),
+        ("Risk <= 12%", "Risk above 12%", pd.notna(risk_value) and risk_value <= 12),
+        ("Institutional/Sector/Momentum Leader", "Leader quality not eligible", leader_ok),
+        ("Stage 2 / not failed", "Stage is failed, climactic, or not ready", not bad_stage),
+        ("No character change", "Character change detected", character_change_flag != "CHARACTER CHANGE"),
+        ("No near earnings risk", "High earnings risk within 7 trading days", not earnings_block),
+        ("Setup Quality Grade above C", "Setup Quality Grade is C or Reject", setup_quality_ok),
+        ("Pullback quality acceptable", "Pullback Quality is HIGH RISK PULLBACK", pullback_quality_ok),
     ]
-    passed = [label for label, ok in criteria if ok]
-    failed = [label for label, ok in criteria if not ok]
+    passed = [pass_label for pass_label, _, ok in criteria if ok]
+    failed = [fail_label for _, fail_label, ok in criteria if not ok]
     actionable_buy_zone = not strict_blockers and not failed
 
     early_setup_ok = setup_type in {
@@ -4953,14 +4973,14 @@ def buy_setup_explainability(
         and (pd.isna(ma20_value) or ma20_value <= 18)
     )
     early_criteria = [
-        ("Adjusted Final Score >= 85", pd.notna(adjusted_value) and adjusted_value >= 85),
-        ("Professional Score >= 80", pd.notna(professional_value) and professional_value >= 80),
-        ("RS >= 7", pd.notna(rs_value) and rs_value >= 7),
-        ("Risk <= 13%", pd.notna(risk_value) and risk_value <= 13),
-        ("Leader quality eligible", leader_ok),
-        ("Setup supports pilot entry", early_setup_ok),
-        ("Not too extended", early_extended_ok),
-        ("No hard reject", not hard_reject and character_change_flag != "CHARACTER CHANGE" and not earnings_block),
+        ("Adjusted Final Score below 85", pd.notna(adjusted_value) and adjusted_value >= 85),
+        ("Professional Score below 80", pd.notna(professional_value) and professional_value >= 80),
+        ("RS below 7", pd.notna(rs_value) and rs_value >= 7),
+        ("Risk above 13%", pd.notna(risk_value) and risk_value <= 13),
+        ("Leader quality not eligible", leader_ok),
+        ("Setup does not support pilot entry", early_setup_ok),
+        ("Too extended for pilot entry", early_extended_ok),
+        ("Hard reject, character change, or earnings risk", not hard_reject and character_change_flag != "CHARACTER CHANGE" and not earnings_block),
     ]
     early_failed = [label for label, ok in early_criteria if not ok]
     early_position_zone = not strict_blockers and not early_failed
@@ -5043,16 +5063,17 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
 
         if pd.notna(final_score):
             capped_final_score = min(float(final_score), timing_score_cap(entry_timing_value))
-            if character_change_value == "CHARACTER CHANGE":
+            if character_change_value == "CHARACTER CHANGE" or stage_label_value == "FAILED STAGE":
                 capped_final_score = min(capped_final_score, 45)
             fixed.at[idx, "Final Score"] = round(float(capped_final_score), 1)
             final_score = capped_final_score
 
-        if character_change_value == "CHARACTER CHANGE":
-            signal_state = "REJECT" if hard_reject else "WAIT PULLBACK"
+        if character_change_value == "CHARACTER CHANGE" or stage_label_value == "FAILED STAGE":
+            hard_reject = True
+            signal_state = "REJECT"
             trade = "NO"
-            watchlist_flag = "NO" if signal_state == "REJECT" else "YES"
-            trade_tier = "Tier 4 - Avoid / Reject" if hard_reject else trade_tier
+            watchlist_flag = "NO"
+            trade_tier = "Tier 4 - Avoid / Reject"
             professional_score = min(professional_score, 45) if pd.notna(professional_score) else 45
             decision_reason = "Character change detected: wait for structure to rebuild."
 
@@ -5061,6 +5082,14 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             trade = "NO"
             watchlist_flag = "YES"
             decision_reason = "Tradeability is not clean enough for BUY NOW; wait for tighter risk/reward."
+        if signal_state == "BUY NOW" and (
+            str(row.get("Setup Quality Grade", "")) in {"C", "Reject"}
+            or str(row.get("Pullback Quality", "")) == "HIGH RISK PULLBACK"
+        ):
+            signal_state = "EARLY POSITION" if leader_label_value in {"INSTITUTIONAL LEADER", "MOMENTUM LEADER", "SECTOR LEADER"} else "BUY ON BREAKOUT"
+            trade = "YES" if signal_state == "EARLY POSITION" else "NO"
+            watchlist_flag = "YES"
+            decision_reason = "Quality guard blocks full BUY NOW; pilot position only or wait for breakout confirmation."
 
         protected = (
             (pd.notna(rs_score) and pd.notna(final_score) and rs_score >= 8 and final_score >= 85 and pd.notna(risk_pct) and risk_pct <= 12)
@@ -5270,6 +5299,8 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "Signal State"] = signal_state
         fixed.at[idx, "Trade"] = trade
         fixed.at[idx, "WATCHLIST FLAG"] = watchlist_flag
+        if hard_reject:
+            fixed.at[idx, "Hard Reject"] = "YES"
         fixed.at[idx, "Decision Reason"] = decision_reason
         fixed.at[idx, "Trade Reason"] = decision_reason
         fixed.at[idx, "Watchlist Reason"] = "Already Trade YES" if trade == "YES" else decision_reason
@@ -6283,12 +6314,13 @@ def build_scan_row(
         and not hard_reject
     )
     extended_timing = entry_timing in {"EXTENDED - WAIT", "TOO LATE"} or stage_maturity_label in {"LATE STAGE 2", "CLIMAX / PARABOLIC"}
-    if character_change_flag == "CHARACTER CHANGE":
-        signal_state = "REJECT" if hard_reject or current_setup_status in {"FAILED", "FAILED BREAKOUT"} else "WAIT PULLBACK"
+    if character_change_flag == "CHARACTER CHANGE" or stage_maturity_label == "FAILED STAGE":
+        hard_reject = True
+        signal_state = "REJECT"
         trade = "NO"
-        watchlist_flag = "NO" if signal_state == "REJECT" else "YES"
-        decision_reason = "Character change detected: wait for structure to rebuild."
-        sell_strategy = "AVOID / NO TRADE" if signal_state == "REJECT" else "WAIT FOR ENTRY"
+        watchlist_flag = "NO"
+        decision_reason = "Character change or failed stage detected: wait for structure to rebuild."
+        sell_strategy = "AVOID / NO TRADE"
     elif high_quality_leader and extended_timing and not hard_reject:
         signal_state = "WAIT PULLBACK"
         trade = "NO"
@@ -6327,8 +6359,11 @@ def build_scan_row(
         final_score=final_score,
         breakout_alert=breakout_alert,
         volume_confirmation=volume_confirmation,
+        setup_quality_grade=quality_grade,
+        pullback_quality=pullback_quality,
     )
-    if buy_explainability["actionable_buy_zone"] and not extended_timing:
+    quality_guard_blocks_buy_now = quality_grade in {"C", "Reject"} or pullback_quality == "HIGH RISK PULLBACK"
+    if buy_explainability["actionable_buy_zone"] and not extended_timing and not quality_guard_blocks_buy_now:
         signal_state = "BUY NOW"
         trade = "YES"
         watchlist_flag = "NO"
@@ -6340,7 +6375,10 @@ def build_scan_row(
         signal_state = "EARLY POSITION"
         trade = "YES"
         watchlist_flag = "YES"
-        decision_reason = "high-quality leader; pilot position allowed before full breakout confirmation."
+        if quality_guard_blocks_buy_now:
+            decision_reason = "quality guard blocks full BUY NOW; pilot position only or wait for breakout confirmation."
+        else:
+            decision_reason = "high-quality leader; pilot position allowed before full breakout confirmation."
     elif signal_state == "BUY NOW":
         if high_quality_leader and extended_timing:
             signal_state = "WAIT PULLBACK"
