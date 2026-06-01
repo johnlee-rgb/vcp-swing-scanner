@@ -1885,14 +1885,15 @@ def risk_note(risk_pct: float, aggressive_mode: bool) -> str:
     return "Aggressive risk allowed" if aggressive_mode else "Risk above 10%"
 
 
-ACTIONABLE_SIGNAL_STATES = {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}
+ACTIONABLE_SIGNAL_STATES = {"BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}
 SIGNAL_STATE_PRIORITY = {
     "BUY NOW": 0,
-    "BUY ON BREAKOUT": 1,
-    "WATCH": 2,
-    "WAIT PULLBACK": 3,
-    "EXTENDED DO NOT CHASE": 4,
-    "REJECT": 5,
+    "EARLY POSITION": 1,
+    "BUY ON BREAKOUT": 2,
+    "WATCH": 3,
+    "WAIT PULLBACK": 4,
+    "EXTENDED DO NOT CHASE": 5,
+    "REJECT": 6,
 }
 TRADE_TIER_PRIORITY = {
     "Tier 1 - Immediate Action": 0,
@@ -1902,6 +1903,7 @@ TRADE_TIER_PRIORITY = {
 }
 DECISION_PREFIX_BY_STATE = {
     "BUY NOW": "BUY NOW:",
+    "EARLY POSITION": "EARLY POSITION:",
     "BUY ON BREAKOUT": "BUY ON BREAKOUT:",
     "WATCH": "WATCH:",
     "WAIT PULLBACK": "WAIT PULLBACK:",
@@ -4795,6 +4797,7 @@ def reason_with_signal_prefix(signal_state: str, decision_reason: str) -> str:
 
     default_reason = {
         "BUY NOW": "breakout confirmed, strong RS, risk controlled.",
+        "EARLY POSITION": "high-quality leader; pilot position allowed before full breakout confirmation.",
         "BUY ON BREAKOUT": "near trigger, wait for clean confirmation.",
         "WATCH": "good setup, wait for trigger.",
         "WAIT PULLBACK": "risk or extension requires a tighter entry.",
@@ -4827,16 +4830,14 @@ def finalize_signal_outputs(
         watchlist_flag = "YES"
         decision_reason = "WATCH: strong setup but earnings risk high; consider smaller size or wait after earnings."
 
-    if trade == "YES" and signal_state != "BUY NOW" and trade_tier in {"", "Tier 1 - Immediate Action"}:
+    if trade == "YES" and signal_state not in {"BUY NOW", "EARLY POSITION"} and trade_tier in {"", "Tier 1 - Immediate Action"}:
         signal_state = "BUY NOW"
     if signal_state == "BUY NOW":
-        if trade_tier and trade_tier != "Tier 1 - Immediate Action":
-            signal_state = "WATCH"
-            trade = "NO"
-            watchlist_flag = "YES"
-        else:
-            trade = "YES"
-            watchlist_flag = "NO"
+        trade = "YES"
+        watchlist_flag = "NO"
+    elif signal_state == "EARLY POSITION":
+        trade = "YES"
+        watchlist_flag = "YES"
     elif signal_state in {"BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"}:
         trade = "NO"
         watchlist_flag = "YES"
@@ -4859,6 +4860,8 @@ def action_readiness_label(
         return "AVOID"
     if signal_state == "BUY NOW":
         return "READY NOW"
+    if signal_state == "EARLY POSITION":
+        return "NEAR TIER 1"
     if signal_state == "BUY ON BREAKOUT":
         return "WAIT TRIGGER"
     if signal_state == "WAIT PULLBACK":
@@ -4872,6 +4875,144 @@ def action_readiness_label(
     ):
         return "NEAR TIER 1"
     return "WAIT TRIGGER" if signal_state == "WATCH" else "AVOID"
+
+
+def buy_setup_explainability(
+    *,
+    adjusted_score: float,
+    professional_score: float,
+    rs_score: float,
+    risk_pct: float,
+    leader_label: str,
+    stage_label: str,
+    character_change_flag: str,
+    earnings_risk_label: str,
+    days_to_earnings: int | str | None,
+    setup_type: str,
+    ma10_distance: float,
+    ma20_distance: float,
+    hard_reject: bool,
+    final_score: float,
+    breakout_alert: str,
+    volume_confirmation: str,
+) -> Dict[str, object]:
+    """Explain why a row can or cannot be acted on without adding new data calls."""
+    leader_ok = leader_label in {"INSTITUTIONAL LEADER", "SECTOR LEADER", "MOMENTUM LEADER"}
+    bad_stage = stage_label in {"CLIMAX / PARABOLIC", "FAILED STAGE", "STAGE 1 / NOT READY"}
+    days_numeric = numeric_or_na(days_to_earnings)
+    earnings_block = earnings_risk_label == "HIGH RISK" and pd.notna(days_numeric) and days_numeric <= 7
+    rs_value = numeric_or_na(rs_score)
+    risk_value = numeric_or_na(risk_pct)
+    adjusted_value = numeric_or_na(adjusted_score)
+    professional_value = numeric_or_na(professional_score)
+    final_value = numeric_or_na(final_score)
+    ma10_value = numeric_or_na(ma10_distance)
+    ma20_value = numeric_or_na(ma20_distance)
+    strict_blockers: List[str] = []
+    if hard_reject:
+        strict_blockers.append("Hard reject")
+    if character_change_flag == "CHARACTER CHANGE":
+        strict_blockers.append("Character Change")
+    if stage_label in {"FAILED STAGE", "CLIMAX / PARABOLIC"}:
+        strict_blockers.append(stage_label)
+    if pd.notna(risk_value) and risk_value > 18:
+        strict_blockers.append("Risk > 18%")
+    if pd.notna(rs_value) and rs_value < 4:
+        strict_blockers.append("Weak RS")
+    if pd.notna(final_value) and final_value < 60:
+        strict_blockers.append("Final Score < 60")
+    if earnings_block:
+        strict_blockers.append("Earnings Risk")
+
+    criteria = [
+        ("Adjusted Final Score >= 90", pd.notna(adjusted_value) and adjusted_value >= 90),
+        ("Professional Score >= 85", pd.notna(professional_value) and professional_value >= 85),
+        ("RS >= 8", pd.notna(rs_value) and rs_value >= 8),
+        ("Risk <= 12%", pd.notna(risk_value) and risk_value <= 12),
+        ("Institutional/Sector/Momentum Leader", leader_ok),
+        ("Stage 2 / not failed", not bad_stage),
+        ("No character change", character_change_flag != "CHARACTER CHANGE"),
+        ("No near earnings risk", not earnings_block),
+    ]
+    passed = [label for label, ok in criteria if ok]
+    failed = [label for label, ok in criteria if not ok]
+    actionable_buy_zone = not strict_blockers and not failed
+
+    early_setup_ok = setup_type in {
+        "EARLY VCP",
+        "VALID VCP",
+        "TRUE VCP",
+        "BASE BUILDING",
+        "PULLBACK TO MA10",
+        "HEALTHY PULLBACK WATCH",
+        "RESISTANCE BREAKOUT WATCH",
+        "POST-BREAKOUT DIGESTION",
+    }
+    early_extended_ok = (
+        (pd.isna(ma10_value) or ma10_value <= 12)
+        and (pd.isna(ma20_value) or ma20_value <= 18)
+    )
+    early_criteria = [
+        ("Adjusted Final Score >= 85", pd.notna(adjusted_value) and adjusted_value >= 85),
+        ("Professional Score >= 80", pd.notna(professional_value) and professional_value >= 80),
+        ("RS >= 7", pd.notna(rs_value) and rs_value >= 7),
+        ("Risk <= 13%", pd.notna(risk_value) and risk_value <= 13),
+        ("Leader quality eligible", leader_ok),
+        ("Setup supports pilot entry", early_setup_ok),
+        ("Not too extended", early_extended_ok),
+        ("No hard reject", not hard_reject and character_change_flag != "CHARACTER CHANGE" and not earnings_block),
+    ]
+    early_failed = [label for label, ok in early_criteria if not ok]
+    early_position_zone = not strict_blockers and not early_failed
+    breakout_confirmed = breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
+    volume_confirmed = volume_confirmation == "YES"
+    volume_only_block = (not actionable_buy_zone) and len(failed) == 0 and not volume_confirmed
+
+    missing_condition = "None"
+    if len(failed) == 1:
+        missing_condition = failed[0]
+    elif volume_only_block:
+        missing_condition = "Volume confirmation missing"
+    elif len(early_failed) == 1:
+        missing_condition = early_failed[0]
+
+    suggested_action = "None"
+    if missing_condition == "Volume confirmation missing":
+        suggested_action = "pilot buy or wait for breakout volume"
+    elif "Risk" in missing_condition:
+        suggested_action = "wait pullback to lower risk"
+    elif "extended" in missing_condition.lower() or "Not too extended" == missing_condition:
+        suggested_action = "wait MA10/MA20 reset"
+    elif missing_condition != "None":
+        suggested_action = "watch for the missing condition to improve"
+
+    return {
+        "actionable_buy_zone": actionable_buy_zone,
+        "early_position_zone": early_position_zone,
+        "passed": passed,
+        "failed": failed,
+        "blocked_by": strict_blockers or ["None"],
+        "downgrade_reason": "None",
+        "upgrade_reason": "Actionable Buy Zone" if actionable_buy_zone else "Early Position" if early_position_zone else "None",
+        "missing_condition": missing_condition,
+        "suggested_action": suggested_action,
+        "breakout_confirmed": breakout_confirmed,
+        "volume_confirmed": volume_confirmed,
+    }
+
+
+def execution_confidence_for_signal(signal_state: str, breakout_alert: str, volume_confirmation: str) -> str:
+    """Separate execution confidence from the final signal state."""
+    if signal_state == "BUY NOW" and volume_confirmation == "YES" and breakout_alert == "CONFIRMED BREAKOUT":
+        return "HIGH"
+    if signal_state in {"BUY NOW", "EARLY POSITION"}:
+        return "MEDIUM"
+    return "LOW"
+
+
+def scanner_verdict_for_signal(signal_state: str, decision_reason: str) -> str:
+    """Provide a user-facing verdict with the same prefix as the signal state."""
+    return reason_with_signal_prefix(signal_state, decision_reason)
 
 
 def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
@@ -4977,7 +5118,7 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         if strong_leader_floor:
             professional_score = max(professional_score, 68)
         if not hard_reject and trade_tier not in TRADE_TIER_PRIORITY:
-            if professional_score >= 88 and entry_quality >= 7 and pd.notna(risk_pct) and risk_pct <= 10 and signal_state in {"BUY NOW", "BUY ON BREAKOUT"}:
+            if professional_score >= 88 and entry_quality >= 7 and pd.notna(risk_pct) and risk_pct <= 10 and signal_state in {"BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT"}:
                 trade_tier = "Tier 1 - Immediate Action"
             elif professional_score >= 72:
                 trade_tier = "Tier 2 - High Quality, Wait Better Entry"
@@ -4987,7 +5128,7 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
                 trade_tier = "Tier 3 - Leadership Watchlist"
             else:
                 trade_tier = "Tier 4 - Avoid / Reject"
-        if not hard_reject and signal_state in {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
+        if not hard_reject and signal_state in {"BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
             trade_tier = "Tier 2 - High Quality, Wait Better Entry" if strong_leader_floor or professional_score >= 68 else "Tier 3 - Leadership Watchlist"
         if (
             leader_label_value == "LAGGARD / AVOID"
@@ -5002,19 +5143,24 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         if trade_tier == "Tier 1 - Immediate Action":
             if signal_state == "BUY NOW":
                 trade = "YES"
+            elif signal_state == "EARLY POSITION":
+                trade = "YES"
+                watchlist_flag = "YES"
             elif signal_state not in {"BUY ON BREAKOUT", "BUY NOW"}:
                 signal_state = "BUY ON BREAKOUT"
             decision_reason = "TIER 1: institutional leader with clean entry near pivot, risk controlled."
         elif trade_tier == "Tier 2 - High Quality, Wait Better Entry":
-            trade = "NO"
-            watchlist_flag = "YES"
-            if signal_state == "BUY NOW":
-                signal_state = "WATCH"
-            decision_reason = "TIER 2: strong leader but entry timing not ideal; wait for MA10/MA20 pullback."
+            if signal_state in {"BUY NOW", "EARLY POSITION"}:
+                trade = "YES"
+                watchlist_flag = "YES" if signal_state == "EARLY POSITION" else "NO"
+            else:
+                trade = "NO"
+                watchlist_flag = "YES"
+                decision_reason = "TIER 2: strong leader but entry timing not ideal; wait for MA10/MA20 pullback."
         elif trade_tier == "Tier 3 - Leadership Watchlist":
             trade = "NO"
             watchlist_flag = "YES"
-            if signal_state in {"BUY NOW", "BUY ON BREAKOUT"}:
+            if signal_state in {"BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT"}:
                 signal_state = "WATCH"
             elif signal_state == "REJECT" and not hard_reject:
                 signal_state = "WATCH"
@@ -5127,6 +5273,15 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "Decision Reason"] = decision_reason
         fixed.at[idx, "Trade Reason"] = decision_reason
         fixed.at[idx, "Watchlist Reason"] = "Already Trade YES" if trade == "YES" else decision_reason
+        fixed.at[idx, "Execution Confidence"] = execution_confidence_for_signal(
+            signal_state,
+            str(row.get("Breakout Alert", "")),
+            str(row.get("Volume Confirmation", "")),
+        )
+        fixed.at[idx, "Scanner Verdict"] = scanner_verdict_for_signal(signal_state, decision_reason)
+        for explain_col in ["Buy Criteria Passed", "Buy Criteria Failed", "Blocked By", "Downgrade Reason", "Upgrade Reason", "Missing Condition", "Suggested Action"]:
+            if explain_col not in fixed.columns or not str(row.get(explain_col, "")).strip():
+                fixed.at[idx, explain_col] = "None"
         fixed.at[idx, "Executable Grade"] = executable_grade
         fixed.at[idx, "Executable Score"] = round(float(executable_score), 1)
         fixed.at[idx, "Professional Score"] = round(float(professional_score), 1)
@@ -6155,29 +6310,49 @@ def build_scan_row(
             else "Good high-quality leader, but no clean trigger yet."
         )
 
-    buy_now_allowed = (
-        quality_grade in {"A+", "A"}
-        and final_score >= 85
-        and score_at_least(rs_score, 7)
-        and (vcp_tightness_score >= 7 or breakout_quality_score >= 8)
-        and pd.notna(risk_pct)
-        and risk_pct <= 10
-        and tradeability_score >= 6
-        and not extended_timing
-        and character_change_flag != "CHARACTER CHANGE"
-        and not hard_reject
-        and (volume_confirmation == "YES" or breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"})
+    buy_explainability = buy_setup_explainability(
+        adjusted_score=adjusted_score,
+        professional_score=professional_score,
+        rs_score=rs_score,
+        risk_pct=risk_pct,
+        leader_label=leader_label,
+        stage_label=stage_maturity_label,
+        character_change_flag=character_change_flag,
+        earnings_risk_label=earnings_label,
+        days_to_earnings=earnings_info.get("days_to_earnings"),
+        setup_type=setup_type,
+        ma10_distance=ma10_distance,
+        ma20_distance=ma20_distance,
+        hard_reject=hard_reject,
+        final_score=final_score,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
     )
-    if signal_state == "BUY NOW" and not buy_now_allowed:
-        if entry_timing in {"NEAR PIVOT", "BREAKOUT CONFIRMED"} and pd.notna(risk_pct) and risk_pct <= 10:
-            signal_state = "BUY ON BREAKOUT"
-        elif high_quality_leader and extended_timing:
+    if buy_explainability["actionable_buy_zone"] and not extended_timing:
+        signal_state = "BUY NOW"
+        trade = "YES"
+        watchlist_flag = "NO"
+        if buy_explainability["breakout_confirmed"] and buy_explainability["volume_confirmed"]:
+            decision_reason = "confirmed breakout with volume and controlled risk."
+        else:
+            decision_reason = "high-quality leader in actionable buy zone; no need to wait for perfect breakout."
+    elif buy_explainability["early_position_zone"] and not extended_timing:
+        signal_state = "EARLY POSITION"
+        trade = "YES"
+        watchlist_flag = "YES"
+        decision_reason = "high-quality leader; pilot position allowed before full breakout confirmation."
+    elif signal_state == "BUY NOW":
+        if high_quality_leader and extended_timing:
             signal_state = "WAIT PULLBACK"
+            decision_reason = "high-quality leader, but entry is extended or risk/reward is not clean enough; wait for MA10/MA20 reset."
+        elif entry_timing in {"NEAR PIVOT", "BREAKOUT CONFIRMED"} and pd.notna(risk_pct) and risk_pct <= 12:
+            signal_state = "BUY ON BREAKOUT"
+            decision_reason = "near trigger; wait for breakout volume or confirmation."
         else:
             signal_state = "WATCH"
+            decision_reason = "quality setup but no trigger yet."
         trade = "NO"
         watchlist_flag = "YES"
-        decision_reason = "Good stock, but execution trigger is not clean enough for BUY NOW."
 
     signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
         signal_state=signal_state,
@@ -6223,7 +6398,7 @@ def build_scan_row(
     )
     if not hard_reject and high_quality_leader and extended_timing and trade_tier == "Tier 4 - Avoid / Reject":
         trade_tier = "Tier 2 - High Quality, Wait Better Entry"
-    if signal_state in {"BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
+    if signal_state in {"BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"} and trade_tier == "Tier 4 - Avoid / Reject":
         trade_tier = "Tier 2 - High Quality, Wait Better Entry" if high_quality_leader else "Tier 3 - Leadership Watchlist"
     quality_score = calculate_quality_score(
         institutional_quality_score=institutional_quality_score,
@@ -6292,6 +6467,13 @@ def build_scan_row(
     signal_reason_detail = strip_executable_prefix(executable_reason)
     if signal_state == "BUY ON BREAKOUT":
         signal_reason_detail = "near trigger; wait for breakout confirmation before execution."
+    elif signal_state == "BUY NOW" and buy_explainability.get("actionable_buy_zone"):
+        if buy_explainability.get("breakout_confirmed") and buy_explainability.get("volume_confirmed"):
+            signal_reason_detail = "confirmed breakout with volume and controlled risk."
+        else:
+            signal_reason_detail = "high-quality leader in actionable buy zone; no need to wait for perfect breakout."
+    elif signal_state == "EARLY POSITION":
+        signal_reason_detail = "high-quality leader; pilot position allowed before full breakout confirmation."
     elif signal_state == "WATCH" and signal_reason_detail.lower().startswith(("hard reject", "failed setup", "character change", "entry is too late")):
         signal_reason_detail = "good setup or leader context, but no clean trigger yet."
     elif signal_state == "WAIT PULLBACK" and high_quality_leader and extended_timing:
@@ -6302,6 +6484,15 @@ def build_scan_row(
         signal_state,
         f"{signal_reason_detail} Entry timing: {entry_timing}. Stage: {stage_maturity_label}. Stock quality: {leader_label}, theme {theme_weight}/10.",
     )
+    execution_confidence = execution_confidence_for_signal(signal_state, breakout_alert, volume_confirmation)
+    scanner_verdict = scanner_verdict_for_signal(signal_state, decision_reason)
+    buy_criteria_passed = "; ".join(buy_explainability.get("passed", [])) or "None"
+    buy_criteria_failed = "; ".join(buy_explainability.get("failed", [])) or "None"
+    blocked_by = "; ".join(buy_explainability.get("blocked_by", ["None"])) or "None"
+    downgrade_reason = str(buy_explainability.get("downgrade_reason", "None"))
+    upgrade_reason = str(buy_explainability.get("upgrade_reason", "None"))
+    missing_condition = str(buy_explainability.get("missing_condition", "None"))
+    suggested_action = str(buy_explainability.get("suggested_action", "None"))
     action_readiness = action_readiness_label(
         trade_tier=trade_tier,
         signal_state=signal_state,
@@ -6403,6 +6594,15 @@ def build_scan_row(
         "Entry Quality Label": entry_quality_label,
         "Trade Tier": trade_tier,
         "Action Readiness Label": action_readiness,
+        "Execution Confidence": execution_confidence,
+        "Buy Criteria Passed": buy_criteria_passed,
+        "Buy Criteria Failed": buy_criteria_failed,
+        "Blocked By": blocked_by,
+        "Downgrade Reason": downgrade_reason,
+        "Upgrade Reason": upgrade_reason,
+        "Scanner Verdict": scanner_verdict,
+        "Missing Condition": missing_condition,
+        "Suggested Action": suggested_action,
         "Healthy Pullback Score": healthy_pullback_score,
         "Healthy Pullback Label": healthy_pullback_label,
         "Institutional Tightness Score": institutional_tightness_score,
@@ -6518,6 +6718,7 @@ def style_scan_table(row: pd.Series) -> List[str]:
         return ["background-color: #22c55e; color: #052e16; font-weight: 900"] * len(row)
     colors = {
         "BUY NOW": "background-color: #86efac; color: #052e16; font-weight: 800",
+        "EARLY POSITION": "background-color: #a7f3d0; color: #064e3b; font-weight: 760",
         "BUY ON BREAKOUT": "background-color: #bbf7d0; color: #14532d; font-weight: 750",
         "WATCH": "background-color: #fef9c3; color: #713f12; font-weight: 650",
         "WAIT PULLBACK": "background-color: #dbeafe; color: #1e3a8a; font-weight: 650",
@@ -10013,6 +10214,15 @@ def render_swing_scanner(
         "Entry Quality Score",
         "Trade Tier",
         "Action Readiness Label",
+        "Execution Confidence",
+        "Buy Criteria Passed",
+        "Buy Criteria Failed",
+        "Blocked By",
+        "Downgrade Reason",
+        "Upgrade Reason",
+        "Scanner Verdict",
+        "Missing Condition",
+        "Suggested Action",
         "Healthy Pullback Score",
         "Healthy Pullback Label",
         "Institutional Tightness Score",
@@ -10119,12 +10329,23 @@ def render_swing_scanner(
     metric_cols[4].metric("Stocks Passed", len(results))
     metric_cols[5].metric("Mode", st.session_state.get(f"{key_prefix}_last_scanner_mode_kind", "EOD Swing Scanner"))
 
-    state_summary_cols = st.columns(5)
+    state_summary_cols = st.columns(7)
     state_summary_cols[0].metric("BUY NOW", int((results["Signal State"] == "BUY NOW").sum()))
-    state_summary_cols[1].metric("BUY ON BREAKOUT", int((results["Signal State"] == "BUY ON BREAKOUT").sum()))
-    state_summary_cols[2].metric("WATCH", int((results["Signal State"] == "WATCH").sum()))
-    state_summary_cols[3].metric("EXTENDED", int((results["Signal State"] == "EXTENDED DO NOT CHASE").sum()))
-    state_summary_cols[4].metric("REJECT", int((results["Signal State"] == "REJECT").sum()))
+    state_summary_cols[1].metric("EARLY POSITION", int((results["Signal State"] == "EARLY POSITION").sum()))
+    state_summary_cols[2].metric("BUY ON BREAKOUT", int((results["Signal State"] == "BUY ON BREAKOUT").sum()))
+    state_summary_cols[3].metric("WATCH", int((results["Signal State"] == "WATCH").sum()))
+    state_summary_cols[4].metric("WAIT PULLBACK", int((results["Signal State"] == "WAIT PULLBACK").sum()))
+    state_summary_cols[5].metric("EXTENDED", int((results["Signal State"] == "EXTENDED DO NOT CHASE").sum()))
+    state_summary_cols[6].metric("REJECT", int((results["Signal State"] == "REJECT").sum()))
+
+    buy_now_count = int((results["Signal State"] == "BUY NOW").sum())
+    early_position_count = int((results["Signal State"] == "EARLY POSITION").sum())
+    if buy_now_count:
+        st.success("Best Action Today: There are actionable setups today.")
+    elif early_position_count:
+        st.info("Best Action Today: Only pilot-position setups today. Use smaller size.")
+    else:
+        st.info("Best Action Today: No clean entry today. Build watchlist and wait.")
 
     dashboard_cols = st.columns(7)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
@@ -10146,6 +10367,24 @@ def render_swing_scanner(
         st.warning(f"Data stale - refresh required: {stale_count} ticker(s) have latest candles older than one trading day.")
     if sync_error_count:
         st.error(f"Chart sync error: {sync_error_count} ticker(s) have quote/chart mismatch above 2%.")
+    if int((results["Trade"] == "YES").sum()) == 0:
+        st.warning("No BUY NOW today.")
+        blocked_text = results.get("Blocked By", pd.Series("", index=results.index)).astype(str)
+        failed_text = results.get("Buy Criteria Failed", pd.Series("", index=results.index)).astype(str)
+        timing_text = results.get("Entry Timing Label", pd.Series("", index=results.index)).astype(str)
+        blocker_counts = {
+            "Risk > 12%": int(failed_text.str.contains("Risk <= 12%", case=False, na=False).sum()),
+            "Extended MA10/MA20": int(timing_text.isin(["EXTENDED - WAIT", "TOO LATE"]).sum()),
+            "Earnings Risk": int(blocked_text.str.contains("Earnings Risk", case=False, na=False).sum()),
+            "Weak RS": int(failed_text.str.contains("RS >= 8", case=False, na=False).sum()),
+            "Character Change": int(blocked_text.str.contains("Character Change", case=False, na=False).sum()),
+            "Volume only": int(results.get("Missing Condition", pd.Series("", index=results.index)).astype(str).str.contains("Volume confirmation missing", case=False, na=False).sum()),
+        }
+        blocker_cols = st.columns(6)
+        for col, (label, count) in zip(blocker_cols, blocker_counts.items()):
+            col.metric(label, count)
+        if blocker_counts["Volume only"]:
+            st.warning("Scanner may be too strict if volume-only blocks many high-quality leaders.")
 
     qualified = results[
         (results["Setup Quality Grade"].isin(["A+", "A", "B"]))
@@ -10248,7 +10487,7 @@ def render_swing_scanner(
     if sector_filter != "All":
         visible = visible[visible["Sector Group"] == sector_filter]
     if only_ready_pullback:
-        visible = visible[visible["Signal State"].isin(["BUY NOW", "BUY ON BREAKOUT"]) | visible["Action Label"].isin(["PULLBACK ENTRY"])]
+        visible = visible[visible["Signal State"].isin(["BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT"]) | visible["Action Label"].isin(["PULLBACK ENTRY"])]
     if only_trade_watchlist:
         visible = visible[(visible["Trade"] == "YES") | (visible["WATCHLIST FLAG"] == "YES")]
     if hide_extended:
@@ -10273,6 +10512,7 @@ def render_swing_scanner(
     signal_priority = SIGNAL_STATE_PRIORITY
     quality_priority = {"A+": 0, "A": 1, "B": 2, "C": 3, "Reject": 4}
     visible["tier sort"] = visible.get("Trade Tier", pd.Series("", index=visible.index)).map(TRADE_TIER_PRIORITY).fillna(9)
+    visible["trade sort"] = np.where(visible["Trade"] == "YES", 0, 1)
     visible["signal sort"] = visible["Signal State"].map(signal_priority).fillna(9)
     visible["quality sort"] = visible["Setup Quality Grade"].map(quality_priority).fillna(9)
     visible["stage sort"] = visible.get("Stage Label", pd.Series("", index=visible.index)).map(STAGE_SORT_PRIORITY).fillna(9)
@@ -10298,18 +10538,15 @@ def render_swing_scanner(
     )
     visible = visible.sort_values(
         [
+            "trade sort",
             "signal sort",
-            "wait quality sort",
-            "Execution Score",
-            "Quality Score",
-            "quality sort",
-            "stage sort",
-            "Final Score",
-            "VCP Tightness Score",
-            "Tradeability Score",
+            "Adjusted Final Score",
+            "Professional Score",
             "RS Sort",
+            "Risk %",
+            "Breakout Quality Score",
         ],
-        ascending=[True, True, False, False, True, True, False, False, False, False],
+        ascending=[True, True, False, False, False, True, False],
     )
 
     compact_columns = [
@@ -10317,6 +10554,7 @@ def render_swing_scanner(
         "Sector / Industry",
         "close",
         "Signal State",
+        "Execution Confidence",
         "Setup Quality Grade",
         "Stage Label",
         "Pullback Quality",
@@ -10331,6 +10569,12 @@ def render_swing_scanner(
         "Stop Loss",
         "Ideal TP",
         "Decision Reason",
+        "Scanner Verdict",
+        "Buy Criteria Passed",
+        "Buy Criteria Failed",
+        "Blocked By",
+        "Upgrade Reason",
+        "Downgrade Reason",
         "Leader Quality Label",
         "Executable Grade",
         "Executable Score",
@@ -10347,6 +10591,8 @@ def render_swing_scanner(
         "Sector Leadership Status",
         "Trade Tier",
         "Action Readiness Label",
+        "Missing Condition",
+        "Suggested Action",
         "Professional Score",
         "Entry Quality Score",
         "Healthy Pullback Score",
@@ -10475,6 +10721,10 @@ def render_swing_scanner(
         ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
         ascending=[True, False, False, False, False, True],
     )
+    early_position_focus = focus_source[focus_source["Signal State"] == "EARLY POSITION"].sort_values(
+        ["quality sort", "Professional Score Sort", "Entry Quality Sort", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
+    )
     buy_breakout_focus = focus_source[focus_source["Signal State"] == "BUY ON BREAKOUT"].sort_values(
         ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
         ascending=[True, False, False, False, False, True],
@@ -10523,16 +10773,24 @@ def render_swing_scanner(
         ["Professional Score Sort", "Entry Quality Sort", "Institutional Quality Score", "RS Sort", "Risk %"],
         ascending=[False, False, False, False, True],
     )
+    almost_buy_focus = focus_source[
+        focus_source.get("Missing Condition", pd.Series("None", index=focus_source.index)).astype(str).ne("None")
+    ].sort_values(
+        ["Professional Score Sort", "Adjusted Final Score", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
+    )
 
     st.subheader("Daily Focus Summary")
     if buy_now_focus.empty:
         st.info("No clean BUY NOW today. Best action: wait. Watchlist candidates below.")
-    focus_cols = st.columns(3)
+    focus_cols = st.columns(4)
     with focus_cols[0]:
         show_focus_group("Top BUY NOW", buy_now_focus, "Decision Reason")
     with focus_cols[1]:
-        show_focus_group("Top BUY ON BREAKOUT", buy_breakout_focus, "Decision Reason")
+        show_focus_group("Top EARLY POSITION", early_position_focus, "Decision Reason")
     with focus_cols[2]:
+        show_focus_group("Top BUY ON BREAKOUT", buy_breakout_focus, "Decision Reason")
+    with focus_cols[3]:
         show_focus_group("Top Watchlist", watchlist_focus, "Decision Reason")
     extra_focus_cols = st.columns(3)
     with extra_focus_cols[0]:
@@ -10542,9 +10800,24 @@ def render_swing_scanner(
     with extra_focus_cols[2]:
         show_focus_group("Reject / Avoid", rejected_focus, "Decision Reason")
     show_focus_group("Closest To Action", closest_to_action_focus, "Decision Reason")
+    if not almost_buy_focus.empty:
+        st.subheader("Top Almost Buy Setups")
+        almost_buy_columns = [
+            "ticker",
+            "Sector / Industry",
+            "Signal State",
+            "Final Score",
+            "Adjusted Final Score",
+            "Professional Score",
+            "RS Score",
+            "Risk %",
+            "Missing Condition",
+            "Suggested Action",
+        ]
+        st.dataframe(round_display_values(almost_buy_focus.head(10)[almost_buy_columns]), width="stretch", hide_index=True)
 
     st.subheader("Action View")
-    actionable_states = ["BUY NOW", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"]
+    actionable_states = ["BUY NOW", "EARLY POSITION", "BUY ON BREAKOUT", "WATCH", "WAIT PULLBACK"]
     avoid_states = ["EXTENDED DO NOT CHASE", "REJECT"]
     action_view = visible[visible["Signal State"].isin(actionable_states)].copy()
     avoid_view = visible[visible["Signal State"].isin(avoid_states)].copy()
@@ -10554,6 +10827,7 @@ def render_swing_scanner(
     else:
         for state, expanded in [
             ("BUY NOW", True),
+            ("EARLY POSITION", True),
             ("BUY ON BREAKOUT", True),
             ("WATCH", True),
             ("WAIT PULLBACK", False),
