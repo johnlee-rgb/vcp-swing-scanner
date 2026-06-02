@@ -682,6 +682,7 @@ COMMON_SECTOR_OVERRIDES = {
 }
 for symbol, metadata in COMMON_SECTOR_OVERRIDES.items():
     MANUAL_SECTOR_MAP[symbol] = metadata
+MANUAL_SECTOR_FALLBACK = MANUAL_SECTOR_MAP
 
 MARKET_TICKERS = [
     "SPY",
@@ -1117,7 +1118,7 @@ def download_sector_industry(tickers: Tuple[str, ...]) -> Dict[str, dict]:
 
 def fallback_sector_industry_one(ticker: str) -> dict:
     """Return instant manual sector metadata without touching yfinance."""
-    sector, industry = MANUAL_SECTOR_MAP.get(ticker.upper(), ("N/A", "N/A"))
+    sector, industry = MANUAL_SECTOR_FALLBACK.get(normalize_manual_sector_ticker(ticker), ("N/A", "N/A"))
     if ticker.endswith(".HK") and sector == "N/A":
         sector, industry = "Hong Kong", "HK liquid leader"
     if sector == "N/A" and industry == "N/A":
@@ -1134,6 +1135,42 @@ def fallback_sector_industry_one(ticker: str) -> dict:
         "sector_industry": display,
         "sector_group": classify_sector_group(ticker, sector, industry),
         "theme_group": classify_theme_group(ticker, sector, industry),
+    }
+
+
+def normalize_manual_sector_ticker(ticker: object) -> str:
+    """Normalize scanner ticker symbols before manual sector fallback lookup."""
+    symbol = str(ticker or "").strip().upper()
+    if not symbol:
+        return ""
+    symbol = symbol.split()[0]
+    if "." in symbol and not symbol.endswith(".HK"):
+        symbol = symbol.split(".", 1)[0]
+    return symbol
+
+
+def is_missing_sector_value(value: object) -> bool:
+    """Treat common placeholder strings as missing sector metadata."""
+    if value is None:
+        return True
+    text = str(value).strip()
+    lowered = text.lower()
+    return lowered == "" or lowered in {"n/a", "na", "nan", "none", "null", "n/a / n/a", "nan / nan", "none / none", "null / null"}
+
+
+def manual_sector_fallback_display(ticker: object) -> dict:
+    """Return manual fallback sector fields for final display/export repair."""
+    symbol = normalize_manual_sector_ticker(ticker)
+    sector, industry = MANUAL_SECTOR_FALLBACK.get(symbol, ("N/A", "N/A"))
+    if sector == "N/A" and industry == "N/A":
+        return {}
+    display = industry if sector == "N/A" else sector if industry == "N/A" else f"{sector} / {industry}"
+    return {
+        "sector": sector,
+        "industry": industry,
+        "sector_industry": display,
+        "sector_group": classify_sector_group(symbol, sector, industry),
+        "theme_group": classify_theme_group(symbol, sector, industry),
     }
 
 
@@ -5098,6 +5135,13 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         character_change_value = str(row.get("Character Change Flag", "NONE"))
         tradeability_score = numeric_or_na(row.get("Tradeability Score"))
         price_above_ma20 = numeric_or_na(row.get("close")) >= numeric_or_na(row.get("MA20", row.get("close"))) if pd.notna(numeric_or_na(row.get("close"))) else False
+        sector_fallback = manual_sector_fallback_display(row.get("ticker", ""))
+        if sector_fallback and is_missing_sector_value(row.get("Sector / Industry")):
+            fixed.at[idx, "Sector / Industry"] = sector_fallback["sector_industry"]
+            fixed.at[idx, "Sector Raw"] = sector_fallback["sector"]
+            fixed.at[idx, "Industry Raw"] = sector_fallback["industry"]
+            fixed.at[idx, "Sector Group"] = sector_fallback["sector_group"]
+            fixed.at[idx, "Theme Group"] = sector_fallback["theme_group"]
 
         if pd.notna(final_score):
             capped_final_score = min(float(final_score), timing_score_cap(entry_timing_value))
