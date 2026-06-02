@@ -667,6 +667,16 @@ COMMON_SECTOR_OVERRIDES = {
     "AA": ("Basic Materials", "Aluminum"),
     "TGT": ("Consumer Defensive", "Discount Stores"),
     "FCX": ("Basic Materials", "Copper"),
+    "MTCH": ("Communication Services", "Internet Content & Information"),
+    "CARR": ("Industrials", "Building Products & Equipment"),
+    "LUMN": ("Communication Services", "Telecom Services"),
+    "ETSY": ("Consumer Cyclical", "Internet Retail"),
+    "DXCM": ("Healthcare", "Medical Devices"),
+    "AAL": ("Industrials", "Airlines"),
+    "LUV": ("Industrials", "Airlines"),
+    "ODFL": ("Industrials", "Trucking"),
+    "ILMN": ("Healthcare", "Diagnostics & Research"),
+    "XPO": ("Industrials", "Trucking / Logistics"),
 }
 for symbol, metadata in COMMON_SECTOR_OVERRIDES.items():
     MANUAL_SECTOR_MAP.setdefault(symbol, metadata)
@@ -3075,9 +3085,17 @@ def classify_pullback_quality(
         and recent["Volume"].tail(3).mean() <= recent["Volume"].mean()
     )
     recently_extended = len(data) >= 10 and ((data["Close"].tail(10) / data["MA20"].tail(10) - 1) * 100).max() > 20
+    low_risk_near_ma10 = pd.notna(risk_pct) and risk_pct <= 8 and pd.notna(close) and pd.notna(ma10) and abs(ma10_distance) <= 3 and close >= ma10 * 0.98
+    low_risk_near_ma20 = pd.notna(risk_pct) and risk_pct <= 8 and pd.notna(close) and pd.notna(ma20) and abs(ma20_distance) <= 4 and close >= ma20 * 0.98
 
     if character_change_flag == "CHARACTER CHANGE":
         return "CLIMAX PULLBACK" if recently_extended else "HIGH RISK PULLBACK"
+    if low_risk_near_ma10 and volume_controlled:
+        return "CLEAN MA10 PULLBACK"
+    if low_risk_near_ma20 and volume_controlled:
+        return "CLEAN MA20 RESET"
+    if low_risk_near_ma10 or low_risk_near_ma20:
+        return "NORMAL PULLBACK"
     if recently_extended and pd.notna(rsi) and rsi > 75 and (wide_red or weak_close):
         return "CLIMAX PULLBACK"
     if wide_red or weak_close or (pd.notna(risk_pct) and risk_pct > 12):
@@ -5106,6 +5124,23 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             and adjusted_score_value >= 80
             and not hard_reject
         )
+        soft_reject_protected_institutional = (
+            leader_label_value == "INSTITUTIONAL LEADER"
+            and pd.notna(adjusted_score_value)
+            and adjusted_score_value >= 90
+            and pd.notna(risk_pct)
+            and risk_pct <= 12
+            and character_change_value == "NONE"
+            and stage_label_value not in {"FAILED STAGE", "CLIMAX / PARABOLIC"}
+        )
+        earnings_only_reject = hard_reject and "earnings risk" in str(row.get("Hard Reject Reason", "")).lower()
+        if earnings_only_reject and soft_reject_protected_institutional:
+            hard_reject = False
+            signal_state = "WATCH"
+            trade = "NO"
+            watchlist_flag = "YES"
+            trade_tier = "Tier 2 - High Quality, Wait Better Entry" if professional_score >= 72 else trade_tier
+            decision_reason = "WATCH: institutional leader with strong score, but earnings risk is near; wait through earnings or use alert only."
         if signal_state == "REJECT" and protected_high_quality_leader:
             if entry_timing_value in {"EXTENDED - WAIT", "TOO LATE"} or stage_label_value in {"LATE STAGE 2", "CLIMAX / PARABOLIC"}:
                 signal_state = "WAIT PULLBACK"
@@ -5113,6 +5148,13 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
             else:
                 signal_state = "WATCH"
                 decision_reason = "WATCH: good high-quality leader, but no clean trigger yet."
+        if signal_state == "REJECT" and soft_reject_protected_institutional and not hard_reject:
+            if entry_timing_value in {"EXTENDED - WAIT", "TOO LATE"} or stage_label_value == "LATE STAGE 2":
+                signal_state = "WAIT PULLBACK"
+                decision_reason = "WAIT PULLBACK: high-quality institutional leader, but entry is extended; wait for MA10/MA20 reset."
+            else:
+                signal_state = "WATCH"
+                decision_reason = "WATCH: institutional leader with strong score; wait for trigger or earnings clarity."
         if signal_state == "REJECT" and protected and not hard_reject:
             if pd.notna(risk_pct) and risk_pct > 12:
                 signal_state = "WAIT PULLBACK"
@@ -5301,6 +5343,8 @@ def validate_scan_results(frame: pd.DataFrame) -> pd.DataFrame:
         fixed.at[idx, "WATCHLIST FLAG"] = watchlist_flag
         if hard_reject:
             fixed.at[idx, "Hard Reject"] = "YES"
+        else:
+            fixed.at[idx, "Hard Reject"] = "NO"
         fixed.at[idx, "Decision Reason"] = decision_reason
         fixed.at[idx, "Trade Reason"] = decision_reason
         fixed.at[idx, "Watchlist Reason"] = "Already Trade YES" if trade == "YES" else decision_reason
@@ -6314,6 +6358,23 @@ def build_scan_row(
         and not hard_reject
     )
     extended_timing = entry_timing in {"EXTENDED - WAIT", "TOO LATE"} or stage_maturity_label in {"LATE STAGE 2", "CLIMAX / PARABOLIC"}
+    earnings_only_hard_reject = hard_reject and "earnings risk" in str(hard_reject_reason).lower()
+    protect_institutional_leader_from_soft_reject = (
+        leader_label == "INSTITUTIONAL LEADER"
+        and pd.notna(adjusted_score)
+        and adjusted_score >= 90
+        and pd.notna(risk_pct)
+        and risk_pct <= 12
+        and character_change_flag == "NONE"
+        and stage_maturity_label not in {"FAILED STAGE", "CLIMAX / PARABOLIC"}
+    )
+    if earnings_only_hard_reject and protect_institutional_leader_from_soft_reject:
+        hard_reject = False
+        hard_reject_reason = ""
+        signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "WATCH: institutional leader with strong score, but earnings risk is near; wait through earnings or use alert only."
     if character_change_flag == "CHARACTER CHANGE" or stage_maturity_label == "FAILED STAGE":
         hard_reject = True
         signal_state = "REJECT"
@@ -6340,6 +6401,15 @@ def build_scan_row(
             "High-quality leader, but entry is extended. Wait for MA10/MA20 reset or tight base."
             if extended_timing
             else "Good high-quality leader, but no clean trigger yet."
+        )
+    elif protect_institutional_leader_from_soft_reject and signal_state == "REJECT" and not hard_reject:
+        signal_state = "WAIT PULLBACK" if extended_timing else "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = (
+            "High-quality institutional leader, but entry is extended; wait for MA10/MA20 reset."
+            if extended_timing
+            else "WATCH: institutional leader with strong score; wait for trigger or earnings clarity."
         )
 
     buy_explainability = buy_setup_explainability(
@@ -10384,6 +10454,25 @@ def render_swing_scanner(
         st.info("Best Action Today: Only pilot-position setups today. Use smaller size.")
     else:
         st.info("Best Action Today: No clean entry today. Build watchlist and wait.")
+    if buy_now_count == 1:
+        st.info("Only 1 clean BUY NOW today. Stay selective.")
+
+    def best_state_summary(label: str, states: List[str]) -> str:
+        state_rows = results[results["Signal State"].isin(states)].copy()
+        if state_rows.empty:
+            return "None"
+        state_rows["_summary_score"] = pd.to_numeric(state_rows.get("Adjusted Final Score"), errors="coerce").fillna(0)
+        state_rows["_summary_professional"] = pd.to_numeric(state_rows.get("Professional Score"), errors="coerce").fillna(0)
+        state_rows["_summary_rs"] = pd.to_numeric(state_rows.get("RS Score Raw", state_rows.get("RS Score")), errors="coerce").fillna(0)
+        best = state_rows.sort_values(["_summary_score", "_summary_professional", "_summary_rs"], ascending=[False, False, False]).iloc[0]
+        return f"{best.get('ticker', 'N/A')} ({best.get('Signal State', label)})"
+
+    best_summary_cols = st.columns(5)
+    best_summary_cols[0].metric("Best BUY NOW", best_state_summary("BUY NOW", ["BUY NOW"]))
+    best_summary_cols[1].metric("Best EARLY POSITION", best_state_summary("EARLY POSITION", ["EARLY POSITION"]))
+    best_summary_cols[2].metric("Best WATCH", best_state_summary("WATCH", ["WATCH"]))
+    best_summary_cols[3].metric("Best WAIT PULLBACK", best_state_summary("WAIT PULLBACK", ["WAIT PULLBACK"]))
+    best_summary_cols[4].metric("Best AVOID", best_state_summary("AVOID", ["EXTENDED DO NOT CHASE", "REJECT"]))
 
     dashboard_cols = st.columns(7)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
