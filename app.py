@@ -654,7 +654,7 @@ COMMON_SECTOR_OVERRIDES = {
     "MS": ("Financial Services", "Capital Markets"),
     "WELL": ("Real Estate", "Healthcare REIT"),
     "CNC": ("Healthcare", "Healthcare Plans"),
-    "MNST": ("Consumer Defensive", "Beverages - Non-Alcoholic"),
+    "MNST": ("Consumer Defensive", "Beverages"),
     "ELV": ("Healthcare", "Healthcare Plans"),
     "HUM": ("Healthcare", "Healthcare Plans"),
     "CVS": ("Healthcare", "Healthcare Plans / Pharmacy"),
@@ -662,24 +662,26 @@ COMMON_SECTOR_OVERRIDES = {
     "STLD": ("Basic Materials", "Steel"),
     "DAL": ("Industrials", "Airlines"),
     "CNI": ("Industrials", "Railroads"),
-    "CROX": ("Consumer Cyclical", "Footwear & Accessories"),
+    "CROX": ("Consumer Cyclical", "Footwear"),
     "NUE": ("Basic Materials", "Steel"),
     "AA": ("Basic Materials", "Aluminum"),
     "TGT": ("Consumer Defensive", "Discount Stores"),
     "FCX": ("Basic Materials", "Copper"),
-    "MTCH": ("Communication Services", "Internet Content & Information"),
-    "CARR": ("Industrials", "Building Products & Equipment"),
-    "LUMN": ("Communication Services", "Telecom Services"),
+    "MTCH": ("Communication Services", "Internet Content"),
+    "CARR": ("Industrials", "Building Products"),
+    "LUMN": ("Communication Services", "Telecom"),
     "ETSY": ("Consumer Cyclical", "Internet Retail"),
     "DXCM": ("Healthcare", "Medical Devices"),
     "AAL": ("Industrials", "Airlines"),
     "LUV": ("Industrials", "Airlines"),
     "ODFL": ("Industrials", "Trucking"),
     "ILMN": ("Healthcare", "Diagnostics & Research"),
-    "XPO": ("Industrials", "Trucking / Logistics"),
+    "XPO": ("Industrials", "Trucking"),
+    "CMC": ("Basic Materials", "Steel"),
+    "A": ("Healthcare", "Diagnostics & Research"),
 }
 for symbol, metadata in COMMON_SECTOR_OVERRIDES.items():
-    MANUAL_SECTOR_MAP.setdefault(symbol, metadata)
+    MANUAL_SECTOR_MAP[symbol] = metadata
 
 MARKET_TICKERS = [
     "SPY",
@@ -4960,6 +4962,19 @@ def buy_setup_explainability(
 
     setup_quality_ok = setup_quality_grade not in {"C", "Reject"}
     pullback_quality_ok = pullback_quality != "HIGH RISK PULLBACK"
+    professional_flex_ok = (
+        pd.notna(professional_value)
+        and professional_value > 75
+        and pd.notna(adjusted_value)
+        and adjusted_value >= 90
+        and pd.notna(rs_value)
+        and rs_value >= 8
+        and pd.notna(risk_value)
+        and risk_value <= 12
+        and setup_quality_grade in {"A+", "A", "B"}
+        and stage_label in {"EARLY STAGE 2", "MID STAGE 2"}
+        and character_change_flag == "NONE"
+    )
     criteria = [
         ("Adjusted Final Score >= 90", "Adjusted Final Score below 90", pd.notna(adjusted_value) and adjusted_value >= 90),
         ("Professional Score >= 85", "Professional Score below 85", pd.notna(professional_value) and professional_value >= 85),
@@ -4975,6 +4990,7 @@ def buy_setup_explainability(
     passed = [pass_label for pass_label, _, ok in criteria if ok]
     failed = [fail_label for _, fail_label, ok in criteria if not ok]
     actionable_buy_zone = not strict_blockers and not failed
+    soft_professional_only_block = failed == ["Professional Score below 85"] and professional_flex_ok
 
     early_setup_ok = setup_type in {
         "EARLY VCP",
@@ -4992,7 +5008,7 @@ def buy_setup_explainability(
     )
     early_criteria = [
         ("Adjusted Final Score below 85", pd.notna(adjusted_value) and adjusted_value >= 85),
-        ("Professional Score below 80", pd.notna(professional_value) and professional_value >= 80),
+        ("Professional Score below 75", pd.notna(professional_value) and professional_value >= 75),
         ("RS below 7", pd.notna(rs_value) and rs_value >= 7),
         ("Risk above 13%", pd.notna(risk_value) and risk_value <= 13),
         ("Leader quality not eligible", leader_ok),
@@ -5001,7 +5017,7 @@ def buy_setup_explainability(
         ("Hard reject, character change, or earnings risk", not hard_reject and character_change_flag != "CHARACTER CHANGE" and not earnings_block),
     ]
     early_failed = [label for label, ok in early_criteria if not ok]
-    early_position_zone = not strict_blockers and not early_failed
+    early_position_zone = not strict_blockers and (not early_failed or soft_professional_only_block)
     breakout_confirmed = breakout_alert in {"CONFIRMED BREAKOUT", "BREAKOUT IN PROGRESS"}
     volume_confirmed = volume_confirmation == "YES"
     volume_only_block = (not actionable_buy_zone) and len(failed) == 0 and not volume_confirmed
@@ -5011,6 +5027,8 @@ def buy_setup_explainability(
         missing_condition = failed[0]
     elif volume_only_block:
         missing_condition = "Volume confirmation missing"
+    elif soft_professional_only_block:
+        missing_condition = "Professional Score slightly below ideal"
     elif len(early_failed) == 1:
         missing_condition = early_failed[0]
 
@@ -5023,6 +5041,8 @@ def buy_setup_explainability(
         suggested_action = "wait MA10/MA20 reset"
     elif missing_condition != "None":
         suggested_action = "watch for the missing condition to improve"
+    if missing_condition == "Professional Score slightly below ideal":
+        suggested_action = "use smaller position or wait for confirmation"
 
     return {
         "actionable_buy_zone": actionable_buy_zone,
@@ -6447,6 +6467,8 @@ def build_scan_row(
         watchlist_flag = "YES"
         if quality_guard_blocks_buy_now:
             decision_reason = "quality guard blocks full BUY NOW; pilot position only or wait for breakout confirmation."
+        elif buy_explainability.get("missing_condition") == "Professional Score slightly below ideal":
+            decision_reason = "Professional Score slightly below ideal; use smaller position or wait for confirmation."
         else:
             decision_reason = "high-quality leader; pilot position allowed before full breakout confirmation."
     elif signal_state == "BUY NOW":
@@ -10448,23 +10470,31 @@ def render_swing_scanner(
 
     buy_now_count = int((results["Signal State"] == "BUY NOW").sum())
     early_position_count = int((results["Signal State"] == "EARLY POSITION").sum())
+    wait_extended_count = int(results["Signal State"].isin(["WAIT PULLBACK", "EXTENDED DO NOT CHASE"]).sum())
     if buy_now_count:
-        st.success("Best Action Today: There are actionable setups today.")
+        st.success("Action today: There are actionable setups. Focus on BUY NOW first, then EARLY POSITION.")
     elif early_position_count:
-        st.info("Best Action Today: Only pilot-position setups today. Use smaller size.")
+        st.info("Action today: No full-size BUY NOW. Pilot positions only.")
     else:
-        st.info("Best Action Today: No clean entry today. Build watchlist and wait.")
+        st.info("Action today: No clean entry. Build watchlist and wait.")
+    if wait_extended_count >= max(5, len(results) // 4):
+        st.info("Market condition: Many leaders are extended. Wait for MA10/MA20 reset.")
     if buy_now_count == 1:
         st.info("Only 1 clean BUY NOW today. Stay selective.")
 
-    def best_state_summary(label: str, states: List[str]) -> str:
+    def best_state_row(states: List[str]) -> pd.Series | None:
         state_rows = results[results["Signal State"].isin(states)].copy()
         if state_rows.empty:
-            return "None"
+            return None
         state_rows["_summary_score"] = pd.to_numeric(state_rows.get("Adjusted Final Score"), errors="coerce").fillna(0)
         state_rows["_summary_professional"] = pd.to_numeric(state_rows.get("Professional Score"), errors="coerce").fillna(0)
         state_rows["_summary_rs"] = pd.to_numeric(state_rows.get("RS Score Raw", state_rows.get("RS Score")), errors="coerce").fillna(0)
-        best = state_rows.sort_values(["_summary_score", "_summary_professional", "_summary_rs"], ascending=[False, False, False]).iloc[0]
+        return state_rows.sort_values(["_summary_score", "_summary_professional", "_summary_rs"], ascending=[False, False, False]).iloc[0]
+
+    def best_state_summary(label: str, states: List[str]) -> str:
+        best = best_state_row(states)
+        if best is None:
+            return "None"
         return f"{best.get('ticker', 'N/A')} ({best.get('Signal State', label)})"
 
     best_summary_cols = st.columns(5)
@@ -10473,6 +10503,66 @@ def render_swing_scanner(
     best_summary_cols[2].metric("Best WATCH", best_state_summary("WATCH", ["WATCH"]))
     best_summary_cols[3].metric("Best WAIT PULLBACK", best_state_summary("WAIT PULLBACK", ["WAIT PULLBACK"]))
     best_summary_cols[4].metric("Best AVOID", best_state_summary("AVOID", ["EXTENDED DO NOT CHASE", "REJECT"]))
+
+    def short_reason(row: pd.Series | None) -> str:
+        if row is None:
+            return "None"
+        return str(row.get("Scanner Verdict", row.get("Decision Reason", "N/A")))
+
+    summary_rows = []
+    for label, states in [
+        ("Best BUY NOW", ["BUY NOW"]),
+        ("Best EARLY POSITION", ["EARLY POSITION"]),
+        ("Best BUY ON BREAKOUT", ["BUY ON BREAKOUT"]),
+        ("Best WATCH", ["WATCH"]),
+        ("Best WAIT PULLBACK", ["WAIT PULLBACK"]),
+        ("Best AVOID", ["EXTENDED DO NOT CHASE", "REJECT"]),
+    ]:
+        row = best_state_row(states)
+        summary_rows.append(
+            {
+                "Category": label,
+                "Ticker": row.get("ticker", "None") if row is not None else "None",
+                "Reason": short_reason(row),
+                "Risk %": row.get("Risk %", "N/A") if row is not None else "N/A",
+                "Entry Trigger": row.get("Entry Trigger", "N/A") if row is not None else "N/A",
+                "Stop Loss": row.get("Stop Loss", "N/A") if row is not None else "N/A",
+                "Pivot / Breakout Trigger": row.get("Pivot", row.get("Entry Trigger", "N/A")) if row is not None else "N/A",
+            }
+        )
+    st.subheader("Summary Dashboard")
+    st.dataframe(round_display_values(pd.DataFrame(summary_rows)), width="stretch", hide_index=True)
+
+    def best_theme_row(keywords: List[str]) -> str:
+        text = (
+            results.get("Sector / Industry", pd.Series("", index=results.index)).astype(str)
+            + " "
+            + results.get("Sector Group", pd.Series("", index=results.index)).astype(str)
+            + " "
+            + results.get("Theme Group", pd.Series("", index=results.index)).astype(str)
+        ).str.lower()
+        mask = pd.Series(False, index=results.index)
+        for keyword in keywords:
+            mask = mask | text.str.contains(keyword, case=False, na=False)
+        theme_rows = results[mask].copy()
+        if theme_rows.empty:
+            return "None"
+        theme_rows["_summary_score"] = pd.to_numeric(theme_rows.get("Adjusted Final Score"), errors="coerce").fillna(0)
+        theme_rows["_summary_quality"] = pd.to_numeric(theme_rows.get("Quality Score"), errors="coerce").fillna(0)
+        theme_rows["_summary_rs"] = pd.to_numeric(theme_rows.get("RS Score Raw", theme_rows.get("RS Score")), errors="coerce").fillna(0)
+        best = theme_rows.sort_values(["_summary_score", "_summary_quality", "_summary_rs"], ascending=[False, False, False]).iloc[0]
+        return f"{best.get('ticker', 'N/A')} ({best.get('Signal State', 'N/A')})"
+
+    sector_summary_cols = st.columns(4)
+    sector_summary_cols[0].metric("Best Semiconductor", best_theme_row(["semi", "chip"]))
+    sector_summary_cols[1].metric("Best AI Infrastructure", best_theme_row(["ai infrastructure", "data center", "electrical equipment"]))
+    sector_summary_cols[2].metric("Best Software", best_theme_row(["software"]))
+    sector_summary_cols[3].metric("Best Cybersecurity", best_theme_row(["cyber"]))
+    sector_summary_cols_2 = st.columns(4)
+    sector_summary_cols_2[0].metric("Best Financial", best_theme_row(["financial", "capital markets", "bank"]))
+    sector_summary_cols_2[1].metric("Best Healthcare", best_theme_row(["health", "medical", "diagnostics"]))
+    sector_summary_cols_2[2].metric("Best Energy", best_theme_row(["energy", "oil", "gas", "uranium", "nuclear"]))
+    sector_summary_cols_2[3].metric("Best Industrial", best_theme_row(["industrial", "railroad", "airlines", "trucking", "building products"]))
 
     dashboard_cols = st.columns(7)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
@@ -10665,15 +10755,14 @@ def render_swing_scanner(
     )
     visible = visible.sort_values(
         [
-            "trade sort",
             "signal sort",
             "Adjusted Final Score",
-            "Professional Score",
+            "Quality Score",
             "RS Sort",
             "Risk %",
-            "Breakout Quality Score",
+            "Execution Score",
         ],
-        ascending=[True, True, False, False, False, True, False],
+        ascending=[True, False, False, False, True, False],
     )
 
     compact_columns = [
