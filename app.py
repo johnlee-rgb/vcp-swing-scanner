@@ -4334,6 +4334,93 @@ def risk_reward_efficiency_score(risk_pct: float, ideal_r: float, tp_type: str) 
     return int(min(max(score, 0), 10))
 
 
+def active_entry_zone(latest: pd.Series, pivot: PivotInfo) -> Tuple[float, str, float, float]:
+    """Choose the current actionable entry zone instead of chasing an old pivot."""
+    close = numeric_or_na(latest.get("Close"))
+    pivot_value = numeric_or_na(pivot.pivot)
+    ma10 = numeric_or_na(latest.get("MA10"))
+    if pd.isna(close):
+        return np.nan, "NO ACTIVE ENTRY", np.nan, np.nan
+    original_pivot = pivot_value if pd.notna(pivot_value) else np.nan
+    if pd.notna(pivot_value) and close <= pivot_value * 1.03:
+        active_entry = pivot_value
+        entry_type = "BREAKOUT ENTRY"
+    elif pd.notna(ma10) and close <= ma10 * 1.05:
+        active_entry = ma10
+        entry_type = "MA10 PULLBACK ENTRY"
+    elif pd.notna(ma10):
+        active_entry = ma10
+        entry_type = "WAIT MA10 RESET"
+    elif pd.notna(pivot_value):
+        active_entry = pivot_value
+        entry_type = "WAIT RESET"
+    else:
+        active_entry = close
+        entry_type = "NO ACTIVE ENTRY"
+    distance_active = (close / active_entry - 1) * 100 if pd.notna(active_entry) and active_entry > 0 else np.nan
+    distance_pivot = (close / pivot_value - 1) * 100 if pd.notna(pivot_value) and pivot_value > 0 else np.nan
+    return round(float(active_entry), 2), entry_type, round(float(distance_active), 2) if pd.notna(distance_active) else np.nan, round(float(distance_pivot), 2) if pd.notna(distance_pivot) else np.nan
+
+
+def calculate_core_trade_score(
+    *,
+    latest: pd.Series,
+    trend_score: int,
+    technical_score: int,
+    higher_low_structure: bool,
+    vcp_status: str,
+    tightness_score: int,
+    vcp_tightness_score: int,
+    rs_score: float,
+    volume_confirmation: str,
+    volume_dry_up: bool,
+    breakout_quality_score: int,
+    risk_pct: float,
+    ideal_r: float,
+    tp_type: str,
+) -> float:
+    """Pure trading score: price action, base quality, RS, volume, and reward/risk."""
+    close = numeric_or_na(latest.get("Close"))
+    ma10 = numeric_or_na(latest.get("MA10"))
+    ma20 = numeric_or_na(latest.get("MA20"))
+    ma50 = numeric_or_na(latest.get("MA50"))
+    ma_alignment_points = 0
+    if all(pd.notna(value) for value in [close, ma10, ma20, ma50]):
+        if close > ma10:
+            ma_alignment_points += 1
+        if close > ma20:
+            ma_alignment_points += 1
+        if close > ma50:
+            ma_alignment_points += 1
+        if ma10 >= ma20 >= ma50:
+            ma_alignment_points += 1
+    if higher_low_structure:
+        ma_alignment_points += 1
+    price_action_score = min(10, (trend_score / 7) * 4 + (technical_score / 8) * 3 + ma_alignment_points * 0.6)
+
+    vcp_bonus = 2 if vcp_status in {"VALID VCP", "EARLY VCP"} else 0
+    base_quality_score = min(10, max(float(vcp_tightness_score), float(tightness_score) * 2) + vcp_bonus)
+
+    rs_component = min(max(float(rs_score), 0), 10) if pd.notna(rs_score) else 0
+
+    volume_score = 0
+    if volume_dry_up:
+        volume_score += 4
+    if volume_confirmation == "YES":
+        volume_score += 4
+    volume_score += min(2, max(0, breakout_quality_score - 6) * 0.5)
+
+    rr_score = risk_reward_efficiency_score(risk_pct, ideal_r, tp_type)
+    score = (
+        price_action_score * 10 * 0.40
+        + base_quality_score * 10 * 0.25
+        + rs_component * 10 * 0.15
+        + volume_score * 10 * 0.10
+        + rr_score * 10 * 0.10
+    )
+    return round(float(min(max(score, 0), 100)), 1)
+
+
 def calculate_professional_score(
     *,
     institutional_quality_score: int,
@@ -5766,7 +5853,7 @@ def build_scan_row(
         technical_score=technical_score,
         trend_score=trend_score,
         final_score=final_score,
-        risk_pct=risk_pct,
+        risk_pct=trade_risk_pct,
         rr_score=rr_score,
         extended=extended,
         earnings_risk=earnings_risk,
@@ -6398,6 +6485,32 @@ def build_scan_row(
         stop=stop,
         ma10_distance=ma10_distance,
     )
+    original_pivot, active_entry, active_entry_type, distance_from_active_entry_pct, distance_from_pivot_pct = (
+        pivot.pivot,
+        *active_entry_zone(latest, pivot),
+    )
+    active_risk_pct = (
+        (active_entry - stop) / active_entry * 100
+        if pd.notna(active_entry) and active_entry > 0 and pd.notna(stop) and active_entry > stop
+        else np.nan
+    )
+    trade_risk_pct = round(float(active_risk_pct), 2) if pd.notna(active_risk_pct) else risk_pct
+    core_trade_score = calculate_core_trade_score(
+        latest=latest,
+        trend_score=trend_score,
+        technical_score=technical_score,
+        higher_low_structure=higher_low_structure,
+        vcp_status=vcp.status,
+        tightness_score=tightness_score,
+        vcp_tightness_score=vcp_tightness_score,
+        rs_score=rs_score,
+        volume_confirmation=volume_confirmation,
+        volume_dry_up=vcp.volume_contraction,
+        breakout_quality_score=breakout_quality_score,
+        risk_pct=trade_risk_pct,
+        ideal_r=ideal_r,
+        tp_type=tp_type,
+    )
 
     final_score = int(min(max(final_score + stage_score_adjustment(stage_maturity_label), 0), 100))
     final_score = min(final_score, timing_score_cap(entry_timing))
@@ -6480,7 +6593,7 @@ def build_scan_row(
         adjusted_score=adjusted_score,
         professional_score=professional_score,
         rs_score=rs_score,
-        risk_pct=risk_pct,
+        risk_pct=trade_risk_pct,
         leader_label=leader_label,
         stage_label=stage_maturity_label,
         character_change_flag=character_change_flag,
@@ -6527,6 +6640,88 @@ def build_scan_row(
             decision_reason = "quality setup but no trigger yet."
         trade = "NO"
         watchlist_flag = "YES"
+
+    earnings_days = numeric_or_na(earnings_info.get("days_to_earnings"))
+    earnings_high_soon = earnings_label == "HIGH RISK" and pd.notna(earnings_days) and earnings_days <= 7
+    active_entry_extended = pd.notna(distance_from_active_entry_pct) and distance_from_active_entry_pct > 5
+    ma10_extended_for_entry = pd.notna(ma10_distance) and ma10_distance > 5
+    near_breakout_trigger = (
+        (pd.notna(distance_from_pivot_pct) and -3 <= distance_from_pivot_pct <= 0)
+        or (pd.notna(resistance_distance_pct) and 0 <= resistance_distance_pct <= 3)
+        or breakout_alert in {"NEAR BREAKOUT", "BREAKOUT IN PROGRESS"}
+    )
+    poor_structure = (
+        action == "FAILED"
+        or current_setup_status in {"FAILED", "FAILED BREAKOUT"}
+        or quality_grade == "Reject"
+        or stage_maturity_label in {"FAILED STAGE", "STAGE 1 / NOT READY"}
+    )
+    hard_core_block = (
+        hard_reject
+        or character_change_flag == "CHARACTER CHANGE"
+        or stage_maturity_label == "FAILED STAGE"
+        or (pd.notna(trade_risk_pct) and trade_risk_pct > 18)
+        or (pd.notna(rs_score) and rs_score < 4)
+        or (float(latest["Close"]) < float(latest["MA50"]) and pd.notna(rs_score) and rs_score < 6)
+        or earnings_high_soon
+    )
+    core_setup_ok = quality_grade in {"A+", "A", "B"} and pullback_quality != "HIGH RISK PULLBACK"
+    core_stage_ok = stage_maturity_label in {"EARLY STAGE 2", "MID STAGE 2"}
+    if hard_core_block or (core_trade_score < 65 and poor_structure):
+        signal_state = "REJECT"
+        trade = "NO"
+        watchlist_flag = "NO"
+        decision_reason = "REJECT: hard trading block, damaged structure, earnings risk, weak RS, or risk too high."
+    elif active_entry_extended or ma10_extended_for_entry or (pd.notna(trade_risk_pct) and trade_risk_pct > 12):
+        signal_state = "WAIT PULLBACK"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "WAIT PULLBACK: price is extended above active entry zone; wait for MA10/MA20 reset."
+    elif (
+        core_trade_score >= 85
+        and pd.notna(trade_risk_pct)
+        and trade_risk_pct <= 10
+        and score_at_least(rs_score, 7)
+        and core_setup_ok
+        and core_stage_ok
+    ):
+        signal_state = "BUY NOW"
+        trade = "YES"
+        watchlist_flag = "NO"
+        decision_reason = "BUY NOW: high Core Trade Score, clean active entry zone, strong RS, and controlled risk."
+    elif (
+        core_trade_score >= 78
+        and pd.notna(trade_risk_pct)
+        and trade_risk_pct <= 12
+        and score_at_least(rs_score, 6.5)
+        and (vcp_tightness_score >= 6 or breakout_quality_score >= 7)
+        and not extended_timing
+    ):
+        signal_state = "EARLY POSITION"
+        trade = "YES"
+        watchlist_flag = "YES"
+        decision_reason = "EARLY POSITION: strong Core Trade Score; pilot entry only until breakout or volume confirmation."
+    elif (
+        core_trade_score >= 75
+        and near_breakout_trigger
+        and volume_confirmation != "YES"
+        and pd.notna(trade_risk_pct)
+        and trade_risk_pct <= 12
+    ):
+        signal_state = "BUY ON BREAKOUT"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "BUY ON BREAKOUT: tight setup near pivot/resistance; wait for breakout volume."
+    elif core_trade_score >= 65 and not poor_structure:
+        signal_state = "WATCH"
+        trade = "NO"
+        watchlist_flag = "YES"
+        decision_reason = "WATCH: good trading structure, but no active entry trigger yet."
+    else:
+        signal_state = "REJECT"
+        trade = "NO"
+        watchlist_flag = "NO"
+        decision_reason = "REJECT: Core Trade Score or structure is not strong enough for a swing setup."
 
     signal_state, trade, watchlist_flag, decision_reason = finalize_signal_outputs(
         signal_state=signal_state,
@@ -6639,24 +6834,23 @@ def build_scan_row(
     elif high_quality_leader and extended_timing and executable_grade == "B - WATCHLIST":
         executable_reason = "B - WATCHLIST: High-quality leader, but entry is extended. Wait for MA10/MA20 reset or tight base."
     signal_reason_detail = strip_executable_prefix(executable_reason)
-    if signal_state == "BUY ON BREAKOUT":
-        signal_reason_detail = "near trigger; wait for breakout confirmation before execution."
-    elif signal_state == "BUY NOW" and buy_explainability.get("actionable_buy_zone"):
-        if buy_explainability.get("breakout_confirmed") and buy_explainability.get("volume_confirmed"):
-            signal_reason_detail = "confirmed breakout with volume and controlled risk."
-        else:
-            signal_reason_detail = "high-quality leader in actionable buy zone; no need to wait for perfect breakout."
+    if signal_state == "BUY NOW":
+        signal_reason_detail = "high Core Trade Score, clean active entry zone, strong RS, and controlled risk."
     elif signal_state == "EARLY POSITION":
-        signal_reason_detail = "high-quality leader; pilot position allowed before full breakout confirmation."
+        signal_reason_detail = "strong Core Trade Score; pilot entry only until breakout or volume confirmation."
+    elif signal_state == "BUY ON BREAKOUT":
+        signal_reason_detail = "tight setup near pivot/resistance; wait for breakout volume."
     elif signal_state == "WATCH" and signal_reason_detail.lower().startswith(("hard reject", "failed setup", "character change", "entry is too late")):
-        signal_reason_detail = "good setup or leader context, but no clean trigger yet."
-    elif signal_state == "WAIT PULLBACK" and high_quality_leader and extended_timing:
-        signal_reason_detail = "high-quality leader, but entry is extended; wait for MA10/MA20 reset or tight base."
+        signal_reason_detail = "good trading structure, but no active entry trigger yet."
+    elif signal_state == "WATCH":
+        signal_reason_detail = "good trading structure, but no active entry trigger yet."
+    elif signal_state == "WAIT PULLBACK":
+        signal_reason_detail = "price is extended above active entry zone; wait for MA10/MA20 reset."
     elif signal_state == "REJECT" and not hard_reject:
-        signal_reason_detail = "weak setup condition triggered."
+        signal_reason_detail = "Core Trade Score or structure is not strong enough for a swing setup."
     decision_reason = reason_with_signal_prefix(
         signal_state,
-        f"{signal_reason_detail} Entry timing: {entry_timing}. Stage: {stage_maturity_label}. Stock quality: {leader_label}, theme {theme_weight}/10.",
+        f"{signal_reason_detail} Core Trade Score: {core_trade_score}/100. Active entry: {active_entry_type}, {distance_from_active_entry_pct}% from zone.",
     )
     execution_confidence = execution_confidence_for_signal(signal_state, breakout_alert, volume_confirmation)
     scanner_verdict = scanner_verdict_for_signal(signal_state, decision_reason)
@@ -6691,6 +6885,16 @@ def build_scan_row(
         if pd.notna(latest.get("High52W", np.nan)) and float(latest["High52W"]) > 0
         else np.nan
     )
+    liquidity_warnings = []
+    if pd.isna(market_cap):
+        liquidity_warnings.append("Market cap unavailable")
+    elif market_cap < 2_000_000_000:
+        liquidity_warnings.append("Market cap below 2B")
+    if pd.notna(latest.get("AvgDollarVol50", np.nan)) and float(latest.get("AvgDollarVol50", 0)) < 20_000_000:
+        liquidity_warnings.append("Avg dollar volume below 20M")
+    if float(latest["Close"]) <= 10:
+        liquidity_warnings.append("Price below 10")
+    liquidity_warning = "; ".join(liquidity_warnings) if liquidity_warnings else "OK"
 
     notes = "; ".join(
         [
@@ -6735,6 +6939,7 @@ def build_scan_row(
         "market cap raw": market_cap,
         "avg dollar volume": format_large_number(latest.get("AvgDollarVol50")),
         "avg dollar volume raw": latest.get("AvgDollarVol50"),
+        "Liquidity Warning": liquidity_warning,
         "RSI": round(float(latest["RSI14"]), 1),
         "RS Score": round(float(rs_score), 1) if pd.notna(rs_score) else "N/A",
         "RS Score Raw": round(float(rs_score), 1) if pd.notna(rs_score) else np.nan,
@@ -6750,6 +6955,7 @@ def build_scan_row(
         "Market Environment": market_environment,
         "Final Score": final_score,
         "Adjusted Final Score": adjusted_score,
+        "Core Trade Score": core_trade_score,
         "Professional Score": professional_score,
         "Quality Score": quality_score,
         "Execution Score": execution_score,
@@ -6796,6 +7002,11 @@ def build_scan_row(
         "volume contraction": "Yes" if vcp.volume_contraction else "No",
         "Volume Dry-Up": "Yes" if vcp.volume_contraction else "No",
         "Pivot": pivot.pivot,
+        "Original Pivot": original_pivot,
+        "Active Entry Zone": active_entry,
+        "Current Buy Zone": active_entry,
+        "Distance From Active Entry %": distance_from_active_entry_pct,
+        "Distance From Pivot %": distance_from_pivot_pct,
         "Distance to Pivot %": pivot.distance_pct,
         "Action Label": action,
         "Tightness Score": tightness_score,
@@ -6824,14 +7035,14 @@ def build_scan_row(
         "Earnings Intelligence": earnings_intelligence,
         "Trade": trade,
         "Trade Reason": trade_reason,
-        "Entry Type": entry_type,
+        "Entry Type": active_entry_type,
         "Decision Reason": decision_reason,
         "Why Selected": why_selected,
         "WATCHLIST FLAG": watchlist_flag,
         "Watchlist Reason": watchlist_reason,
-        "Entry Trigger": entry,
+        "Entry Trigger": active_entry if pd.notna(active_entry) else entry,
         "Stop Loss": stop,
-        "Risk %": risk_pct,
+        "Risk %": trade_risk_pct,
         "Risk Note": risk_quality_note,
         "Target 1R": target_1r,
         "Target 2R": target_2r,
@@ -10371,6 +10582,7 @@ def render_swing_scanner(
         "Earnings Risk",
         "Final Score",
         "Adjusted Final Score",
+        "Core Trade Score",
         "Professional Score",
         "Quality Score",
         "Execution Score",
@@ -10385,6 +10597,11 @@ def render_swing_scanner(
         "Pullback Quality",
         "VCP Tightness Score",
         "Tradeability Score",
+        "Original Pivot",
+        "Active Entry Zone",
+        "Current Buy Zone",
+        "Distance From Active Entry %",
+        "Distance From Pivot %",
         "Entry Quality Score",
         "Trade Tier",
         "Action Readiness Label",
@@ -10474,9 +10691,11 @@ def render_swing_scanner(
         "Quote Applied To Candle",
         "Data Stale",
         "Data Warning",
+        "Liquidity Warning",
         "Chart Sync",
         "Chart/Quote Mismatch %",
         "AI Trading Notes",
+        "Liquidity Warning",
     }
 
     if not results.empty and not required_result_columns.issubset(results.columns):
@@ -10530,7 +10749,7 @@ def render_swing_scanner(
         state_rows = results[results["Signal State"].isin(states)].copy()
         if state_rows.empty:
             return None
-        state_rows["_summary_score"] = pd.to_numeric(state_rows.get("Adjusted Final Score"), errors="coerce").fillna(0)
+        state_rows["_summary_score"] = pd.to_numeric(state_rows.get("Core Trade Score"), errors="coerce").fillna(0)
         state_rows["_summary_professional"] = pd.to_numeric(state_rows.get("Professional Score"), errors="coerce").fillna(0)
         state_rows["_summary_rs"] = pd.to_numeric(state_rows.get("RS Score Raw", state_rows.get("RS Score")), errors="coerce").fillna(0)
         return state_rows.sort_values(["_summary_score", "_summary_professional", "_summary_rs"], ascending=[False, False, False]).iloc[0]
@@ -10591,7 +10810,7 @@ def render_swing_scanner(
         theme_rows = results[mask].copy()
         if theme_rows.empty:
             return "None"
-        theme_rows["_summary_score"] = pd.to_numeric(theme_rows.get("Adjusted Final Score"), errors="coerce").fillna(0)
+        theme_rows["_summary_score"] = pd.to_numeric(theme_rows.get("Core Trade Score"), errors="coerce").fillna(0)
         theme_rows["_summary_quality"] = pd.to_numeric(theme_rows.get("Quality Score"), errors="coerce").fillna(0)
         theme_rows["_summary_rs"] = pd.to_numeric(theme_rows.get("RS Score Raw", theme_rows.get("RS Score")), errors="coerce").fillna(0)
         best = theme_rows.sort_values(["_summary_score", "_summary_quality", "_summary_rs"], ascending=[False, False, False]).iloc[0]
@@ -10800,13 +11019,13 @@ def render_swing_scanner(
     visible = visible.sort_values(
         [
             "signal sort",
-            "Adjusted Final Score",
-            "Quality Score",
-            "RS Sort",
+            "Core Trade Score",
             "Risk %",
-            "Execution Score",
+            "VCP Tightness Score",
+            "RS Sort",
+            "Breakout Quality Score",
         ],
-        ascending=[True, False, False, False, True, False],
+        ascending=[True, False, True, False, False, False],
     )
 
     compact_columns = [
@@ -10814,21 +11033,30 @@ def render_swing_scanner(
         "Sector / Industry",
         "close",
         "Signal State",
+        "Core Trade Score",
+        "Risk %",
+        "RS Score",
+        "VCP Tightness Score",
+        "Breakout Quality Score",
+        "Pullback Quality",
+        "Stage Label",
+        "Original Pivot",
+        "Active Entry Zone",
+        "Distance From Active Entry %",
+        "Entry Type",
+        "Stop Loss",
+        "TP1",
+        "TP2",
+        "TP3",
+        "Decision Reason",
         "Execution Confidence",
         "Setup Quality Grade",
-        "Stage Label",
-        "Pullback Quality",
-        "VCP Tightness Score",
         "Tradeability Score",
-        "Execution Score",
-        "Quality Score",
-        "Final Score",
-        "RS Score",
-        "Risk %",
         "Entry Trigger",
-        "Stop Loss",
+        "Current Buy Zone",
+        "Distance From Pivot %",
+        "Entry Trigger",
         "Ideal TP",
-        "Decision Reason",
         "Scanner Verdict",
         "Buy Criteria Passed",
         "Buy Criteria Failed",
@@ -10842,25 +11070,16 @@ def render_swing_scanner(
         "Trade",
         "Setup Type",
         "Watch Type",
-        "Adjusted Final Score",
-        "Institutional Quality Score",
-        "Theme Weight",
         "MA10 Efficiency Score",
         "Character Change Flag",
         "Pivot",
-        "Sector Leadership Status",
         "Trade Tier",
         "Action Readiness Label",
         "Missing Condition",
         "Suggested Action",
-        "Professional Score",
         "Entry Quality Score",
         "Healthy Pullback Score",
         "Institutional Tightness Score",
-        "Breakout Quality Score",
-        "TP1",
-        "TP2",
-        "TP3",
         "TP Type",
     ]
     diagnostic_columns = compact_columns + [
@@ -10878,6 +11097,13 @@ def render_swing_scanner(
         "Healthy Pullback Label",
         "Institutional Tightness Label",
         "Sector Leadership Weight",
+        "Professional Score",
+        "Theme Weight",
+        "Institutional Quality Score",
+        "Sector Leadership Status",
+        "Adjusted Final Score",
+        "Quality Score",
+        "Execution Score",
         "Final Score",
         "Explosive Score",
         "RS Score Raw",
@@ -10974,35 +11200,36 @@ def render_swing_scanner(
     focus_source["Professional Score Sort"] = pd.to_numeric(focus_source.get("Professional Score"), errors="coerce").fillna(0)
     focus_source["Entry Quality Sort"] = pd.to_numeric(focus_source.get("Entry Quality Score"), errors="coerce").fillna(0)
     focus_source["Final Score Sort"] = pd.to_numeric(focus_source.get("Final Score"), errors="coerce").fillna(0)
+    focus_source["Core Trade Score Sort"] = pd.to_numeric(focus_source.get("Core Trade Score"), errors="coerce").fillna(0)
     focus_source["VCP Tightness Sort"] = pd.to_numeric(focus_source.get("VCP Tightness Score"), errors="coerce").fillna(0)
     focus_source["Tradeability Sort"] = pd.to_numeric(focus_source.get("Tradeability Score"), errors="coerce").fillna(0)
 
     buy_now_focus = focus_source[focus_source["Signal State"] == "BUY NOW"].sort_values(
-        ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, True],
+        ["Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
     )
     early_position_focus = focus_source[focus_source["Signal State"] == "EARLY POSITION"].sort_values(
-        ["quality sort", "Professional Score Sort", "Entry Quality Sort", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
     )
     buy_breakout_focus = focus_source[focus_source["Signal State"] == "BUY ON BREAKOUT"].sort_values(
-        ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, True],
+        ["Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
     )
     watchlist_focus = focus_source[
         (focus_source["Signal State"] == "WATCH")
         & (focus_source["Setup Type"] != "MOMENTUM BREAKOUT EXCEPTION")
         & (focus_source["Setup Type"] != "RESISTANCE BREAKOUT WATCH")
     ].sort_values(
-        ["quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, False, True],
+        ["Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
     )
     healthy_pullback_focus = focus_source[
         focus_source.get("Pullback Quality", pd.Series("", index=focus_source.index)).isin(["CLEAN MA10 PULLBACK", "CLEAN MA20 RESET", "TIGHT FLAG"])
         | (focus_source.get("Healthy Pullback Label", pd.Series("", index=focus_source.index)) == "HEALTHY PULLBACK")
     ].sort_values(
-        ["signal sort", "quality sort", "Final Score Sort", "VCP Tightness Sort", "Tradeability Sort", "RS Sort", "Risk %"],
-        ascending=[True, True, False, False, False, False, True],
+        ["signal sort", "Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
+        ascending=[True, False, False, False, True],
     )
     extended_focus = focus_source[
         focus_source["Signal State"].isin(["WAIT PULLBACK", "EXTENDED DO NOT CHASE"])
@@ -11011,8 +11238,8 @@ def render_swing_scanner(
             | focus_source.get("Stage Label", pd.Series("", index=focus_source.index)).isin(["LATE STAGE 2", "CLIMAX / PARABOLIC"])
         )
     ].sort_values(
-        ["quality sort", "Final Score Sort", "Institutional Quality Score", "RS Sort", "Risk %"],
-        ascending=[True, False, False, False, True],
+        ["Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
     )
     rejected_focus = focus_source[
         (focus_source["Signal State"] == "REJECT")
@@ -11020,8 +11247,8 @@ def render_swing_scanner(
         | (focus_source["Action Label"] == "FAILED")
         | (focus_source.get("Executable Grade", pd.Series("", index=focus_source.index)) == "C - AVOID")
     ].sort_values(
-        ["quality sort", "Risk %", "Final Score Sort"],
-        ascending=[True, True, False],
+        ["Risk %", "Core Trade Score Sort"],
+        ascending=[True, False],
     )
     closest_to_action_focus = focus_source[
         (focus_source["Trade Tier"] == "Tier 2 - High Quality, Wait Better Entry")
@@ -11030,13 +11257,13 @@ def render_swing_scanner(
         & (focus_source["RS Sort"] >= 7)
         & (focus_source["Signal State"] != "EXTENDED DO NOT CHASE")
     ].sort_values(
-        ["Professional Score Sort", "Entry Quality Sort", "Institutional Quality Score", "RS Sort", "Risk %"],
-        ascending=[False, False, False, False, True],
+        ["Core Trade Score Sort", "Entry Quality Sort", "RS Sort", "Risk %"],
+        ascending=[False, False, False, True],
     )
     almost_buy_focus = focus_source[
         focus_source.get("Missing Condition", pd.Series("None", index=focus_source.index)).astype(str).ne("None")
     ].sort_values(
-        ["Professional Score Sort", "Adjusted Final Score", "RS Sort", "Risk %"],
+        ["Core Trade Score Sort", "VCP Tightness Sort", "RS Sort", "Risk %"],
         ascending=[False, False, False, True],
     )
 
