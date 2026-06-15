@@ -10703,6 +10703,18 @@ def render_swing_scanner(
         st.info("The scanner was upgraded with new decision fields. Run a fresh scan to rebuild the table.")
         return
 
+    st.write("Result columns:", results.columns.tolist())
+    if results.empty:
+        st.warning("No scanner results are available yet. Run a fresh scan to build the dashboard.")
+        st.markdown(
+            "For education and trade planning only. Not financial advice. Data may be delayed or inaccurate. "
+            "Confirm live price and volume in your broker before trading."
+        )
+        return
+    if "Signal State" not in results.columns:
+        st.warning("Dashboard skipped: Signal State column is missing from the scanner results. Run a fresh scan to rebuild compatible results.")
+        return
+
     market_score = summary.get("market_score", 0)
     market_status = summary.get("market_status", "N/A")
     market_environment = summary.get("market_environment", "UPTREND UNDER PRESSURE")
