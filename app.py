@@ -674,6 +674,80 @@ def format_large_number(value: float | int | None) -> str:
     return f"${value:,.0f}"
 
 
+DISPLAY_SECTOR_FALLBACK = {
+    "AAPL": ("Technology", "Consumer Electronics", "Mega Cap Tech"),
+    "MSFT": ("Technology", "Software Infrastructure", "AI / Cloud"),
+    "NVDA": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "AMD": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "AVGO": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "TSM": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "DELL": ("Technology", "Computer Hardware", "AI Infrastructure"),
+    "VRT": ("Industrials", "Electrical Equipment", "AI Infrastructure"),
+    "SMCI": ("Technology", "Computer Hardware", "AI Infrastructure"),
+    "AMZN": ("Consumer Cyclical", "Internet Retail", "Cloud / Consumer"),
+    "META": ("Communication Services", "Internet Content", "Mega Cap Tech"),
+    "GOOGL": ("Communication Services", "Internet Content", "Mega Cap Tech"),
+    "GOOG": ("Communication Services", "Internet Content", "Mega Cap Tech"),
+    "TSLA": ("Consumer Cyclical", "Auto Manufacturers", "EV / Growth"),
+    "STLD": ("Basic Materials", "Steel", "Cyclical Materials"),
+    "NUE": ("Basic Materials", "Steel", "Cyclical Materials"),
+    "AA": ("Basic Materials", "Aluminum", "Cyclical Materials"),
+    "FCX": ("Basic Materials", "Copper", "Cyclical Materials"),
+    "CNC": ("Healthcare", "Healthcare Plans", "Managed Care"),
+    "ELV": ("Healthcare", "Healthcare Plans", "Managed Care"),
+    "HUM": ("Healthcare", "Healthcare Plans", "Managed Care"),
+    "MRK": ("Healthcare", "Drug Manufacturers", "Healthcare"),
+    "CVS": ("Healthcare", "Healthcare Plans", "Managed Care"),
+    "MNST": ("Consumer Defensive", "Beverages", "Consumer Defensive"),
+    "DAL": ("Industrials", "Airlines", "Airlines"),
+    "AAL": ("Industrials", "Airlines", "Airlines"),
+    "LUV": ("Industrials", "Airlines", "Airlines"),
+    "CNI": ("Industrials", "Railroads", "Transportation"),
+    "CROX": ("Consumer Cyclical", "Footwear", "Consumer Cyclical"),
+    "ODFL": ("Industrials", "Trucking", "Transportation"),
+    "XPO": ("Industrials", "Trucking", "Transportation"),
+    "CARR": ("Industrials", "Building Products", "Industrials"),
+    "MTCH": ("Communication Services", "Internet Content", "Internet"),
+    "LUMN": ("Communication Services", "Telecom", "Telecom"),
+    "ETSY": ("Consumer Cyclical", "Internet Retail", "Internet Retail"),
+    "DXCM": ("Healthcare", "Medical Devices", "Healthcare"),
+    "ILMN": ("Healthcare", "Diagnostics & Research", "Healthcare"),
+    "A": ("Healthcare", "Diagnostics & Research", "Healthcare"),
+    "CMC": ("Basic Materials", "Steel", "Cyclical Materials"),
+}
+
+
+SECTOR_ETF_DISPLAY_FALLBACK = {
+    "SMH": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "SOXX": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "XLK": ("Technology", "Technology", "Technology"),
+    "XLY": ("Consumer Cyclical", "Consumer Discretionary", "Consumer Cyclical"),
+    "XLF": ("Financial Services", "Financials", "Financials"),
+    "XLV": ("Healthcare", "Healthcare", "Healthcare"),
+    "XLI": ("Industrials", "Industrials", "Industrials"),
+    "XLE": ("Energy", "Energy", "Energy"),
+    "IBB": ("Healthcare", "Biotechnology", "Biotech"),
+    "ITA": ("Industrials", "Aerospace & Defense", "Aerospace / Defense"),
+    "SPY": ("Market", "Broad Market", "Broad Market"),
+}
+
+
+def display_sector_metadata(ticker: str, sector_etf: str) -> dict:
+    """Return display-only sector fields without affecting scanner scoring."""
+    clean_ticker = str(ticker).upper().strip().split(".")[0]
+    sector, industry, theme = DISPLAY_SECTOR_FALLBACK.get(
+        clean_ticker,
+        SECTOR_ETF_DISPLAY_FALLBACK.get(sector_etf, ("N/A", "N/A", sector_etf or "N/A")),
+    )
+    return {
+        "Sector": sector,
+        "Industry": industry,
+        "Theme": theme,
+        "Sector / Industry": f"{sector} / {industry}" if sector != "N/A" or industry != "N/A" else "N/A",
+        "Theme Group": theme,
+    }
+
+
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def download_daily_data(tickers: Tuple[str, ...], period: str = "18mo") -> Dict[str, pd.DataFrame]:
     """Download daily OHLCV data and return one cleaned DataFrame per ticker."""
@@ -1630,6 +1704,7 @@ def build_scan_row(
         data, trend_score, rs_score, sector_score, earnings_info
     )
     post_earnings_label = detect_post_earnings_label(data, earnings_info)
+    display_sector = display_sector_metadata(ticker, sector_etf)
     final_score = calculate_final_score(
         trend_score=trend_score,
         technical_score=technical_score,
@@ -1682,6 +1757,11 @@ def build_scan_row(
 
     row = {
         "ticker": ticker,
+        "Sector / Industry": display_sector["Sector / Industry"],
+        "Sector": display_sector["Sector"],
+        "Industry": display_sector["Industry"],
+        "Theme": display_sector["Theme"],
+        "Theme Group": display_sector["Theme Group"],
         "close": round(float(latest["Close"]), 2),
         "market cap": format_large_number(market_cap),
         "market cap raw": market_cap,
@@ -1745,16 +1825,16 @@ def build_scan_row(
 def style_scan_table(row: pd.Series) -> List[str]:
     """Color rows by action label for fast visual review."""
     if row["Trade"] == "YES":
-        return ["background-color: #86efac; color: #052e16; font-weight: 800"] * len(row)
+        return ["background-color: #064e3b; color: #dcfce7; font-weight: 800"] * len(row)
     if row["WATCHLIST FLAG"] == "YES":
-        return ["background-color: #dbeafe; color: #1e3a8a; font-weight: 700"] * len(row)
+        return ["background-color: #1e3a8a; color: #dbeafe; font-weight: 700"] * len(row)
 
     colors = {
-        "READY": "background-color: #dcfce7; color: #14532d; font-weight: 700",
-        "PULLBACK ENTRY": "background-color: #dbeafe; color: #1e3a8a; font-weight: 700",
-        "WATCH": "background-color: #fef9c3; color: #713f12",
-        "EXTENDED": "background-color: #fed7aa; color: #7c2d12",
-        "FAILED": "background-color: #fee2e2; color: #7f1d1d",
+        "READY": "background-color: #14532d; color: #dcfce7; font-weight: 700",
+        "PULLBACK ENTRY": "background-color: #172554; color: #dbeafe; font-weight: 700",
+        "WATCH": "background-color: #422006; color: #fef9c3",
+        "EXTENDED": "background-color: #7c2d12; color: #ffedd5",
+        "FAILED": "background-color: #7f1d1d; color: #fee2e2",
     }
     return [colors.get(row["Action Label"], "")] * len(row)
 
@@ -1784,6 +1864,89 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
             if converted.notna().any():
                 rounded[column] = converted.round(2).where(converted.notna(), rounded[column])
     return rounded
+
+
+def escape_pdf_text(value: object) -> str:
+    """Escape text for the app's lightweight built-in PDF export."""
+    return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def dataframe_to_simple_pdf(frame: pd.DataFrame, title: str) -> bytes:
+    """Create a compact text PDF without adding dependencies or touching scanner logic."""
+    export = frame.fillna("N/A").astype(str)
+    lines = [title, ""]
+    lines.append(" | ".join(export.columns))
+    lines.append("-" * 120)
+    for _, row in export.iterrows():
+        lines.append(" | ".join(str(row[column])[:44] for column in export.columns))
+
+    pages = [lines[index : index + 42] for index in range(0, len(lines), 42)] or [[title]]
+    objects: List[str] = []
+    page_refs: List[int] = []
+    font_obj_num = 3
+
+    for page_lines in pages:
+        content_lines = ["BT", "/F1 7 Tf", "36 792 Td", "9 TL"]
+        for line in page_lines:
+            content_lines.append(f"({escape_pdf_text(line)}) Tj")
+            content_lines.append("T*")
+        content_lines.append("ET")
+        content = "\n".join(content_lines)
+        content_obj_num = len(objects) + 4
+        page_obj_num = len(objects) + 5
+        objects.append(
+            f"{content_obj_num} 0 obj\n<< /Length {len(content.encode('latin-1', errors='ignore'))} >>\n"
+            f"stream\n{content}\nendstream\nendobj\n"
+        )
+        objects.append(
+            f"{page_obj_num} 0 obj\n"
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] "
+            f"/Contents {content_obj_num} 0 R /Resources << /Font << /F1 {font_obj_num} 0 R >> >> >>\n"
+            "endobj\n"
+        )
+        page_refs.append(page_obj_num)
+
+    base_objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        f"2 0 obj\n<< /Type /Pages /Kids [{' '.join(f'{ref} 0 R' for ref in page_refs)}] /Count {len(page_refs)} >>\nendobj\n",
+        "3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>\nendobj\n",
+    ]
+    all_objects = base_objects + objects
+    pdf = "%PDF-1.4\n"
+    offsets = [0]
+    for obj in all_objects:
+        offsets.append(len(pdf.encode("latin-1", errors="ignore")))
+        pdf += obj
+    xref_pos = len(pdf.encode("latin-1", errors="ignore"))
+    pdf += f"xref\n0 {len(all_objects) + 1}\n0000000000 65535 f \n"
+    for offset in offsets[1:]:
+        pdf += f"{offset:010d} 00000 n \n"
+    pdf += f"trailer\n<< /Size {len(all_objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF"
+    return pdf.encode("latin-1", errors="ignore")
+
+
+def trade_plan_text(row: pd.Series) -> str:
+    """Build a selected-row trade plan export from May scanner fields."""
+    return "\n".join(
+        [
+            f"Ticker: {row.get('ticker', 'N/A')}",
+            f"Sector / Industry: {row.get('Sector / Industry', 'N/A')}",
+            f"Theme: {row.get('Theme', 'N/A')}",
+            f"Action: {row.get('Action Label', 'N/A')}",
+            f"Trade: {row.get('Trade', 'N/A')} - {row.get('Trade Reason', 'N/A')}",
+            f"Watchlist: {row.get('WATCHLIST FLAG', 'N/A')} - {row.get('Watchlist Reason', 'N/A')}",
+            f"Final Score: {row.get('Final Score', 'N/A')}",
+            f"Entry Trigger: {row.get('Entry Trigger', 'N/A')}",
+            f"Stop Loss: {row.get('Stop Loss', 'N/A')}",
+            f"Risk %: {row.get('Risk %', 'N/A')}",
+            f"Target 2R: {row.get('Target 2R', 'N/A')}",
+            f"Target 3R: {row.get('Target 3R', 'N/A')}",
+            f"RS Score: {row.get('RS Score', 'N/A')}",
+            f"VCP: {row.get('VCP Status', 'N/A')} ({row.get('Contractions', 'N/A')})",
+            f"Earnings: {row.get('Earnings Risk', 'N/A')}",
+            f"Notes: {row.get('Notes', 'N/A')}",
+        ]
+    )
 
 
 def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame:
@@ -1934,8 +2097,8 @@ def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
         go.Bar(
             x=chart_data.index,
             y=chart_data["Volume"],
-            marker_color="#94a3b8",
-            opacity=0.35,
+            marker_color=np.where(chart_data["Close"] >= chart_data["Open"], "#22c55e", "#ef4444"),
+            opacity=0.22,
             name="Volume",
             yaxis="y2",
         )
@@ -1963,7 +2126,9 @@ def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
                 arrowhead=2,
                 ax=0,
                 ay=28,
-                font=dict(size=11, color="#334155"),
+                font=dict(size=11, color="#e5e7eb"),
+                bgcolor="#111827",
+                bordercolor="#334155",
             )
 
     figure.update_layout(
@@ -1971,10 +2136,14 @@ def make_chart(ticker: str, data: pd.DataFrame, row: pd.Series) -> go.Figure:
         height=600,
         margin=dict(l=12, r=12, t=48, b=24),
         xaxis_rangeslider_visible=False,
-        yaxis=dict(title="Price"),
+        yaxis=dict(title="Price", gridcolor="#1f2937"),
         yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False, rangemode="tozero"),
         legend=dict(orientation="h", y=1.02, x=0),
-        template="plotly_white",
+        template="plotly_dark",
+        paper_bgcolor="#020617",
+        plot_bgcolor="#0f172a",
+        font=dict(color="#e5e7eb"),
+        hovermode="x unified",
     )
     return figure
 
@@ -3373,6 +3542,8 @@ def render_swing_scanner(
 
     compact_columns = [
         "ticker",
+        "Sector / Industry",
+        "Theme",
         "close",
         "Final Score",
         "Trade",
@@ -3396,6 +3567,9 @@ def render_swing_scanner(
         "AI Trading Notes",
     ]
     diagnostic_columns = compact_columns + [
+        "Sector",
+        "Industry",
+        "Theme Group",
         "market cap",
         "avg dollar volume",
         "RSI",
@@ -3497,7 +3671,33 @@ def render_swing_scanner(
         st.write(f"VCP: {selected_row['VCP Status']} ({selected_row['Contractions']})")
         st.write(f"Pivot: ${selected_row['Pivot']:.2f}, distance {selected_row['Distance to Pivot %']:.2f}%")
         st.write(f"MA distance: MA10 {selected_row['MA10 Distance %']:.2f}%, MA20 {selected_row['MA20 Distance %']:.2f}%")
+        st.write(f"Sector / Industry: {selected_row.get('Sector / Industry', 'N/A')}")
+        st.write(f"Theme: {selected_row.get('Theme', 'N/A')}")
         st.write(selected_row["Notes"])
+
+    export_frame = round_display_values(visible[display_columns] if not visible.empty else results[display_columns])
+    export_cols = st.columns(3)
+    export_cols[0].download_button(
+        "Download CSV",
+        data=export_frame.to_csv(index=False).encode("utf-8"),
+        file_name=f"{key_prefix}_vcp_scan.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+    export_cols[1].download_button(
+        "Download PDF",
+        data=dataframe_to_simple_pdf(export_frame, f"{title} Export"),
+        file_name=f"{key_prefix}_vcp_scan.pdf",
+        mime="application/pdf",
+        width="stretch",
+    )
+    export_cols[2].download_button(
+        "Export Trade Plan",
+        data=trade_plan_text(selected_row).encode("utf-8"),
+        file_name=f"{selected_ticker}_trade_plan.txt",
+        mime="text/plain",
+        width="stretch",
+    )
 
     st.caption(
         "For education and trade planning only. Not financial advice. Data may be delayed or inaccurate. "
