@@ -677,18 +677,51 @@ def format_large_number(value: float | int | None) -> str:
 DISPLAY_SECTOR_FALLBACK = {
     "AAPL": ("Technology", "Consumer Electronics", "Mega Cap Tech"),
     "MSFT": ("Technology", "Software Infrastructure", "AI / Cloud"),
+    "ORCL": ("Technology", "Software Infrastructure", "AI / Cloud"),
+    "CRM": ("Technology", "Software Application", "Software"),
+    "NOW": ("Technology", "Software Application", "Software"),
+    "ADBE": ("Technology", "Software Application", "Software"),
+    "PANW": ("Technology", "Cybersecurity", "Cybersecurity"),
+    "CRWD": ("Technology", "Cybersecurity", "Cybersecurity"),
+    "DDOG": ("Technology", "Software Infrastructure", "Software"),
+    "SNOW": ("Technology", "Software Application", "Software"),
+    "NET": ("Technology", "Software Infrastructure", "Software"),
     "NVDA": ("Technology", "Semiconductors", "AI Semiconductor"),
     "AMD": ("Technology", "Semiconductors", "AI Semiconductor"),
     "AVGO": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "MU": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "LRCX": ("Technology", "Semiconductor Equipment", "AI Semiconductor"),
+    "AMAT": ("Technology", "Semiconductor Equipment", "AI Semiconductor"),
+    "KLAC": ("Technology", "Semiconductor Equipment", "AI Semiconductor"),
+    "ASML": ("Technology", "Semiconductor Equipment", "AI Semiconductor"),
+    "QCOM": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "MRVL": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "ARM": ("Technology", "Semiconductors", "AI Semiconductor"),
+    "TXN": ("Technology", "Semiconductors", "Semiconductors"),
+    "INTC": ("Technology", "Semiconductors", "Semiconductors"),
     "TSM": ("Technology", "Semiconductors", "AI Semiconductor"),
     "DELL": ("Technology", "Computer Hardware", "AI Infrastructure"),
     "VRT": ("Industrials", "Electrical Equipment", "AI Infrastructure"),
+    "ANET": ("Technology", "Communication Equipment", "AI Infrastructure"),
     "SMCI": ("Technology", "Computer Hardware", "AI Infrastructure"),
+    "PLTR": ("Technology", "Software Infrastructure", "AI Software"),
+    "APP": ("Technology", "Software Application", "AI Software"),
     "AMZN": ("Consumer Cyclical", "Internet Retail", "Cloud / Consumer"),
+    "NFLX": ("Communication Services", "Entertainment", "Streaming"),
     "META": ("Communication Services", "Internet Content", "Mega Cap Tech"),
     "GOOGL": ("Communication Services", "Internet Content", "Mega Cap Tech"),
     "GOOG": ("Communication Services", "Internet Content", "Mega Cap Tech"),
     "TSLA": ("Consumer Cyclical", "Auto Manufacturers", "EV / Growth"),
+    "BRK-B": ("Financial Services", "Insurance Diversified", "Financials"),
+    "JPM": ("Financial Services", "Banks Diversified", "Financials"),
+    "V": ("Financial Services", "Credit Services", "Payments"),
+    "MA": ("Financial Services", "Credit Services", "Payments"),
+    "COIN": ("Financial Services", "Capital Markets", "Crypto / Fintech"),
+    "HOOD": ("Financial Services", "Capital Markets", "Fintech"),
+    "COST": ("Consumer Defensive", "Discount Stores", "Retail"),
+    "WMT": ("Consumer Defensive", "Discount Stores", "Retail"),
+    "HD": ("Consumer Cyclical", "Home Improvement Retail", "Retail"),
+    "LLY": ("Healthcare", "Drug Manufacturers", "Healthcare"),
     "STLD": ("Basic Materials", "Steel", "Cyclical Materials"),
     "NUE": ("Basic Materials", "Steel", "Cyclical Materials"),
     "AA": ("Basic Materials", "Aluminum", "Cyclical Materials"),
@@ -1885,6 +1918,11 @@ def build_scan_row(
         else:
             watchlist_reason = "Momentum breakout watch - waiting for breakout confirmation."
         trade_reason = watchlist_reason
+    if trade == "YES" and rs_score < 5:
+        trade = "NO"
+        watchlist_flag = "YES"
+        trade_reason = "RS too weak for Trade YES."
+        watchlist_reason = "RS too weak for Trade YES."
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
 
     notes = "; ".join(
@@ -3692,7 +3730,6 @@ def render_swing_scanner(
     compact_columns = [
         "ticker",
         "Sector / Industry",
-        "Theme",
         "Setup Category",
         "close",
         "Final Score",
@@ -3700,29 +3737,30 @@ def render_swing_scanner(
         "WATCHLIST FLAG",
         "Action Label",
         "Breakout Alert",
-        "Earnings Date",
-        "Earnings Risk",
-        "Earnings Setup Score",
-        "Trend Score",
-        "Technical Score",
         "RS Score",
         "Tightness Score",
-        "RR Score",
         "Pivot",
         "Entry Trigger",
         "Stop Loss",
         "Risk %",
         "Target 2R",
-        "Target 3R",
         "AI Trading Notes",
     ]
     diagnostic_columns = compact_columns + [
         "Sector",
         "Industry",
+        "Theme",
         "Theme Group",
         "market cap",
         "avg dollar volume",
         "RSI",
+        "Earnings Date",
+        "Earnings Risk",
+        "Earnings Setup Score",
+        "Trend Score",
+        "Technical Score",
+        "RR Score",
+        "Target 3R",
         "Sector Score",
         "Sector ETF",
         "Sector Leadership",
@@ -3745,7 +3783,7 @@ def render_swing_scanner(
         "Post-Earnings Label",
         "Notes",
     ]
-    display_columns = diagnostic_columns if show_full_diagnostics else compact_columns
+    display_columns = compact_columns
 
     focus_source = results.copy()
     focus_source["trade sort"] = np.where(focus_source["Trade"] == "YES", 0, 1)
@@ -3782,13 +3820,34 @@ def render_swing_scanner(
     with focus_cols[2]:
         show_focus_group("Best Pullback Candidates", pullback_focus, "Pullback Reason")
 
-    st.subheader("Best Setups")
-    if visible.empty:
-        st.info("No rows match the current display filters.")
-    else:
-        table_display = round_display_values(visible[display_columns])
+    def show_setup_section(title: str, frame: pd.DataFrame) -> None:
+        st.subheader(title)
+        if frame.empty:
+            st.caption("No current matches.")
+            return
+        table_display = round_display_values(frame[display_columns])
         st.dataframe(
             table_display.style.apply(style_scan_table, axis=1),
+            width="stretch",
+            hide_index=True,
+        )
+
+    trade_yes_view = visible[visible["Trade"] == "YES"].copy()
+    watchlist_view = visible[(visible["WATCHLIST FLAG"] == "YES") & (visible["Trade"] != "YES")].copy()
+    high_risk_view = visible[
+        (visible["Setup Category"] == "High Risk")
+        | (visible["Action Label"].isin(["FAILED", "EXTENDED"]))
+        | ((visible["Trade"] != "YES") & (visible["WATCHLIST FLAG"] != "YES"))
+    ].copy()
+
+    show_setup_section("Trade YES", trade_yes_view)
+    show_setup_section("Watchlist", watchlist_view)
+    show_setup_section("High Risk / Avoid", high_risk_view)
+
+    with st.expander("Detailed Diagnostics", expanded=show_full_diagnostics):
+        diagnostic_display = round_display_values(visible[diagnostic_columns])
+        st.dataframe(
+            diagnostic_display.style.apply(style_scan_table, axis=1),
             width="stretch",
             hide_index=True,
         )
