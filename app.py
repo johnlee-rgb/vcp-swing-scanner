@@ -1647,6 +1647,118 @@ def is_momentum_breakout_watch(
     )
 
 
+def build_rank_reason(
+    trend_score: int,
+    technical_score: int,
+    rs_score: float,
+    vcp_status: str,
+    risk_pct: float,
+    breakout_alert: str,
+    volume_confirmation: str,
+    trade: str,
+    watchlist_flag: str,
+    trade_reason: str,
+    watchlist_reason: str,
+) -> str:
+    """Explain ranking inputs without affecting ranking."""
+    parts = [
+        f"Trend {trend_score}/7",
+        f"Technical {technical_score}/8",
+        f"RS {rs_score}",
+        vcp_status,
+        f"Risk {risk_pct}%",
+    ]
+    if breakout_alert != "NO BREAKOUT":
+        parts.append(breakout_alert.replace("_", " ").title())
+    parts.append("Volume confirmed" if volume_confirmation == "YES" else "Volume not confirmed")
+    if trade != "YES" and watchlist_flag == "YES":
+        parts.append(f"Watch only: {watchlist_reason}")
+    elif trade != "YES" and trade_reason:
+        parts.append(trade_reason)
+    return "; ".join(str(part) for part in parts if str(part).strip())
+
+
+def entry_logic_audit(data: pd.DataFrame, pivot: PivotInfo, action: str, entry: float) -> Tuple[float, float, float, str]:
+    """Display-only audit of whether the active entry still matches current price position."""
+    latest = data.iloc[-1]
+    previous = data.iloc[-2] if len(data) >= 2 else latest
+    close = float(latest["Close"])
+    pivot_value = float(pivot.pivot) if pd.notna(pivot.pivot) else np.nan
+    entry_value = float(entry) if pd.notna(entry) else np.nan
+
+    if pd.notna(pivot_value) and close <= pivot_value * 1.03:
+        active_entry = entry_value
+        warning = "Breakout entry valid"
+    else:
+        support_candidates = [
+            float(latest["MA10"]) if pd.notna(latest.get("MA10", np.nan)) else np.nan,
+            float(latest["MA20"]) if pd.notna(latest.get("MA20", np.nan)) else np.nan,
+            float(previous["High"]) if pd.notna(previous.get("High", np.nan)) else np.nan,
+        ]
+        valid_supports = [value for value in support_candidates if pd.notna(value) and value <= close]
+        fallback_supports = [value for value in support_candidates if pd.notna(value)]
+        active_entry = max(valid_supports) if valid_supports else max(fallback_supports) if fallback_supports else entry_value
+        warning = "Post-breakout: old pivot is not active entry. Use pullback / support zone."
+
+    entry_distance = round((close - active_entry) / active_entry * 100, 2) if active_entry else np.nan
+    if action == "READY" and pd.notna(entry_value) and entry_value > 0 and (close - entry_value) / entry_value * 100 > 5:
+        warning = "READY but extended above trigger - verify manually"
+    return round(pivot_value, 2) if pd.notna(pivot_value) else np.nan, round(active_entry, 2), entry_distance, warning
+
+
+def calculate_accumulation_display(data: pd.DataFrame, breakout_alert: str, volume_confirmation: str) -> Tuple[int, str]:
+    """Display-only accumulation read using existing daily OHLCV."""
+    recent = data.tail(10).copy()
+    if len(recent) < 3:
+        return 0, "Not enough data"
+
+    previous_close = recent["Close"].shift(1)
+    previous_volume = recent["Volume"].shift(1)
+    up_higher_volume = ((recent["Close"] > previous_close) & (recent["Volume"] > previous_volume)).sum()
+    down_lower_volume = ((recent["Close"] < previous_close) & (recent["Volume"] < previous_volume)).sum()
+    daily_range = (recent["High"] - recent["Low"]).replace(0, np.nan)
+    upper_closes = (recent["Close"] >= recent["Low"] + daily_range * 0.6).sum()
+    tight_close_days = (recent["Close"].pct_change().abs() <= 0.015).sum()
+    avg_vol20 = recent["AvgVol20"].iloc[-1] if "AvgVol20" in recent and pd.notna(recent["AvgVol20"].iloc[-1]) else np.nan
+    distribution_days = (
+        (recent["Close"] < previous_close)
+        & (recent["Volume"] > recent["AvgVol20"].fillna(previous_volume))
+        & (recent["Close"] <= recent["Low"] + daily_range * 0.4)
+    ).sum()
+
+    score = 0
+    if up_higher_volume >= 3:
+        score += 2
+    elif up_higher_volume >= 1:
+        score += 1
+    if down_lower_volume >= 3:
+        score += 2
+    elif down_lower_volume >= 1:
+        score += 1
+    if upper_closes >= 6:
+        score += 2
+    elif upper_closes >= 4:
+        score += 1
+    if volume_confirmation == "YES" and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT", "NEAR BREAKOUT"}:
+        score += 2
+    if tight_close_days >= 5:
+        score += 1
+    if distribution_days <= 1:
+        score += 1
+    score = int(min(score, 10))
+
+    notes = [
+        f"{int(up_higher_volume)} up-volume days",
+        f"{int(down_lower_volume)} lower-volume down days",
+        f"{int(upper_closes)} upper-range closes",
+        f"{int(tight_close_days)} tight closes",
+        f"{int(distribution_days)} distribution days",
+    ]
+    if pd.notna(avg_vol20):
+        notes.append("volume baseline available")
+    return score, "; ".join(notes)
+
+
 def build_ai_trading_notes(row: dict) -> str:
     """Create compact rule-based notes for table, cards, and alerts."""
     return (
@@ -1923,6 +2035,33 @@ def build_scan_row(
         watchlist_flag = "YES"
         trade_reason = "RS too weak for Trade YES."
         watchlist_reason = "RS too weak for Trade YES."
+    if (
+        trade == "NO"
+        and action == "READY"
+        and vcp.status in {"VALID VCP", "EARLY VCP"}
+        and final_score >= 85
+        and rs_score >= 7
+        and risk_pct <= 12
+        and breakout_alert in {"NEAR BREAKOUT", "BREAKOUT IN PROGRESS"}
+    ):
+        watchlist_flag = "YES"
+        watchlist_reason = "Strong VCP setup - waiting for breakout confirmation or lower-risk entry."
+        trade_reason = watchlist_reason
+    original_pivot, active_entry_zone, entry_distance_pct, entry_logic_warning = entry_logic_audit(data, pivot, action, entry)
+    accumulation_score, accumulation_notes = calculate_accumulation_display(data, breakout_alert, volume_confirmation)
+    rank_reason = build_rank_reason(
+        trend_score=trend_score,
+        technical_score=technical_score,
+        rs_score=rs_score,
+        vcp_status=vcp.status,
+        risk_pct=risk_pct,
+        breakout_alert=breakout_alert,
+        volume_confirmation=volume_confirmation,
+        trade=trade,
+        watchlist_flag=watchlist_flag,
+        trade_reason=trade_reason,
+        watchlist_reason=watchlist_reason,
+    )
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
 
     notes = "; ".join(
@@ -1961,12 +2100,17 @@ def build_scan_row(
         "Sector Spread %": sector_spread if sector_spread is not None else "N/A",
         "Market Score": market_score,
         "Final Score": final_score,
+        "Rank Reason": rank_reason,
         "VCP Status": vcp.status,
         "Contractions": contraction_text,
         "contraction count": vcp.count,
         "final contraction %": vcp.final_pct,
         "volume contraction": "Yes" if vcp.volume_contraction else "No",
         "Pivot": pivot.pivot,
+        "Original Pivot": original_pivot,
+        "Active Entry Zone": active_entry_zone,
+        "Entry Distance %": entry_distance_pct,
+        "Entry Logic Warning": entry_logic_warning,
         "Distance to Pivot %": pivot.distance_pct,
         "Action Label": action,
         "Tightness Score": tightness_score,
@@ -1986,6 +2130,8 @@ def build_scan_row(
         "Earnings Setup Score": earnings_setup_score,
         "Earnings Strategy": earnings_strategy,
         "Post-Earnings Label": post_earnings_label,
+        "Accumulation Score": accumulation_score,
+        "Accumulation Notes": accumulation_notes,
         "Trade": trade,
         "Trade Reason": trade_reason,
         "WATCHLIST FLAG": watchlist_flag,
@@ -2117,10 +2263,15 @@ def trade_plan_text(row: pd.Series) -> str:
             f"Sector / Industry: {row.get('Sector / Industry', 'N/A')}",
             f"Theme: {row.get('Theme', 'N/A')}",
             f"Setup Category: {row.get('Setup Category', 'N/A')}",
+            f"Rank Reason: {row.get('Rank Reason', 'N/A')}",
             f"Action: {row.get('Action Label', 'N/A')}",
             f"Trade: {row.get('Trade', 'N/A')} - {row.get('Trade Reason', 'N/A')}",
             f"Watchlist: {row.get('WATCHLIST FLAG', 'N/A')} - {row.get('Watchlist Reason', 'N/A')}",
             f"Final Score: {row.get('Final Score', 'N/A')}",
+            f"Original Pivot: {row.get('Original Pivot', 'N/A')}",
+            f"Active Entry Zone: {row.get('Active Entry Zone', 'N/A')}",
+            f"Entry Distance %: {row.get('Entry Distance %', 'N/A')}",
+            f"Entry Logic Warning: {row.get('Entry Logic Warning', 'N/A')}",
             f"Entry Trigger: {row.get('Entry Trigger', 'N/A')}",
             f"Stop Loss: {row.get('Stop Loss', 'N/A')}",
             f"Risk %: {row.get('Risk %', 'N/A')}",
@@ -2128,6 +2279,8 @@ def trade_plan_text(row: pd.Series) -> str:
             f"Target 3R: {row.get('Target 3R', 'N/A')}",
             f"RS Score: {row.get('RS Score', 'N/A')}",
             f"VCP: {row.get('VCP Status', 'N/A')} ({row.get('Contractions', 'N/A')})",
+            f"Accumulation Score: {row.get('Accumulation Score', 'N/A')}",
+            f"Accumulation Notes: {row.get('Accumulation Notes', 'N/A')}",
             f"Earnings: {row.get('Earnings Risk', 'N/A')}",
             f"Notes: {row.get('Notes', 'N/A')}",
         ]
@@ -3653,6 +3806,13 @@ def render_swing_scanner(
         "Earnings Risk",
         "Final Score",
         "Setup Category",
+        "Rank Reason",
+        "Original Pivot",
+        "Active Entry Zone",
+        "Entry Distance %",
+        "Entry Logic Warning",
+        "Accumulation Score",
+        "Accumulation Notes",
         "WATCHLIST FLAG",
         "Watchlist Reason",
         "Breakout Alert",
@@ -3729,28 +3889,37 @@ def render_swing_scanner(
 
     compact_columns = [
         "ticker",
-        "Sector / Industry",
-        "Setup Category",
-        "close",
-        "Final Score",
-        "Trade",
-        "WATCHLIST FLAG",
-        "Action Label",
-        "Breakout Alert",
-        "RS Score",
-        "Tightness Score",
-        "Pivot",
-        "Entry Trigger",
-        "Stop Loss",
-        "Risk %",
-        "Target 2R",
-        "AI Trading Notes",
-    ]
-    diagnostic_columns = compact_columns + [
         "Sector",
         "Industry",
         "Theme",
+        "Action Label",
+        "Setup Category",
+        "Trade",
+        "WATCHLIST FLAG",
+        "Final Score",
+        "Rank Reason",
+        "Breakout Alert",
+        "VCP Status",
+        "Risk %",
+        "Entry Trigger",
+        "Stop Loss",
+        "Target 2R",
+        "Target 3R",
+        "Accumulation Score",
+    ]
+    diagnostic_columns = compact_columns + [
+        "Sector / Industry",
         "Theme Group",
+        "close",
+        "RS Score",
+        "Tightness Score",
+        "Pivot",
+        "Original Pivot",
+        "Active Entry Zone",
+        "Entry Distance %",
+        "Entry Logic Warning",
+        "Accumulation Notes",
+        "AI Trading Notes",
         "market cap",
         "avg dollar volume",
         "RSI",
@@ -3883,6 +4052,12 @@ def render_swing_scanner(
         st.write(f"Sector / Industry: {selected_row.get('Sector / Industry', 'N/A')}")
         st.write(f"Theme: {selected_row.get('Theme', 'N/A')}")
         st.write(f"Setup Category: {selected_row.get('Setup Category', 'N/A')}")
+        st.write(f"Rank Reason: {selected_row.get('Rank Reason', 'N/A')}")
+        st.write(f"Entry Logic Warning: {selected_row.get('Entry Logic Warning', 'N/A')}")
+        st.write(f"Active Entry Zone: {selected_row.get('Active Entry Zone', 'N/A')}")
+        st.write(f"Entry Distance %: {selected_row.get('Entry Distance %', 'N/A')}")
+        st.write(f"Accumulation Score: {selected_row.get('Accumulation Score', 'N/A')}/10")
+        st.write(f"Accumulation Notes: {selected_row.get('Accumulation Notes', 'N/A')}")
         st.write(selected_row["Notes"])
 
     export_frame = round_display_values(visible[display_columns] if not visible.empty else results[display_columns])
