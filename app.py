@@ -1534,6 +1534,36 @@ def ai_trade_label(row: pd.Series) -> str:
     return "WATCH FOR BREAKOUT"
 
 
+def classify_setup_category(
+    vcp_status: str,
+    action: str,
+    breakout_alert: str,
+    trend_score: int,
+    technical_score: int,
+    rs_score: float,
+    risk_pct: float,
+    extended: bool,
+) -> str:
+    """Group setups for display and momentum-breakout handling."""
+    if action == "FAILED" or extended or risk_pct > 10:
+        return "High Risk"
+    if vcp_status in {"VALID VCP", "EARLY VCP"} and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT", "NEAR BREAKOUT"}:
+        return "VCP Breakout"
+    if (
+        trend_score >= 8
+        and technical_score >= 8
+        and rs_score >= 8
+        and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
+        and risk_pct <= 10
+    ):
+        return "Momentum Breakout"
+    if action == "PULLBACK ENTRY":
+        return "Pullback Setup"
+    if vcp_status == "EARLY VCP" or action == "WATCH":
+        return "Early Base"
+    return "High Risk"
+
+
 def build_ai_trading_notes(row: dict) -> str:
     """Create compact rule-based notes for table, cards, and alerts."""
     return (
@@ -1740,6 +1770,21 @@ def build_scan_row(
         sector_score=sector_score,
         earnings_risk_label=earnings_label,
     )
+    setup_category = classify_setup_category(
+        vcp_status=vcp.status,
+        action=action,
+        breakout_alert=breakout_alert,
+        trend_score=trend_score,
+        technical_score=technical_score,
+        rs_score=rs_score,
+        risk_pct=risk_pct,
+        extended=extended,
+    )
+    if setup_category == "Momentum Breakout":
+        trade = "YES"
+        trade_reason = "Momentum Breakout Candidate"
+        watchlist_flag = "NO"
+        watchlist_reason = "Already Trade YES"
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
 
     notes = "; ".join(
@@ -1762,6 +1807,7 @@ def build_scan_row(
         "Industry": display_sector["Industry"],
         "Theme": display_sector["Theme"],
         "Theme Group": display_sector["Theme Group"],
+        "Setup Category": setup_category,
         "close": round(float(latest["Close"]), 2),
         "market cap": format_large_number(market_cap),
         "market cap raw": market_cap,
@@ -1932,6 +1978,7 @@ def trade_plan_text(row: pd.Series) -> str:
             f"Ticker: {row.get('ticker', 'N/A')}",
             f"Sector / Industry: {row.get('Sector / Industry', 'N/A')}",
             f"Theme: {row.get('Theme', 'N/A')}",
+            f"Setup Category: {row.get('Setup Category', 'N/A')}",
             f"Action: {row.get('Action Label', 'N/A')}",
             f"Trade: {row.get('Trade', 'N/A')} - {row.get('Trade Reason', 'N/A')}",
             f"Watchlist: {row.get('WATCHLIST FLAG', 'N/A')} - {row.get('Watchlist Reason', 'N/A')}",
@@ -1958,6 +2005,7 @@ def focus_summary_frame(frame: pd.DataFrame, reason_column: str) -> pd.DataFrame
     summary["Reason"] = summary[reason_column]
     columns = [
         "ticker",
+        "Setup Category",
         "Action Label",
         "Final Score",
         "Pivot",
@@ -3466,6 +3514,7 @@ def render_swing_scanner(
         "Volume Confirmation",
         "Earnings Risk",
         "Final Score",
+        "Setup Category",
         "WATCHLIST FLAG",
         "Watchlist Reason",
         "Breakout Alert",
@@ -3544,6 +3593,7 @@ def render_swing_scanner(
         "ticker",
         "Sector / Industry",
         "Theme",
+        "Setup Category",
         "close",
         "Final Score",
         "Trade",
@@ -3673,6 +3723,7 @@ def render_swing_scanner(
         st.write(f"MA distance: MA10 {selected_row['MA10 Distance %']:.2f}%, MA20 {selected_row['MA20 Distance %']:.2f}%")
         st.write(f"Sector / Industry: {selected_row.get('Sector / Industry', 'N/A')}")
         st.write(f"Theme: {selected_row.get('Theme', 'N/A')}")
+        st.write(f"Setup Category: {selected_row.get('Setup Category', 'N/A')}")
         st.write(selected_row["Notes"])
 
     export_frame = round_display_values(visible[display_columns] if not visible.empty else results[display_columns])
