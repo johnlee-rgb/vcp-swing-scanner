@@ -1543,9 +1543,13 @@ def classify_setup_category(
     rs_score: float,
     risk_pct: float,
     extended: bool,
+    ma10_distance: float,
+    ma20_distance: float,
+    abnormal_volatility: bool,
 ) -> str:
     """Group setups for display and momentum-breakout handling."""
-    if action == "FAILED" or extended or risk_pct > 10:
+    far_extended = ma10_distance > 15 or ma20_distance > 20
+    if action == "FAILED" or risk_pct > 15 or far_extended or abnormal_volatility:
         return "High Risk"
     if vcp_status in {"VALID VCP", "EARLY VCP"} and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT", "NEAR BREAKOUT"}:
         return "VCP Breakout"
@@ -1561,7 +1565,53 @@ def classify_setup_category(
         return "Pullback Setup"
     if vcp_status == "EARLY VCP" or action == "WATCH":
         return "Early Base"
-    return "High Risk"
+    return "Early Base"
+
+
+def is_momentum_breakout_confirmed(
+    action: str,
+    trend_score: int,
+    technical_score: int,
+    rs_score: float,
+    breakout_alert: str,
+    risk_pct: float,
+    volume_confirmation: str,
+    extended: bool,
+    earnings_label: str,
+) -> bool:
+    """Strict non-VCP breakout route; keeps May VCP route separate."""
+    return bool(
+        action == "READY"
+        and trend_score >= 8
+        and technical_score >= 8
+        and rs_score >= 8
+        and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
+        and risk_pct <= 10
+        and volume_confirmation == "YES"
+        and not extended
+        and earnings_label != "HIGH RISK"
+    )
+
+
+def is_momentum_breakout_watch(
+    trend_score: int,
+    technical_score: int,
+    rs_score: float,
+    breakout_alert: str,
+    risk_pct: float,
+    extended: bool,
+    earnings_label: str,
+) -> bool:
+    """Near-miss momentum setup that should be visible without becoming Trade YES."""
+    return bool(
+        trend_score >= 8
+        and technical_score >= 8
+        and rs_score >= 8
+        and breakout_alert in {"NEAR BREAKOUT", "BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
+        and risk_pct <= 12
+        and not extended
+        and earnings_label != "HIGH RISK"
+    )
 
 
 def build_ai_trading_notes(row: dict) -> str:
@@ -1730,6 +1780,12 @@ def build_scan_row(
     earnings_label, earnings_risk = classify_earnings_risk(earnings_info)
     volume_confirmation, volume_note = calculate_volume_confirmation(data, action, pivot)
     breakout_alert = detect_breakout_alert(data, pivot, volume_confirmation)
+    avg_range20 = data["RangePct"].tail(20).mean() if len(data) >= 20 else np.nan
+    abnormal_volatility = bool(
+        pd.notna(avg_range20)
+        and pd.notna(latest.get("RangePct", np.nan))
+        and float(latest["RangePct"]) > max(float(avg_range20) * 2.0, 0.08)
+    )
     earnings_setup_score, earnings_setup_label, earnings_strategy = calculate_earnings_setup(
         data, trend_score, rs_score, sector_score, earnings_info
     )
@@ -1770,6 +1826,18 @@ def build_scan_row(
         sector_score=sector_score,
         earnings_risk_label=earnings_label,
     )
+    if (
+        vcp.status == "NOT VCP"
+        and trend_score >= 8
+        and technical_score >= 8
+        and rs_score >= 8
+        and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
+        and risk_pct <= 10
+        and volume_confirmation == "YES"
+        and not extended
+        and earnings_label != "HIGH RISK"
+    ):
+        action = "READY"
     setup_category = classify_setup_category(
         vcp_status=vcp.status,
         action=action,
@@ -1779,12 +1847,44 @@ def build_scan_row(
         rs_score=rs_score,
         risk_pct=risk_pct,
         extended=extended,
+        ma10_distance=ma10_distance,
+        ma20_distance=ma20_distance,
+        abnormal_volatility=abnormal_volatility,
     )
-    if setup_category == "Momentum Breakout":
+    if setup_category == "Momentum Breakout" and is_momentum_breakout_confirmed(
+        action=action,
+        trend_score=trend_score,
+        technical_score=technical_score,
+        rs_score=rs_score,
+        breakout_alert=breakout_alert,
+        risk_pct=risk_pct,
+        volume_confirmation=volume_confirmation,
+        extended=extended,
+        earnings_label=earnings_label,
+    ):
         trade = "YES"
         trade_reason = "Momentum Breakout Candidate"
         watchlist_flag = "NO"
         watchlist_reason = "Already Trade YES"
+    elif vcp.status == "NOT VCP" and is_momentum_breakout_watch(
+        trend_score=trend_score,
+        technical_score=technical_score,
+        rs_score=rs_score,
+        breakout_alert=breakout_alert,
+        risk_pct=risk_pct,
+        extended=extended,
+        earnings_label=earnings_label,
+    ):
+        setup_category = "Momentum Breakout"
+        trade = "NO"
+        watchlist_flag = "YES"
+        if risk_pct > 10:
+            watchlist_reason = "Good momentum setup, but risk is slightly too wide."
+        elif breakout_alert == "NEAR BREAKOUT":
+            watchlist_reason = "Momentum breakout watch - waiting for breakout confirmation."
+        else:
+            watchlist_reason = "Momentum breakout watch - waiting for breakout confirmation."
+        trade_reason = watchlist_reason
     contraction_text = " -> ".join(f"{value:g}%" for value in vcp.contractions) if vcp.contractions else "N/A"
 
     notes = "; ".join(
