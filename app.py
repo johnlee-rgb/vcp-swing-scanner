@@ -2171,7 +2171,7 @@ def style_scan_table(row: pd.Series) -> List[str]:
 
 def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
     """Round displayed prices, levels, scores, and percentages without changing calculations."""
-    rounded = frame.copy()
+    rounded = frame.loc[:, ~frame.columns.duplicated()].copy()
     two_decimal_columns = [
         "close",
         "Pivot",
@@ -2190,9 +2190,16 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
     ]
     for column in two_decimal_columns:
         if column in rounded.columns:
-            converted = pd.to_numeric(rounded[column], errors="coerce")
+            selected = rounded[column]
+            if isinstance(selected, pd.DataFrame):
+                for duplicate_column in selected.columns:
+                    converted = pd.to_numeric(selected[duplicate_column], errors="coerce")
+                    if converted.notna().any():
+                        rounded[duplicate_column] = converted.round(2).where(converted.notna(), selected[duplicate_column])
+                continue
+            converted = pd.to_numeric(selected, errors="coerce")
             if converted.notna().any():
-                rounded[column] = converted.round(2).where(converted.notna(), rounded[column])
+                rounded[column] = converted.round(2).where(converted.notna(), selected)
     return rounded
 
 
@@ -3952,6 +3959,7 @@ def render_swing_scanner(
         "Post-Earnings Label",
         "Notes",
     ]
+    diagnostic_columns = list(dict.fromkeys(diagnostic_columns))
     display_columns = compact_columns
 
     focus_source = results.copy()
