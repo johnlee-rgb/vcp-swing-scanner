@@ -632,6 +632,42 @@ ALL_CONTEXT_TICKERS = list(dict.fromkeys(MARKET_TICKERS + HK_MARKET_TICKERS))
 ACTION_ORDER = {"READY": 0, "PULLBACK ENTRY": 1, "WATCH": 2, "EXTENDED": 3, "FAILED": 4}
 
 
+@dataclass(frozen=True)
+class ScoreRange:
+    """Documented score bounds used to keep thresholds reachable."""
+
+    minimum: float
+    maximum: float
+
+
+SCORE_RANGES = {
+    "trend": ScoreRange(0, 7),
+    "technical": ScoreRange(0, 8),
+    "rs": ScoreRange(0, 10),
+    "tightness": ScoreRange(0, 5),
+    "market": ScoreRange(0, 4),
+    "sector": ScoreRange(0, 3),
+}
+
+MOMENTUM_TREND_MIN = SCORE_RANGES["trend"].maximum
+MOMENTUM_TECHNICAL_MIN = SCORE_RANGES["technical"].maximum
+MOMENTUM_RS_MIN = 8
+
+SETUP_BASE_BUILDING = "BASE_BUILDING"
+SETUP_READY_TO_TRIGGER = "READY_TO_TRIGGER"
+SETUP_BREAKOUT_CONFIRMED = "BREAKOUT_CONFIRMED"
+SETUP_BREAKOUT_FAILED = "BREAKOUT_FAILED"
+SETUP_PULLBACK_ENTRY = "PULLBACK_ENTRY"
+SETUP_EXTENDED = "EXTENDED"
+SETUP_FAILED = "FAILED"
+
+
+def threshold_is_reachable(score_name: str, threshold: float) -> bool:
+    """Return whether a configured threshold can be met by that score."""
+    score_range = SCORE_RANGES[score_name]
+    return score_range.minimum <= threshold <= score_range.maximum
+
+
 @dataclass
 class PivotInfo:
     """Resistance and breakout information for one ticker."""
@@ -1287,10 +1323,14 @@ def choose_action_label(
     near_ma20 = abs(latest["Close"] - latest["MA20"]) / latest["Close"] <= 0.04
     holds_support = latest["Close"] > min(latest["MA10"], latest["MA20"])
     near_pivot = pivot.distance_pct <= 5 or pivot.label == "Breakout in progress"
+    materially_above_trigger = latest["Close"] > pivot.trigger * 1.05
+    controlled_above_ma10 = latest["Close"] <= latest["MA10"] * 1.05
     forming_base = vcp.status in {"VALID VCP", "EARLY VCP"} or near_pivot or has_higher_low_structure(data)
 
     if support_broken or (latest["Close"] < latest["MA50"] and rs_falling):
         return "FAILED"
+    if materially_above_trigger and trend_score >= 5:
+        return "PULLBACK ENTRY" if controlled_above_ma10 and holds_support else "EXTENDED"
     if extended and trend_score >= 5:
         return "EXTENDED"
     if trend_score >= 5 and technical_score >= 6 and vcp.status in {"VALID VCP", "EARLY VCP"} and near_pivot:
@@ -1334,13 +1374,44 @@ def build_trade_plan(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple
     )
 
 
-def calculate_rr_score(entry: float, stop: float, target_2r: float) -> Tuple[float | None, str]:
-    """Classify risk/reward quality from the planned entry, stop, and 2R target."""
+def estimate_structural_reward_target(data: pd.DataFrame, entry: float, pivot: PivotInfo) -> float | None:
+    """Estimate a non-circular target from chart structure instead of planned R math."""
+    if pd.isna(entry) or entry <= 0 or data.empty:
+        return None
+
+    recent = data.tail(90)
+    candidates: List[float] = []
+    for column in ("High20", "High52W"):
+        value = latest_value(data, column)
+        if pd.notna(value) and value > entry:
+            candidates.append(float(value))
+
+    prior_highs = recent["High"].iloc[:-1] if len(recent) > 1 else recent["High"]
+    if not prior_highs.empty:
+        resistance = float(prior_highs[prior_highs > entry].min()) if (prior_highs > entry).any() else np.nan
+        if pd.notna(resistance):
+            candidates.append(resistance)
+
+    base_low = float(recent["Low"].min()) if "Low" in recent and not recent.empty else np.nan
+    if pd.notna(base_low) and pd.notna(pivot.pivot) and pivot.pivot > base_low:
+        measured_move = float(pivot.pivot + (pivot.pivot - base_low))
+        if measured_move > entry:
+            candidates.append(measured_move)
+
+    if not candidates:
+        return None
+    return round(min(candidates), 2)
+
+
+def calculate_rr_score(entry: float, stop: float, structural_target: float | None) -> Tuple[float | None, str]:
+    """Classify risk/reward quality from a real structural target, not the planned 2R target."""
     risk = entry - stop
     if risk <= 0:
         return None, "Invalid"
+    if structural_target is None or pd.isna(structural_target) or structural_target <= entry:
+        return None, "NOT_AVAILABLE"
 
-    rr_ratio = (target_2r - entry) / risk
+    rr_ratio = (structural_target - entry) / risk
     if rr_ratio >= 2.5:
         rr_score = "A+"
     elif rr_ratio >= 2.0:
@@ -1451,8 +1522,33 @@ def classify_earnings_risk(earnings_info: dict) -> Tuple[str, bool]:
     return "LOW RISK", False
 
 
+def classify_setup_state(data: pd.DataFrame, action: str, pivot: PivotInfo) -> str:
+    """Separate base, breakout, pullback, extended, and failed setup states."""
+    if data.empty:
+        return SETUP_FAILED
+
+    latest = data.iloc[-1]
+    close = latest.get("Close", np.nan)
+    if pd.isna(close):
+        return SETUP_FAILED
+    if action == "FAILED" or close < latest.get("MA50", np.inf):
+        return SETUP_FAILED
+    if action == "EXTENDED":
+        return SETUP_EXTENDED
+    if action == "PULLBACK ENTRY":
+        return SETUP_PULLBACK_ENTRY
+    if pd.notna(pivot.pivot) and close > pivot.pivot:
+        if close < latest.get("Low10", -np.inf):
+            return SETUP_BREAKOUT_FAILED
+        return SETUP_BREAKOUT_CONFIRMED
+    if action == "READY" or (pd.notna(pivot.distance_pct) and 0 <= pivot.distance_pct <= 3):
+        return SETUP_READY_TO_TRIGGER
+    return SETUP_BASE_BUILDING
+
+
 def calculate_volume_confirmation(data: pd.DataFrame, action: str, pivot: PivotInfo) -> Tuple[str, str]:
     """Confirm volume for breakout setups and pullback setups."""
+    setup_state = classify_setup_state(data, action, pivot)
     latest = data.iloc[-1]
     avg_vol20 = latest.get("AvgVol20", np.nan)
     if pd.isna(avg_vol20) or avg_vol20 <= 0:
@@ -1460,11 +1556,13 @@ def calculate_volume_confirmation(data: pd.DataFrame, action: str, pivot: PivotI
 
     breakout_volume = latest["Volume"] > 1.5 * avg_vol20
     pullback_volume_contracts = has_volume_contraction(data)
-    near_breakout = action == "READY" or pivot.label == "Breakout in progress" or pivot.distance_pct <= 2
+    dry_up_volume = latest["Volume"] < 0.85 * avg_vol20 or pullback_volume_contracts
 
-    if near_breakout:
+    if setup_state == SETUP_BREAKOUT_CONFIRMED:
         return ("YES", "Breakout volume >1.5x avg") if breakout_volume else ("NO", "Breakout volume below 1.5x avg")
-    if action == "PULLBACK ENTRY":
+    if setup_state == SETUP_READY_TO_TRIGGER:
+        return ("YES", "Base volume dry-up before trigger") if dry_up_volume else ("NO", "No base volume dry-up yet")
+    if setup_state == SETUP_PULLBACK_ENTRY:
         return ("YES", "Pullback volume contracting") if pullback_volume_contracts else ("NO", "Pullback volume not contracting")
     return ("YES", "Volume contracting") if pullback_volume_contracts else ("NO", "No volume confirmation")
 
@@ -1587,9 +1685,10 @@ def classify_setup_category(
     if vcp_status in {"VALID VCP", "EARLY VCP"} and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT", "NEAR BREAKOUT"}:
         return "VCP Breakout"
     if (
-        trend_score >= 8
-        and technical_score >= 8
-        and rs_score >= 8
+        threshold_is_reachable("trend", MOMENTUM_TREND_MIN)
+        and trend_score >= MOMENTUM_TREND_MIN
+        and technical_score >= MOMENTUM_TECHNICAL_MIN
+        and rs_score >= MOMENTUM_RS_MIN
         and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
         and risk_pct <= 10
     ):
@@ -1615,9 +1714,10 @@ def is_momentum_breakout_confirmed(
     """Strict non-VCP breakout route; keeps May VCP route separate."""
     return bool(
         action == "READY"
-        and trend_score >= 8
-        and technical_score >= 8
-        and rs_score >= 8
+        and threshold_is_reachable("trend", MOMENTUM_TREND_MIN)
+        and trend_score >= MOMENTUM_TREND_MIN
+        and technical_score >= MOMENTUM_TECHNICAL_MIN
+        and rs_score >= MOMENTUM_RS_MIN
         and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
         and risk_pct <= 10
         and volume_confirmation == "YES"
@@ -1637,9 +1737,10 @@ def is_momentum_breakout_watch(
 ) -> bool:
     """Near-miss momentum setup that should be visible without becoming Trade YES."""
     return bool(
-        trend_score >= 8
-        and technical_score >= 8
-        and rs_score >= 8
+        threshold_is_reachable("trend", MOMENTUM_TREND_MIN)
+        and trend_score >= MOMENTUM_TREND_MIN
+        and technical_score >= MOMENTUM_TECHNICAL_MIN
+        and rs_score >= MOMENTUM_RS_MIN
         and breakout_alert in {"NEAR BREAKOUT", "BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
         and risk_pct <= 12
         and not extended
@@ -1757,6 +1858,14 @@ def calculate_accumulation_display(data: pd.DataFrame, breakout_alert: str, volu
     if pd.notna(avg_vol20):
         notes.append("volume baseline available")
     return score, "; ".join(notes)
+
+
+def is_stale_pivot_entry(data: pd.DataFrame, action: str, entry: float) -> bool:
+    """Detect READY entries that are more than 5% beyond the active trigger."""
+    if data.empty or action != "READY" or pd.isna(entry) or entry <= 0:
+        return False
+    close = latest_value(data, "Close")
+    return bool(pd.notna(close) and close > entry * 1.05)
 
 
 def build_ai_trading_notes(row: dict) -> str:
@@ -1918,11 +2027,13 @@ def build_scan_row(
     extended, ma10_distance, ma20_distance, extension_note = detect_extension(data)
     action = choose_action_label(data, trend_score, technical_score, pivot, vcp, extended)
     entry, stop, risk_pct, target_2r, target_3r, invalidation = build_trade_plan(data, action, pivot)
-    rr_ratio, rr_score = calculate_rr_score(entry, stop, target_2r)
+    structural_target = estimate_structural_reward_target(data, entry, pivot)
+    rr_ratio, rr_score = calculate_rr_score(entry, stop, structural_target)
     tightness_score, tightness_label = calculate_tightness(data, vcp)
     rs_score = calculate_rs_score(data, benchmark_data.get("SPY"), benchmark_data.get("QQQ"))
     sector_leadership, sector_spread = calculate_sector_leadership(data, benchmark_data.get(sector_etf))
     earnings_label, earnings_risk = classify_earnings_risk(earnings_info)
+    setup_state = classify_setup_state(data, action, pivot)
     volume_confirmation, volume_note = calculate_volume_confirmation(data, action, pivot)
     breakout_alert = detect_breakout_alert(data, pivot, volume_confirmation)
     avg_range20 = data["RangePct"].tail(20).mean() if len(data) >= 20 else np.nan
@@ -1973,9 +2084,10 @@ def build_scan_row(
     )
     if (
         vcp.status == "NOT VCP"
-        and trend_score >= 8
-        and technical_score >= 8
-        and rs_score >= 8
+        and threshold_is_reachable("trend", MOMENTUM_TREND_MIN)
+        and trend_score >= MOMENTUM_TREND_MIN
+        and technical_score >= MOMENTUM_TECHNICAL_MIN
+        and rs_score >= MOMENTUM_RS_MIN
         and breakout_alert in {"BREAKOUT IN PROGRESS", "CONFIRMED BREAKOUT"}
         and risk_pct <= 10
         and volume_confirmation == "YES"
@@ -2035,6 +2147,11 @@ def build_scan_row(
         watchlist_flag = "YES"
         trade_reason = "RS too weak for Trade YES."
         watchlist_reason = "RS too weak for Trade YES."
+    if is_stale_pivot_entry(data, action, entry):
+        trade = "NO"
+        watchlist_flag = "YES"
+        trade_reason = "READY but extended above trigger - verify manually"
+        watchlist_reason = "Stale pivot watch - use pullback / support zone."
     if (
         trade == "NO"
         and action == "READY"
@@ -2047,6 +2164,7 @@ def build_scan_row(
         watchlist_flag = "YES"
         watchlist_reason = "Strong VCP setup - waiting for breakout confirmation or lower-risk entry."
         trade_reason = watchlist_reason
+    setup_state = classify_setup_state(data, action, pivot)
     original_pivot, active_entry_zone, entry_distance_pct, entry_logic_warning = entry_logic_audit(data, pivot, action, entry)
     accumulation_score, accumulation_notes = calculate_accumulation_display(data, breakout_alert, volume_confirmation)
     rank_reason = build_rank_reason(
@@ -2117,6 +2235,8 @@ def build_scan_row(
         "Tightness Label": tightness_label,
         "RR Ratio": rr_ratio if rr_ratio is not None else "Invalid",
         "RR Score": rr_score,
+        "Structural Target": structural_target if structural_target is not None else "N/A",
+        "Setup State": setup_state,
         "Volume Confirmation": volume_confirmation,
         "Breakout Alert": breakout_alert,
         "Earnings Date": earnings_info.get("next_date") or "N/A",
@@ -2181,6 +2301,7 @@ def round_display_values(frame: pd.DataFrame) -> pd.DataFrame:
         "Risk %",
         "Target 2R",
         "Target 3R",
+        "Structural Target",
         "RR Ratio",
         "Final Score",
         "RS Score",
@@ -3813,6 +3934,7 @@ def render_swing_scanner(
         "Earnings Risk",
         "Final Score",
         "Setup Category",
+        "Setup State",
         "Rank Reason",
         "Original Pivot",
         "Active Entry Zone",
@@ -3935,8 +4057,9 @@ def render_swing_scanner(
         "Earnings Setup Score",
         "Trend Score",
         "Technical Score",
+        "Setup State",
+        "Structural Target",
         "RR Score",
-        "Target 3R",
         "Sector Score",
         "Sector ETF",
         "Sector Leadership",
