@@ -56,7 +56,7 @@ def outcome(data, index, row, rules=Rules(), hold=20, entry_window=5):
     result = {'Entry Status': 'UNTRIGGERED', 'Simulated Return %': np.nan,
               'R Multiple': np.nan, 'Exit Reason': 'NO FILL', 'Ambiguous': False,
               'Holding Sessions': 0, 'MFE %': np.nan, 'MAE %': np.nan,
-              '2R Before Stop': None, 'Subsequent Lower Low': None}
+              '2R Before Stop': None, '3R Before Stop': None, 'Subsequent Lower Low': None}
     for n in (5,10,20):
         result[f'{n}D Forward Return %'] = (number(data.Close.iloc[index+n])/ref-1)*100 if index+n < len(data) and ref > 0 else np.nan
     if not entry > stop > 0:
@@ -101,6 +101,8 @@ def outcome(data, index, row, rules=Rules(), hold=20, entry_window=5):
             return result
         if target_touch and result['2R Before Stop'] is None:
             result['2R Before Stop'] = True
+        if h >= entry+3*original_risk:
+            result['3R Before Stop'] = True
         if l < number(row.get('Setup Low'),stop):
             result['Subsequent Lower Low'] = True
         exit_price = min(o,stop) if stop_touch else c if count >= hold else None
@@ -116,6 +118,7 @@ def outcome(data, index, row, rules=Rules(), hold=20, entry_window=5):
                            'Exit Date':str(data.index[i]), 'Holding Sessions':count,
                            'MFE %':(best/price-1)*100,'MAE %':(worst/price-1)*100})
             if result['2R Before Stop'] is None: result['2R Before Stop'] = False
+            if result['3R Before Stop'] is None: result['3R Before Stop'] = False
             if result['Subsequent Lower Low'] is None: result['Subsequent Lower Low'] = False
             return result
     if filled is not None:
@@ -123,7 +126,7 @@ def outcome(data, index, row, rules=Rules(), hold=20, entry_window=5):
     return result
 
 
-def backtest(app, frames, ticker, start, end, strategy='VCP', variant='CONFIRMED', rules=Rules(), earnings_dates=()):
+def backtest(app, frames, ticker, start, end, strategy='VCP', variant='CONFIRMED', rules=Rules(), earnings_dates=(), candidate_filter=None):
     data = frames.get(ticker)
     if data is None or data.empty or not {'Open','High','Low','Close','Volume'}.issubset(data):
         return pd.DataFrame()
@@ -145,6 +148,7 @@ def backtest(app, frames, ticker, start, end, strategy='VCP', variant='CONFIRMED
                          row.get('Closing Midpoint Reclaim',False) and row.get('Research Candidate',False) if variant == 'MIDPOINT' else
                          row['Setup Stage'] == 'CONFIRMED')
         if not condition: continue
+        if candidate_filter is not None and not candidate_filter(row,stamp):continue
         result = outcome(data,i,row,rules)
         split = pd.Timestamp(start)+(pd.Timestamp(end)-pd.Timestamp(start))*.7
         label = 'OUT OF SAMPLE' if stamp >= split else 'TRAIN / DEVELOPMENT'

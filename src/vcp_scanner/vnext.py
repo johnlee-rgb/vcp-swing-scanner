@@ -178,7 +178,9 @@ def market_risk(frames, asof=None, rules=Rules()):
     warnings = [t for t,v in flags if v]
     regime = ('YELLOW' if len(core) < 2 else 'RED' if all(core) and len(warnings) >= 3
               else 'ORANGE' if all(core) else 'YELLOW' if warnings or len(flags) < 5 else 'GREEN')
-    return {'regime': regime, 'inputs': rows,
+    from vcp_scanner.market.evidence import market_evidence
+    evidence=market_evidence(frames)
+    return {'regime': regime, 'inputs': rows+evidence,
             'reasons': ([t+' risk warning' for t in warnings] +
                         [r['Input']+' '+r['Freshness'].lower() for r in rows[:7] if r['Freshness'] != 'FRESH'])[:5],
             'eligible': bool(len(core) == 2 and regime != 'RED'),
@@ -240,8 +242,8 @@ def vcp_assessment(data, row, regime, rules=Rules(), asof=None, override=False):
     blackout = row.get('Earnings Risk') == 'HIGH RISK'
     if pd.notna(earnings_date):
         earnings_date = earnings_date.tz_localize(None).normalize()
-        # Conservative weekdays estimate, explicitly not an exchange calendar.
-        days = np.busday_count(source.date(), earnings_date.date())
+        from vcp_scanner.sessions import sessions_until
+        days = sessions_until(source,earnings_date,'HK' if str(row.get('ticker','')).endswith('.HK') else 'US')
         blackout = 0 <= days <= rules.earnings_sessions
     if blackout: blockers.append('Earnings within blackout window')
     elif pd.isna(earnings_date) or earnings_date < source:

@@ -1,5 +1,9 @@
 # vNext Configuration
 
+> 2026-10-29：呢份係上一版設定基線。Cloud vNext 已改用 XNYS／XHKG 日曆，
+> 並加入獨立資金組合研究及私人 D1 儲存。下文舊版關於 weekday／未有 portfolio
+> 嘅限制唔代表最新狀態；請以 CLOUD_DEPLOYMENT_REPORT.md 及 BACKTEST_VALIDATION.md 為準。
+
 No new paid service, account or API is required. Existing yfinance remains the
 daily source. Risk inputs add symbols to the existing batch, not a new provider.
 Normal startup performs no research downloads. A successful scan supplies the

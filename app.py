@@ -42,6 +42,8 @@ from vcp_scanner.tracking_ui import render_tracking
 from vcp_scanner.tracking import daily_bars
 from vcp_scanner.vnext import Rules, configured_rules, regime_override_enabled, market_risk, vcp_assessment
 from vcp_scanner.vnext_ui import render_vnext
+from vcp_scanner.enhanced import enhanced_vcp
+from vcp_scanner.ownership_ui import render_ownership
 
 
 PRESET_UNIVERSES = {
@@ -2758,6 +2760,7 @@ def scan_universe(
             row["Legacy Trade"] = row["Trade"]
             row["Legacy Trade Reason"] = row["Trade Reason"]
             row.update(vcp_assessment(data, row, risk_dashboard, rules, override=regime_override_enabled()))
+            row.update(enhanced_vcp(data,row))
             if row["WATCHLIST FLAG"] == "YES":
                 row["Watchlist Reason"] = row["Trade Reason"]
             row["AI Trading Notes"] = build_ai_trading_notes(row)
@@ -4361,9 +4364,9 @@ def main() -> None:
     st.title("IPO + Swing Pro Scanner")
     st.caption("Daily swing-trading scanner plus IPO grey-market scoring and trade planning.")
 
-    us_tab, hk_tab, ipo_tab, top5_tab, alerts_tab, settings_tab, performance_tab, risk_tab, meta_tab, combined_tab, backtest_tab, health_tab = st.tabs(
+    us_tab, hk_tab, ipo_tab, top5_tab, alerts_tab, settings_tab, performance_tab, risk_tab, meta_tab, combined_tab, backtest_tab, health_tab, institutional_tab, insider_tab = st.tabs(
         ["US Scanner", "HK Scanner", "IPO Scanner", "Top 5 Trades", "Alerts", "Settings", "Signal Performance",
-         "Market Risk", "MET-A Research", "Combined Watchlist", "Backtest / Replay", "Data Health"]
+         "Market Risk", "MET-A Research", "Combined Watchlist", "Backtest / Replay", "Data Health", "Institutional Ownership", "Insider Transactions"]
     )
     with us_tab:
         render_swing_scanner(
@@ -4406,6 +4409,10 @@ def main() -> None:
         render_settings()
     with performance_tab:
         render_tracking(download_daily_data)
+    with institutional_tab:
+        render_ownership('holdings')
+    with insider_tab:
+        render_ownership('insiders')
     for tab, view in [(risk_tab, "risk"), (meta_tab, "meta"), (combined_tab, "combined"),
                       (backtest_tab, "research"), (health_tab, "health")]:
         with tab:

@@ -67,11 +67,8 @@ def daily_bars(frame, market="US", asof=None):
     data.index = dates.normalize()
     data = data[~data.index.isna()].sort_index()
     data = data[~data.index.duplicated(keep="last")]
-    local_now = pd.Timestamp(asof or now_iso()).tz_convert(zone)
-    today = local_now.tz_localize(None).normalize()
-    close_hour = 16
-    cutoff = today if local_now.hour >= close_hour else today - pd.Timedelta(days=1)
-    return data.loc[data.index <= cutoff]
+    from vcp_scanner.sessions import completed_bars
+    return completed_bars(data,asof or now_iso(),market)
 
 
 def strategy_version():

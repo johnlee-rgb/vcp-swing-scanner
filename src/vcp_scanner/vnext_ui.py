@@ -6,6 +6,8 @@ import streamlit as st
 
 from vcp_scanner.vnext import configured_rules, regime_override_enabled, market_risk, meta_assessment, price_plan
 from vcp_scanner.research import backtest, replay, summarize
+from vcp_scanner.performance import compare,metrics,portfolio,portfolio_metrics,walk_forward
+from vcp_scanner.ownership_ui import local_rows
 
 
 def render_vnext(app, view):
@@ -25,7 +27,7 @@ def render_vnext(app, view):
         if regime_override_enabled():
             st.warning('EXPLICIT MARKET REGIME OVERRIDE ACTIVE. VCP_REGIME_OVERRIDE=1; this is recorded on every result.')
         st.caption('Scanner and scheduled job share VCP_RULES_JSON. Capital sizing assumes zero existing open/sector risk unless supplied to the risk calculator; not a portfolio allocation approval.')
-        st.warning('Daily data is not real-time. Earnings weekdays are a conservative estimate, not an exchange holiday calendar. Missing earnings blocks new confirmed eligibility.')
+        st.warning('日線資料唔係即時報價；交易日及盈利 blackout 使用 XNYS／XHKG 日曆。缺少盈利日期仍會阻止 confirmed eligibility。')
         if not results.empty:
             cols = [c for c in ['ticker','Data Trading Date','Data Freshness','Data Completeness','Earnings Date','Trade Eligibility','All Eligibility Blockers'] if c in results]
             st.dataframe(results[cols],hide_index=True)
@@ -71,7 +73,7 @@ def render_vnext(app, view):
                 st.dataframe(meta[meta['Research Candidate'].fillna(False)],hide_index=True)
     elif view == 'research':
         st.subheader('Historical Replay and Event Study')
-        st.warning('Reconstructed research, not saved recommendations. Current universe has survivorship bias. No profitability claim, portfolio return or drawdown. Missing historical earnings prevents production eligibility.')
+        st.warning('歷史重播係重建研究，唔係當日已保存建議。現有股票池有生存者偏差。原始訊號、模擬交易同獨立資金組合結果分開顯示；缺歷史盈利資料唔可以當成實盤資格。')
         tickers = sorted(set(results.ticker)) if not results.empty else sorted(frames)
         ticker = st.selectbox('Research ticker',tickers,key='vnext_replay_ticker')
         strategy = st.selectbox('Research strategy',['VCP','MET-A'])
@@ -85,16 +87,34 @@ def render_vnext(app, view):
             start = st.date_input('Research start',value=dates[max(0,len(dates)-126)].date())
             end = st.date_input('Research end',value=dates[-1].date())
             variant = st.selectbox('Signal variant',['CONFIRMED','WATCH','MIDPOINT'] if strategy == 'MET-A' else ['CONFIRMED','EARLY'])
+            compare_all = st.checkbox('比較 VCP／Enhanced VCP／MET-A 三種研究入場',value=True)
+            filters = st.multiselect('實驗篩選（缺資料時不會當成通過）',['regime','insider','institution'])
             run = st.form_submit_button('Run historical event study')
         if run:
             if start >= end:
                 st.warning('Start must be before end.')
             else:
                 with st.spinner('Replaying historical prefixes...'):
-                    events = backtest(app,frames,ticker,start,end,strategy,variant,rules)
-                st.write(summarize(events))
+                    if compare_all:
+                        events,comparison=compare(app,frames,[ticker],start,end,rules,
+                                                  local_rows('insiders'),local_rows('holdings'),filters)
+                    else:
+                        events = backtest(app,frames,ticker,start,end,strategy,variant,rules)
+                        comparison=pd.DataFrame()
+                if not comparison.empty:
+                    st.subheader('策略比較及樣本數')
+                    st.dataframe(comparison,hide_index=True)
+                st.write(metrics(events))
                 st.dataframe(events,hide_index=True)
                 if not events.empty:
+                    st.write('Walk-forward：按時間分段，訓練跨界交易已剔除')
+                    st.dataframe(walk_forward(events),hide_index=True)
+                    names=events['Strategy Comparison'].unique() if 'Strategy Comparison' in events else ['Selected strategy']
+                    for name in names:
+                        subset=events[events['Strategy Comparison']==name] if 'Strategy Comparison' in events else events
+                        curve,trades=portfolio(subset,frames,rules)
+                        st.write(name,portfolio_metrics(curve,rules.account_equity))
+                        if not curve.empty:st.line_chart(curve.set_index('date')[['equity']])
                     st.download_button('Download research events',events.to_csv(index=False).encode(),file_name='research_events.csv')
                     for group in ('Evaluation','Market Risk Regime','Sector / Industry','Historical Earnings Coverage'):
                         if group in events:

@@ -1,0 +1,42 @@
+[
+  {
+    "repository": "alau1158/sepa",
+    "commit": "f3c18b45b6417f103503e0ce58f81bc10a28b769",
+    "pushed_at": "2026-08-24T06:31:19Z",
+    "archived": false,
+    "license": "MIT",
+    "license_file": "alau1158_sepa_LICENSE.txt",
+    "source_url": "https://github.com/alau1158/sepa",
+    "execution": "Upstream code not executed or vendored"
+  },
+  {
+    "repository": "polakowo/vectorbt",
+    "commit": "8e30b8ce102f302bec0c0226e05b59714453bebd",
+    "pushed_at": "2026-10-23T12:07:43Z",
+    "archived": false,
+    "license": "NOASSERTION",
+    "license_file": "polakowo_vectorbt_LICENSE.txt",
+    "source_url": "https://github.com/polakowo/vectorbt",
+    "execution": "Upstream code not executed or vendored"
+  },
+  {
+    "repository": "dgunning/edgartools",
+    "commit": "3931b22077eee1e0d2b77a8c5a61ab415d51ae0b",
+    "pushed_at": "2026-10-25T14:58:00Z",
+    "archived": false,
+    "license": "MIT",
+    "license_file": "dgunning_edgartools_LICENSE.txt",
+    "source_url": "https://github.com/dgunning/edgartools",
+    "execution": "Upstream code not executed or vendored"
+  },
+  {
+    "repository": "austin-starks/sec-ownership-disclosures",
+    "commit": "aaa6e7a8d8a00d22d221e288d9f2f3e0a6150625",
+    "pushed_at": "2026-09-27T18:09:06Z",
+    "archived": false,
+    "license": "MIT",
+    "license_file": "austin-starks_sec-ownership-disclosures_LICENSE.txt",
+    "source_url": "https://github.com/austin-starks/sec-ownership-disclosures",
+    "execution": "Upstream code not executed or vendored"
+  }
+]

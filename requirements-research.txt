@@ -1,0 +1,7 @@
+-r requirements.txt
+# Batch research only; do not load these packages on dashboard startup.
+# VectorBT: Apache-2.0 + Commons Clause, personal use only.
+vectorbt==1.2.0
+edgartools==5.62.1
+numpy==2.5.4
+pandas==3.1.0

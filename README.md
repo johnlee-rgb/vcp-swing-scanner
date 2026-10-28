@@ -1,5 +1,27 @@
 # VCP Swing Scanner
 
+## 私人雲端版本（2026-10-29）
+
+雲端結果入口：https://vcp-cloud-research.john-lee-5f2.workers.dev/
+
+呢個係同一套 Python scanner 嘅已保存結果前台，唔需要 Mac 長開。
+密碼同讀寫 key 唔會放 Git。完整 Streamlit 私人前台入口係 `cloud_app.py`，
+平台帳戶部署尚需授權；唔好將舊本機 Telegram 設定頁公開部署。
+
+- 每日 US EOD／每週有界研究 workflow：`.github/workflows/daily-cloud.yml`。
+- 資料永久來源係 D1，唔係 runner／Streamlit 嘅 SQLite 或 artifacts。
+- Form4／13F、Enhanced VCP、MET-A 及回測均屬研究，唔會單靠分數產生 BUY。
+- 原有 75 個測試保留；新增 SEC、日曆、永久保存、資金組合及 OIDC 測試。
+- Python 3.12；一般使用 `requirements.txt`，批次研究用 `requirements-research.txt`。
+- 唔會自動 merge main、開付費服務、發 Telegram 或落真實盤。
+
+交付說明：[雲端部署](docs/CLOUD_DEPLOYMENT_REPORT.md)、
+[開源整合](docs/OPEN_SOURCE_INTEGRATION_REPORT.md)、
+[持倉研究](docs/OWNERSHIP_RESEARCH.md)、[回測解讀](docs/BACKTEST_VALIDATION.md)、
+[完成狀態](docs/VNEXT_FINAL_STATUS.md)。
+
+以下係原有本機及上一版說明；交易日曆、資金組合及雲端狀態以以上最新報告為準。
+
 A practical Streamlit app for end-of-day US stock swing-trading preparation using VCP / J Law / Minervini-style checks.
 
 ## Run
