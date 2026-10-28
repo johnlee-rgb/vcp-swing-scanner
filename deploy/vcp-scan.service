@@ -1,0 +1,14 @@
+[Unit]
+Description=VCP EOD scanner and Telegram notifications
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vcp
+WorkingDirectory=/opt/vcp-swing-scanner
+EnvironmentFile=/etc/vcp-scanner.env
+ExecStart=/opt/vcp-swing-scanner/.venv/bin/python scheduled_scan.py scan --timeout 900
+TimeoutStartSec=950
+UMask=0077
+NoNewPrivileges=true

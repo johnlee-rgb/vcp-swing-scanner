@@ -11,8 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from email.message import EmailMessage
 from io import StringIO
+from pathlib import Path
 import re
 import smtplib
+import sys
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -21,6 +23,25 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from vcp_scanner.market.regime import calculate_market_regime
+from vcp_scanner.scoring.dimensions import (
+    apply_rs_percentile,
+    score_data_completeness,
+    score_entry_quality,
+    score_leadership,
+    score_sector_leadership,
+    score_setup_quality,
+)
+from vcp_scanner.workflow import archive_scan
+from vcp_scanner.tracking_ui import render_tracking
+from vcp_scanner.tracking import daily_bars
+from vcp_scanner.vnext import Rules, configured_rules, regime_override_enabled, market_risk, vcp_assessment
+from vcp_scanner.vnext_ui import render_vnext
 
 
 PRESET_UNIVERSES = {
@@ -2015,6 +2036,7 @@ def build_scan_row(
     earnings_info: dict,
     market_score: int,
     sector_score: int,
+    market_regime: dict,
     benchmark_data: Dict[str, pd.DataFrame],
     sector_etf: str,
 ) -> dict:
@@ -2047,6 +2069,46 @@ def build_scan_row(
     )
     post_earnings_label = detect_post_earnings_label(data, earnings_info)
     display_sector = display_sector_metadata(ticker, sector_etf)
+    leadership_dimensions = score_leadership(
+        data=data,
+        spy_data=benchmark_data.get("SPY"),
+        qqq_data=benchmark_data.get("QQQ"),
+        sector_data=benchmark_data.get(sector_etf),
+        rs_score=rs_score,
+        trend_score=trend_score,
+    )
+    setup_dimensions = score_setup_quality(
+        data=data,
+        vcp_status=vcp.status,
+        tightness_score=tightness_score,
+        pivot_tests=pivot.tests,
+        volume_contraction=vcp.volume_contraction,
+    )
+    stale_pivot = is_stale_pivot_entry(data, action, entry)
+    entry_dimensions = score_entry_quality(
+        data=data,
+        setup_state=setup_state,
+        action=action,
+        entry=entry,
+        stop=stop,
+        risk_pct=risk_pct,
+        rr_ratio=rr_ratio,
+        volume_confirmation=volume_confirmation,
+        stale_pivot=stale_pivot,
+    )
+    sector_dimensions = score_sector_leadership(
+        sector_etf=sector_etf,
+        sector_data=benchmark_data.get(sector_etf),
+        sector_spread=sector_spread,
+    )
+    completeness_dimensions = score_data_completeness(
+        data=data,
+        benchmark_data=benchmark_data,
+        sector_etf=sector_etf,
+        sector_data=benchmark_data.get(sector_etf),
+        market_cap=market_cap,
+        earnings_info=earnings_info,
+    )
     final_score = calculate_final_score(
         trend_score=trend_score,
         technical_score=technical_score,
@@ -2147,7 +2209,7 @@ def build_scan_row(
         watchlist_flag = "YES"
         trade_reason = "RS too weak for Trade YES."
         watchlist_reason = "RS too weak for Trade YES."
-    if is_stale_pivot_entry(data, action, entry):
+    if stale_pivot:
         trade = "NO"
         watchlist_flag = "YES"
         trade_reason = "READY but extended above trigger - verify manually"
@@ -2217,6 +2279,12 @@ def build_scan_row(
         "Sector Leadership": sector_leadership,
         "Sector Spread %": sector_spread if sector_spread is not None else "N/A",
         "Market Score": market_score,
+        **market_regime,
+        **leadership_dimensions,
+        **setup_dimensions,
+        **entry_dimensions,
+        **sector_dimensions,
+        **completeness_dimensions,
         "Final Score": final_score,
         "Rank Reason": rank_reason,
         "VCP Status": vcp.status,
@@ -2626,8 +2694,11 @@ def scan_universe(
     tickers = tickers[:500]
     is_hk_scan = any(ticker.endswith(".HK") for ticker in tickers) or "HK" in mode
     context_tickers = ALL_CONTEXT_TICKERS if is_hk_scan else MARKET_TICKERS
-    all_tickers = tuple(sorted(set(tickers + context_tickers)))
+    risk_context = [] if is_hk_scan else ["^IXIC", "^SOX", "WDC", "^TNX", "^TYX"]
+    all_tickers = tuple(sorted(set(tickers + context_tickers + risk_context)))
     raw_data = download_daily_data(all_tickers, period="18mo")
+    raw_data = {t: daily_bars(d, "HK" if t.endswith(".HK") else "US") for t, d in raw_data.items()}
+    raw_data = {t: d for t, d in raw_data.items() if not d.empty}
 
     spy_raw = raw_data.get("^HSI") if is_hk_scan and raw_data.get("^HSI") is not None else raw_data.get("SPY")
     indicator_data = {ticker: add_indicators(frame, spy_raw) for ticker, frame in raw_data.items()}
@@ -2639,9 +2710,19 @@ def scan_universe(
         market_score, market_status, market_details = calculate_hk_market_score(market_data)
     else:
         market_score, market_status, market_details = calculate_market_score(market_data)
+    market_regime = calculate_market_regime(market_data)
     sector_score, sector_details = calculate_sector_score(mode, market_data)
     market_caps = download_market_caps(tuple(tickers))
     earnings_data = download_earnings_data(tuple(tickers))
+    rules = configured_rules()
+    risk_dashboard = market_risk(indicator_data, rules=rules)
+    # US regime inputs do not stand in for HK market confirmation.
+    if is_hk_scan:
+        hsi = market_data.get("SPY", pd.DataFrame())
+        hk_available = not hsi.empty and len(hsi) >= 50
+        hk_constructive = hk_available and hsi.Close.iloc[-1] >= hsi.MA50.iloc[-1]
+        risk_dashboard = {**risk_dashboard, "regime": "YELLOW" if hk_constructive else "RED",
+                          "eligible": bool(hk_constructive), "reasons": ["HK regime uses available HSI MA50; US yield inputs reference only"]}
 
     rows: List[dict] = []
     rejected: List[str] = []
@@ -2663,31 +2744,39 @@ def scan_universe(
 
         try:
             sector_etf = SECTOR_ETF_BY_TICKER.get(ticker, SECTOR_ETFS_BY_MODE.get(mode, ["SPY"])[0])
-            rows.append(
-                build_scan_row(
+            row = build_scan_row(
                     ticker=ticker,
                     data=data,
                     market_cap=market_cap,
                     earnings_info=earnings_data.get(ticker, {}),
                     market_score=market_score,
                     sector_score=sector_score,
+                    market_regime=market_regime,
                     benchmark_data=market_data,
                     sector_etf=sector_etf,
                 )
-            )
+            row["Legacy Trade"] = row["Trade"]
+            row["Legacy Trade Reason"] = row["Trade Reason"]
+            row.update(vcp_assessment(data, row, risk_dashboard, rules, override=regime_override_enabled()))
+            if row["WATCHLIST FLAG"] == "YES":
+                row["Watchlist Reason"] = row["Trade Reason"]
+            row["AI Trading Notes"] = build_ai_trading_notes(row)
+            rows.append(row)
         except Exception as exc:
             rejected.append(f"{ticker}: scoring failed ({exc})")
 
     progress.empty()
-    results = pd.DataFrame(rows)
+    results = apply_rs_percentile(pd.DataFrame(rows))
     summary = {
         "market_score": market_score,
         "market_status": market_status,
         "market_details": market_details,
+        "market_regime": market_regime,
         "sector_score": sector_score,
         "sector_details": sector_details,
         "rejected": rejected,
         "scanned": len(tickers),
+        "risk_dashboard": risk_dashboard,
     }
     return results, indicator_data, summary
 
@@ -3905,6 +3994,12 @@ def render_swing_scanner(
                 min_market_cap=(0 if include_small_caps else min_market_cap_b * 1_000_000_000),
                 min_dollar_volume=min_dollar_volume_m * 1_000_000,
             )
+            try:
+                archive = archive_scan(results, indicator_data, summary, tickers, scan_mode)
+                if archive["outcome"] != "SUCCESS":
+                    st.warning("Scan data is incomplete or unavailable. New Buy signals were not archived; this is not a zero-Buy result.")
+            except Exception:
+                st.warning("Buy signal archive could not be saved. Check storage configuration. Scanner results remain available.")
             st.session_state[f"{key_prefix}_results"] = results
             st.session_state[f"{key_prefix}_indicator_data"] = indicator_data
             st.session_state[f"{key_prefix}_summary"] = summary
@@ -3922,6 +4017,9 @@ def render_swing_scanner(
     indicator_data = st.session_state.get(f"{key_prefix}_indicator_data", {})
     summary = st.session_state.get(f"{key_prefix}_summary", {})
     required_result_columns = {
+        "Final Action",
+        "Trade Eligibility",
+        "Setup Stage",
         "Trade",
         "Trade Reason",
         "RR Ratio",
@@ -3957,6 +4055,8 @@ def render_swing_scanner(
         return
 
     market_score = summary.get("market_score", 0)
+    if regime_override_enabled():
+        st.warning("EXPLICIT MARKET REGIME OVERRIDE ACTIVE. Eligibility overrides are recorded; reduced ORANGE risk sizing applies.")
     market_status = summary.get("market_status", "N/A")
     sector_score = summary.get("sector_score", 0)
 
@@ -3966,6 +4066,12 @@ def render_swing_scanner(
     metric_cols[2].metric("Sector Score", f"{sector_score}/3")
     metric_cols[3].metric("Stocks Passed", len(results))
     metric_cols[4].metric("Mode", st.session_state.get(f"{key_prefix}_last_scan_mode", scan_mode))
+
+    if results.empty:
+        st.warning("No scanner rows available. Check download/filter details; this is not evidence of no opportunities.")
+        with st.expander("Scan diagnostics"):
+            st.write(summary.get("rejected", []))
+        return
 
     dashboard_cols = st.columns(6)
     dashboard_cols[0].metric("Trade YES", int((results["Trade"] == "YES").sum()))
@@ -4022,6 +4128,10 @@ def render_swing_scanner(
         "Industry",
         "Theme",
         "Action Label",
+        "Final Action",
+        "Setup Stage",
+        "Trigger Status",
+        "Trade Eligibility",
         "Setup Category",
         "Trade",
         "WATCHLIST FLAG",
@@ -4036,6 +4146,12 @@ def render_swing_scanner(
         "Target 3R",
         "Accumulation Score",
     ]
+    new_columns = ["Strategy", "Setup Quality Score", "VCP Development", "Risk Eligibility",
+                   "Market Risk Regime", "Execution Timing", "VCP Tightness Score", "Risk Warning",
+                   "Top Supporting Reasons", "Reasons NOT to Buy", "Next Required Confirmation",
+                   "Data Trading Date", "Data Freshness", "Volume Status", "Suggested Shares"]
+    compact_columns += [c for c in new_columns if c in visible]
+    compact_columns = [c for c in compact_columns if c in visible]
     diagnostic_columns = compact_columns + [
         "Sector / Industry",
         "Theme Group",
@@ -4082,7 +4198,8 @@ def render_swing_scanner(
         "Post-Earnings Label",
         "Notes",
     ]
-    diagnostic_columns = list(dict.fromkeys(diagnostic_columns))
+    diagnostic_columns = list(dict.fromkeys(diagnostic_columns + [c for c in visible if not c.startswith("_")]))
+    diagnostic_columns = [c for c in diagnostic_columns if c in visible]
     display_columns = compact_columns
 
     focus_source = results.copy()
@@ -4164,6 +4281,8 @@ def render_swing_scanner(
 
     with plan_col:
         st.subheader("Trade Plan")
+        st.write(selected_row.get("Final Action", "Legacy record: run fresh scan"))
+        st.write(selected_row.get("Next Required Confirmation", "N/A"))
         st.metric("Action", selected_row["Action Label"])
         st.metric("Trade", selected_row["Trade"], selected_row["Trade Reason"])
         st.metric("Watchlist", selected_row["WATCHLIST FLAG"], selected_row["Watchlist Reason"])
@@ -4242,8 +4361,9 @@ def main() -> None:
     st.title("IPO + Swing Pro Scanner")
     st.caption("Daily swing-trading scanner plus IPO grey-market scoring and trade planning.")
 
-    us_tab, hk_tab, ipo_tab, top5_tab, alerts_tab, settings_tab = st.tabs(
-        ["US Scanner", "HK Scanner", "IPO Scanner", "Top 5 Trades", "Alerts", "Settings"]
+    us_tab, hk_tab, ipo_tab, top5_tab, alerts_tab, settings_tab, performance_tab, risk_tab, meta_tab, combined_tab, backtest_tab, health_tab = st.tabs(
+        ["US Scanner", "HK Scanner", "IPO Scanner", "Top 5 Trades", "Alerts", "Settings", "Signal Performance",
+         "Market Risk", "MET-A Research", "Combined Watchlist", "Backtest / Replay", "Data Health"]
     )
     with us_tab:
         render_swing_scanner(
@@ -4284,6 +4404,12 @@ def main() -> None:
         render_alerts()
     with settings_tab:
         render_settings()
+    with performance_tab:
+        render_tracking(download_daily_data)
+    for tab, view in [(risk_tab, "risk"), (meta_tab, "meta"), (combined_tab, "combined"),
+                      (backtest_tab, "research"), (health_tab, "health")]:
+        with tab:
+            render_vnext(sys.modules[__name__], view)
 
 
 if __name__ == "__main__":
