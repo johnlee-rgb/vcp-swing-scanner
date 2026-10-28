@@ -56,6 +56,10 @@ daily-cloud.yml：新加坡時間星期二至六 12:20 跑 US EOD。
 GitHub 只會由 default branch 啟用 schedule。未經用戶批准唔會 merge main，
 所以 feature branch 上面嘅定時排程唔等於已生效。
 新分支首次 push 只做三隻股票嘅雲端端到端驗證，唔改正式預設股票池。
+雲端工作 40746649316 已成功：OIDC 認證、實際下載、三股掃描及 D1 保存
+全部完成；資料內 runner_source 為 GITHUB ACTIONS，github_run_id 同工作一致。
+EOG／DELL／GLW 共 3 rows、0 Buy；呢個唔等於完整 500 股驗證。
+暫時連線失敗有三次有界重試，重試沿用相同 lease／寫入內容，唔製造重複訊號。
 正式每日工作仍用現有 US_PRO_UNIVERSE／DEFAULT_FILTERS。
 完整股票池嘅雲端時間／供應商限制仍需實測；工作有 18 分鐘硬上限。
 GitHub 排程可能延遲，唔係精確時間服務。

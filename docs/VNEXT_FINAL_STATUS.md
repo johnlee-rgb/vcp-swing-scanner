@@ -25,7 +25,16 @@
 
 目前完成嘅係可用私人雲端資料／研究平台，同埋可測試嘅擴充。
 唔會將 UI、資料存在或細樣本勝率包裝成已驗證盈利模型。
-最終 Git commit、push、PR、CI 結果會喺交付時補充；main 仍需用戶批准。
+## 最終驗證及交付
+
+- 實作 commit：c8f182e；雲端有界連線重試修正：918c88b；已 push 到 codex/cloud-vnext。
+- 本機：110 個 Python 測試、8 個 Worker 測試全部通過；app.py、cloud_app.py、cloud_job.py 編譯通過。
+- GitHub 雲端三股工作 [40746649316](https://github.com/johnlee-rgb/vcp-swing-scanner/actions/runs/40746649316) 成功；D1 最新結果帶有相同 GitHub run ID、SUCCESS、3 rows。
+- GitHub 完整回歸工作 [40746648795](https://github.com/johnlee-rgb/vcp-swing-scanner/actions/runs/40746648795) 成功，包含重試修正。
+- 首輪雲端保存遇到暫時連線失敗；已加入三次有界重試及 idempotency 測試，重跑成功，原有成功資料冇被失敗結果覆蓋。
+- PR 建立被 GitHub integration 以 403 拒絕。分支已保存，可以由有權限帳戶開啟 compare 頁建立 PR；冇 merge main。
+- 每日排程仍未生效，需批准 PR 並合併到 default branch；完整股票池時間驗證仍待進行。
+- 今次冇啟用 Telegram、冇發送真實通知、冇落單，亦冇新增付費訂閱。
 
 登入資訊：本機私人 data/CLOUD_LOGIN.txt；唔貼入對話或 GitHub。
 完整前台 secret 檔：data/streamlit_cloud_secrets.toml，只供平台 secret store。
