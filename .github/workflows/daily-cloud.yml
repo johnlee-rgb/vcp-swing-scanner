@@ -2,7 +2,7 @@ name: Private cloud scan and bounded research
 on:
   push:
     branches: [codex/cloud-vnext]
-    paths: ['.github/workflows/daily-cloud.yml']
+    paths: ['.github/workflows/daily-cloud.yml', 'src/vcp_scanner/cloud_store.py']
   workflow_dispatch:
     inputs:
       job:

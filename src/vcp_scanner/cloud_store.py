@@ -19,19 +19,22 @@ class CloudStore:
             raise ValueError('Configure VCP_CLOUD_URL and VCP_CLOUD_TOKEN securely')
 
     def request(self,path,body=None):
-        try:
-            headers={'Authorization':'Bearer '+self.token}
-            for attempt in range(3):
+        import time
+        headers={'Authorization':'Bearer '+self.token}
+        failure='RequestException'
+        for attempt in range(3):
+            try:
                 r=self.session.request('POST' if body is not None else 'GET',self.url+path,
                                        json=body,headers=headers,timeout=(5,30))
                 if r.status_code in (429,502,503,504) and attempt<2:
-                    import time
                     time.sleep(2**attempt)
                     continue
                 if not r.ok: raise RuntimeError(f'Cloud storage HTTP {r.status_code}; state not committed')
                 return r.json()
-        except requests.RequestException:
-            raise RuntimeError('Cloud storage unavailable; no successful run claimed') from None
+            except requests.RequestException as exc:
+                failure=type(exc).__name__
+                if attempt<2:time.sleep(2**attempt)
+        raise RuntimeError(f'Cloud storage unavailable ({failure}); no successful run claimed') from None
 
     def get(self,namespace,key='latest'):
         from urllib.parse import urlencode

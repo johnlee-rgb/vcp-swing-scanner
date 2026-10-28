@@ -203,6 +203,19 @@ def test_storage_error_never_leaks_credentials():
     assert 'private-token' not in str(e.value) and 'secret token' not in str(e.value)
 
 
+def test_transient_cloud_connection_retried_idempotently(monkeypatch):
+    monkeypatch.setattr('time.sleep',lambda _:None)
+    class Transient:
+        calls=0
+        def request(self,*a,**kw):
+            self.calls+=1
+            if self.calls==1:raise requests.ConnectionError('private connection detail')
+            return SimpleNamespace(status_code=200,ok=True,json=lambda:{'acquired':True})
+    session=Transient();cloud=CloudStore('https://example.invalid','private-token',session)
+    assert cloud.request('/api/lease',{'id':'unchanged-id'})['acquired']
+    assert session.calls==2
+
+
 def test_enhanced_reference_does_not_mutate_legacy():
     d=app.add_indicators(pd.concat([prices()]*9,ignore_index=True))
     row={'Final Score':82.7,'RS Score':8}
